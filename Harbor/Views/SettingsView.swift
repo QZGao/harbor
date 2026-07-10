@@ -9,27 +9,45 @@ struct SettingsView: View {
 
         Form {
             Section("General") {
-                LabeledContent("Default Destination") {
-                    VStack(alignment: .trailing, spacing: 6) {
-                        Text(settings.defaultDestinationPath)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.trailing)
-                            .textSelection(.enabled)
-
-                        HStack(spacing: 8) {
-                            Button("Choose…") {
-                                settings.chooseDefaultDestination()
-                            }
-
-                            Button("Reveal") {
-                                settings.revealDefaultDestination()
-                            }
-                        }
-                    }
-                }
-
                 Toggle("Start downloads immediately", isOn: $settings.startDownloadsAutomatically)
                 Toggle("Send download notifications", isOn: $settings.notificationsEnabled)
+            }
+
+            Section("Destinations") {
+                DestinationFolderRow(
+                    title: "Regular Downloads",
+                    path: settings.defaultDestinationPath,
+                    choose: settings.chooseDefaultDestination,
+                    reveal: settings.revealDefaultDestination
+                )
+
+                DestinationFolderRow(
+                    title: "Torrent Downloads",
+                    path: settings.torrentDestinationPath,
+                    choose: settings.chooseTorrentDestination,
+                    reveal: settings.revealTorrentDestination
+                )
+            }
+
+            Section("Torrent Automation") {
+                Toggle("Watch a folder for torrent files", isOn: $settings.torrentWatchFolderEnabled)
+
+                DestinationFolderRow(
+                    title: "Watch Folder",
+                    path: settings.torrentWatchFolderPath,
+                    choose: settings.chooseTorrentWatchFolder,
+                    reveal: settings.revealTorrentWatchFolder
+                )
+
+                if settings.torrentWatchFolderEnabled {
+                    TorrentWatchStatusRow(status: settings.torrentWatchFolderStatus)
+                }
+
+                Toggle(
+                    "Move imported torrent files to Trash",
+                    isOn: $settings.removeWatchedTorrentAfterImport
+                )
+                Toggle("Seed new torrents after downloading", isOn: $settings.seedNewTorrents)
             }
 
             Section("Bandwidth") {
@@ -48,15 +66,27 @@ struct SettingsView: View {
                 }
 
                 SpeedLimitRow(
-                    title: "Global Speed Limit",
+                    title: "Global Download Limit",
                     isEnabled: $settings.globalSpeedLimitEnabled,
                     kilobytesPerSecond: $settings.globalSpeedLimitKilobytesPerSecond
                 )
 
                 SpeedLimitRow(
-                    title: "Per-Download Speed Limit",
+                    title: "Default Download Limit",
                     isEnabled: $settings.perDownloadSpeedLimitEnabled,
                     kilobytesPerSecond: $settings.perDownloadSpeedLimitKilobytesPerSecond
+                )
+
+                SpeedLimitRow(
+                    title: "Global Upload Limit",
+                    isEnabled: $settings.globalUploadSpeedLimitEnabled,
+                    kilobytesPerSecond: $settings.globalUploadSpeedLimitKilobytesPerSecond
+                )
+
+                SpeedLimitRow(
+                    title: "Default Torrent Upload Limit",
+                    isEnabled: $settings.perDownloadUploadSpeedLimitEnabled,
+                    kilobytesPerSecond: $settings.perDownloadUploadSpeedLimitKilobytesPerSecond
                 )
             }
 
@@ -82,6 +112,75 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+private struct DestinationFolderRow: View {
+    let title: LocalizedStringResource
+    let path: String
+    let choose: () -> Void
+    let reveal: () -> Void
+
+    var body: some View {
+        LabeledContent {
+            VStack(alignment: .trailing, spacing: 6) {
+                Text(path)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.trailing)
+                    .textSelection(.enabled)
+
+                HStack(spacing: 8) {
+                    Button("Choose…", action: choose)
+                    Button("Reveal", action: reveal)
+                }
+            }
+        } label: {
+            Text(title)
+        }
+    }
+}
+
+private struct TorrentWatchStatusRow: View {
+    let status: TorrentWatchFolderStatus
+
+    var body: some View {
+        LabeledContent("Status") {
+            Label(message, systemImage: symbolName)
+                .foregroundStyle(foregroundStyle)
+        }
+    }
+
+    private var message: LocalizedStringResource {
+        switch status {
+        case .stopped:
+            "Waiting for the watcher to start"
+        case .watching:
+            "Watching for new torrent files"
+        case .unavailable:
+            "Folder unavailable; Harbor will retry"
+        }
+    }
+
+    private var symbolName: String {
+        switch status {
+        case .stopped:
+            "clock"
+        case .watching:
+            "eye"
+        case .unavailable:
+            "exclamationmark.triangle"
+        }
+    }
+
+    private var foregroundStyle: Color {
+        switch status {
+        case .stopped:
+            .secondary
+        case .watching:
+            .green
+        case .unavailable:
+            .orange
+        }
     }
 }
 
@@ -126,6 +225,6 @@ private struct SpeedLimitRow: View {
         settings: HarborPreviewFixtures.makeSettings(),
         updater: AppUpdater.preview()
     )
-        .frame(width: 520, height: 520)
+        .frame(width: 560, height: 760)
         .padding(20)
 }

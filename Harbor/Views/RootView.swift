@@ -92,7 +92,7 @@ struct RootView: View {
         }
         // TODO: Revisit customizable toolbars after macOS 26 stops crashing while restoring toolbar items during file opens.
         .toolbar {
-            DownloadToolbarContent(center: center)
+            DownloadToolbarContent(center: center, settings: settings)
         }
         .onDrop(
             of: DownloadSourceImportService.supportedContentTypes,
@@ -147,6 +147,7 @@ private struct DownloadDropTargetOverlay: View {
 
 private struct DownloadToolbarContent: ToolbarContent {
     @Bindable var center: DownloadCenter
+    @Bindable var settings: AppSettingsStore
 
     var body: some ToolbarContent {
         ToolbarItem(placement: .primaryAction) {
@@ -171,6 +172,38 @@ private struct DownloadToolbarContent: ToolbarContent {
                     ? center.hasPausableDownloads == false
                     : center.hasResumableDownloads == false
             )
+        }
+
+        ToolbarItem(placement: .primaryAction) {
+            Menu {
+                Toggle("Limit Downloads", isOn: $settings.globalSpeedLimitEnabled)
+
+                Text(
+                    settings.globalSpeedLimitEnabled
+                        ? DownloadFormatting.speedString(Double(settings.globalSpeedLimitKilobytesPerSecond) * 1_024)
+                        : String(localized: "Unlimited")
+                )
+                .foregroundStyle(.secondary)
+
+                Divider()
+
+                Toggle("Limit Uploads", isOn: $settings.globalUploadSpeedLimitEnabled)
+
+                Text(
+                    settings.globalUploadSpeedLimitEnabled
+                        ? DownloadFormatting.speedString(Double(settings.globalUploadSpeedLimitKilobytesPerSecond) * 1_024)
+                        : String(localized: "Unlimited")
+                )
+                .foregroundStyle(.secondary)
+
+                Divider()
+
+                SettingsLink {
+                    Label("Edit Limits…", systemImage: "gearshape")
+                }
+            } label: {
+                Label("Speed Limits", systemImage: "speedometer")
+            }
         }
 
         ToolbarItem(placement: .primaryAction) {

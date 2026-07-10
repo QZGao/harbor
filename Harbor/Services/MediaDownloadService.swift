@@ -64,6 +64,7 @@ actor MediaDownloadService {
     private let temporaryRoot: URL
     private var runtime: MediaRuntimeResolution?
     private var runningDownloads: [UUID: RunningDownload] = [:]
+    private var terminationWaiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
     private var hasCleanedOrphans = false
 
     init(
@@ -86,7 +87,8 @@ actor MediaDownloadService {
         sourceURL: URL,
         destinationFolder: URL,
         metadata: MediaDownloadMetadata?,
-        formatPreference: MediaDownloadFormatPreference
+        formatPreference: MediaDownloadFormatPreference,
+        speedLimitBytesPerSecond: Int64? = nil
     ) async throws -> Int32 {
         if let existing = runningDownloads[id] {
             return existing.process.processIdentifier
@@ -99,13 +101,14 @@ actor MediaDownloadService {
         try fileManager.createDirectory(at: temporaryFolder, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: destinationFolder, withIntermediateDirectories: true)
 
-        let arguments = downloadArguments(
+        let arguments = Self.downloadArguments(
             runtime: runtime,
             sourceURL: sourceURL,
             destinationFolder: destinationFolder,
             temporaryFolder: temporaryFolder,
             metadata: metadata,
-            formatPreference: formatPreference
+            formatPreference: formatPreference,
+            speedLimitBytesPerSecond: speedLimitBytesPerSecond
         )
 
         let environment = processEnvironment(runtime: runtime)
@@ -175,6 +178,21 @@ actor MediaDownloadService {
     @discardableResult
     func remove(id: UUID) -> Bool {
         cancel(id: id)
+    }
+
+    func cancelAndWait(id: UUID) async {
+        guard cancel(id: id) else {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            guard runningDownloads[id] != nil else {
+                continuation.resume()
+                return
+            }
+
+            terminationWaiters[id, default: []].append(continuation)
+        }
     }
 
     func shutdown() async {
@@ -264,6 +282,11 @@ actor MediaDownloadService {
     ) {
         guard let download = runningDownloads.removeValue(forKey: id) else {
             return
+        }
+
+        let waiters = terminationWaiters.removeValue(forKey: id) ?? []
+        defer {
+            waiters.forEach { $0.resume() }
         }
 
         logger.info("Media download \(id.uuidString, privacy: .public) exited with status \(termination.waitStatus, privacy: .public)")
@@ -383,13 +406,14 @@ actor MediaDownloadService {
         }
     }
 
-    private func downloadArguments(
+    nonisolated static func downloadArguments(
         runtime: MediaRuntimeResolution,
         sourceURL: URL,
         destinationFolder: URL,
         temporaryFolder: URL,
         metadata: MediaDownloadMetadata?,
-        formatPreference: MediaDownloadFormatPreference
+        formatPreference: MediaDownloadFormatPreference,
+        speedLimitBytesPerSecond: Int64?
     ) -> [String] {
         var arguments = [
             "--ignore-config",
@@ -415,6 +439,13 @@ actor MediaDownloadService {
 
         if metadata?.isCollection != true {
             arguments.append("--no-playlist")
+        }
+
+        if let speedLimitBytesPerSecond, speedLimitBytesPerSecond > 0 {
+            arguments.append(contentsOf: [
+                "--limit-rate",
+                "\(speedLimitBytesPerSecond)"
+            ])
         }
 
         switch formatPreference {
@@ -569,16 +600,7 @@ actor MediaDownloadService {
     }
 
     private static func defaultTemporaryRoot(fileManager: FileManager) -> URL {
-        let applicationSupportURL = (try? fileManager.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        ))
-            ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
-
-        return applicationSupportURL
-            .appendingPathComponent("Harbor", isDirectory: true)
+        HarborApplicationSupport.directoryURL(fileManager: fileManager)
             .appendingPathComponent("MediaDownloads", isDirectory: true)
     }
 }

@@ -8,6 +8,8 @@ struct DownloadTransferSettings: Equatable, Sendable {
             maxConcurrentDownloads: 3,
             globalSpeedLimitBytesPerSecond: nil,
             perDownloadSpeedLimitBytesPerSecond: nil,
+            globalUploadSpeedLimitBytesPerSecond: nil,
+            perDownloadUploadSpeedLimitBytesPerSecond: nil,
             perDownloadConnectionCount: 4
         )
     }
@@ -15,6 +17,8 @@ struct DownloadTransferSettings: Equatable, Sendable {
     let maxConcurrentDownloads: Int
     let globalSpeedLimitBytesPerSecond: Int64?
     let perDownloadSpeedLimitBytesPerSecond: Int64?
+    let globalUploadSpeedLimitBytesPerSecond: Int64?
+    let perDownloadUploadSpeedLimitBytesPerSecond: Int64?
     let perDownloadConnectionCount: Int
 }
 
@@ -23,6 +27,11 @@ struct DownloadTransferSettings: Equatable, Sendable {
 final class AppSettingsStore {
     private enum Keys {
         static let defaultDestinationPath = "defaultDestinationPath"
+        static let torrentDestinationPath = "torrentDestinationPath"
+        static let torrentWatchFolderPath = "torrentWatchFolderPath"
+        static let torrentWatchFolderEnabled = "torrentWatchFolderEnabled"
+        static let removeWatchedTorrentAfterImport = "removeWatchedTorrentAfterImport"
+        static let seedNewTorrents = "seedNewTorrents"
         static let maxConcurrentDownloads = "maxConcurrentDownloads"
         static let startDownloadsAutomatically = "startDownloadsAutomatically"
         static let notificationsEnabled = "notificationsEnabled"
@@ -30,6 +39,10 @@ final class AppSettingsStore {
         static let globalSpeedLimitKilobytesPerSecond = "globalSpeedLimitKilobytesPerSecond"
         static let perDownloadSpeedLimitEnabled = "perDownloadSpeedLimitEnabled"
         static let perDownloadSpeedLimitKilobytesPerSecond = "perDownloadSpeedLimitKilobytesPerSecond"
+        static let globalUploadSpeedLimitEnabled = "globalUploadSpeedLimitEnabled"
+        static let globalUploadSpeedLimitKilobytesPerSecond = "globalUploadSpeedLimitKilobytesPerSecond"
+        static let perDownloadUploadSpeedLimitEnabled = "perDownloadUploadSpeedLimitEnabled"
+        static let perDownloadUploadSpeedLimitKilobytesPerSecond = "perDownloadUploadSpeedLimitKilobytesPerSecond"
         static let perDownloadConnectionCount = "perDownloadConnectionCount"
     }
 
@@ -39,12 +52,50 @@ final class AppSettingsStore {
 
     private let userDefaults: UserDefaults
     @ObservationIgnored var transferSettingsDidChange: ((DownloadTransferSettings) -> Void)?
+    @ObservationIgnored var torrentAutomationSettingsDidChange: (() -> Void)?
 
     var defaultDestinationPath: String {
         didSet {
             userDefaults.set(defaultDestinationPath, forKey: Keys.defaultDestinationPath)
         }
     }
+
+    var torrentDestinationPath: String {
+        didSet {
+            userDefaults.set(torrentDestinationPath, forKey: Keys.torrentDestinationPath)
+            notifyTorrentAutomationSettingsChanged()
+        }
+    }
+
+    var torrentWatchFolderPath: String {
+        didSet {
+            userDefaults.set(torrentWatchFolderPath, forKey: Keys.torrentWatchFolderPath)
+            notifyTorrentAutomationSettingsChanged()
+        }
+    }
+
+    var torrentWatchFolderEnabled: Bool {
+        didSet {
+            userDefaults.set(torrentWatchFolderEnabled, forKey: Keys.torrentWatchFolderEnabled)
+            notifyTorrentAutomationSettingsChanged()
+        }
+    }
+
+    var removeWatchedTorrentAfterImport: Bool {
+        didSet {
+            userDefaults.set(removeWatchedTorrentAfterImport, forKey: Keys.removeWatchedTorrentAfterImport)
+            notifyTorrentAutomationSettingsChanged()
+        }
+    }
+
+    var seedNewTorrents: Bool {
+        didSet {
+            userDefaults.set(seedNewTorrents, forKey: Keys.seedNewTorrents)
+            notifyTorrentAutomationSettingsChanged()
+        }
+    }
+
+    private(set) var torrentWatchFolderStatus: TorrentWatchFolderStatus = .stopped
 
     var maxConcurrentDownloads: Int {
         didSet {
@@ -93,6 +144,40 @@ final class AppSettingsStore {
         }
     }
 
+    var globalUploadSpeedLimitEnabled: Bool {
+        didSet {
+            userDefaults.set(globalUploadSpeedLimitEnabled, forKey: Keys.globalUploadSpeedLimitEnabled)
+            notifyTransferSettingsChanged()
+        }
+    }
+
+    var globalUploadSpeedLimitKilobytesPerSecond: Int {
+        didSet {
+            userDefaults.set(
+                globalUploadSpeedLimitKilobytesPerSecond,
+                forKey: Keys.globalUploadSpeedLimitKilobytesPerSecond
+            )
+            notifyTransferSettingsChanged()
+        }
+    }
+
+    var perDownloadUploadSpeedLimitEnabled: Bool {
+        didSet {
+            userDefaults.set(perDownloadUploadSpeedLimitEnabled, forKey: Keys.perDownloadUploadSpeedLimitEnabled)
+            notifyTransferSettingsChanged()
+        }
+    }
+
+    var perDownloadUploadSpeedLimitKilobytesPerSecond: Int {
+        didSet {
+            userDefaults.set(
+                perDownloadUploadSpeedLimitKilobytesPerSecond,
+                forKey: Keys.perDownloadUploadSpeedLimitKilobytesPerSecond
+            )
+            notifyTransferSettingsChanged()
+        }
+    }
+
     var perDownloadConnectionCount: Int {
         didSet {
             userDefaults.set(perDownloadConnectionCount, forKey: Keys.perDownloadConnectionCount)
@@ -108,7 +193,21 @@ final class AppSettingsStore {
             in: .userDomainMask
         ).first?.path ?? NSHomeDirectory()
 
-        self.defaultDestinationPath = userDefaults.string(forKey: Keys.defaultDestinationPath) ?? defaultDownloadsPath
+        let regularDestinationPath = userDefaults.string(forKey: Keys.defaultDestinationPath) ?? defaultDownloadsPath
+        self.defaultDestinationPath = regularDestinationPath
+        self.torrentDestinationPath = userDefaults.string(forKey: Keys.torrentDestinationPath)
+            ?? URL(fileURLWithPath: regularDestinationPath, isDirectory: true)
+                .appendingPathComponent("Torrents", isDirectory: true)
+                .path
+        self.torrentWatchFolderPath = userDefaults.string(forKey: Keys.torrentWatchFolderPath)
+            ?? defaultDownloadsPath
+        self.torrentWatchFolderEnabled = userDefaults.bool(forKey: Keys.torrentWatchFolderEnabled)
+        self.removeWatchedTorrentAfterImport = userDefaults.bool(forKey: Keys.removeWatchedTorrentAfterImport)
+        if userDefaults.object(forKey: Keys.seedNewTorrents) == nil {
+            self.seedNewTorrents = true
+        } else {
+            self.seedNewTorrents = userDefaults.bool(forKey: Keys.seedNewTorrents)
+        }
 
         let storedConcurrency = userDefaults.integer(forKey: Keys.maxConcurrentDownloads)
         self.maxConcurrentDownloads = Self.clamped(
@@ -144,6 +243,24 @@ final class AppSettingsStore {
             to: Self.speedLimitKilobytesRange
         )
 
+        self.globalUploadSpeedLimitEnabled = userDefaults.bool(forKey: Keys.globalUploadSpeedLimitEnabled)
+        self.globalUploadSpeedLimitKilobytesPerSecond = Self.clamped(
+            userDefaults.integer(forKey: Keys.globalUploadSpeedLimitKilobytesPerSecond) == 0
+                ? 5 * 1_024
+                : userDefaults.integer(forKey: Keys.globalUploadSpeedLimitKilobytesPerSecond),
+            to: Self.speedLimitKilobytesRange
+        )
+
+        self.perDownloadUploadSpeedLimitEnabled = userDefaults.bool(
+            forKey: Keys.perDownloadUploadSpeedLimitEnabled
+        )
+        self.perDownloadUploadSpeedLimitKilobytesPerSecond = Self.clamped(
+            userDefaults.integer(forKey: Keys.perDownloadUploadSpeedLimitKilobytesPerSecond) == 0
+                ? 1_024
+                : userDefaults.integer(forKey: Keys.perDownloadUploadSpeedLimitKilobytesPerSecond),
+            to: Self.speedLimitKilobytesRange
+        )
+
         let storedConnectionCount = userDefaults.integer(forKey: Keys.perDownloadConnectionCount)
         self.perDownloadConnectionCount = Self.clamped(
             storedConnectionCount == 0 ? 4 : storedConnectionCount,
@@ -153,6 +270,14 @@ final class AppSettingsStore {
 
     var defaultDestinationURL: URL {
         URL(fileURLWithPath: defaultDestinationPath, isDirectory: true)
+    }
+
+    var torrentDestinationURL: URL {
+        URL(fileURLWithPath: torrentDestinationPath, isDirectory: true)
+    }
+
+    var torrentWatchFolderURL: URL {
+        URL(fileURLWithPath: torrentWatchFolderPath, isDirectory: true)
     }
 
     var transferSettings: DownloadTransferSettings {
@@ -165,6 +290,14 @@ final class AppSettingsStore {
             perDownloadSpeedLimitBytesPerSecond: speedLimitBytesPerSecond(
                 isEnabled: perDownloadSpeedLimitEnabled,
                 kilobytesPerSecond: perDownloadSpeedLimitKilobytesPerSecond
+            ),
+            globalUploadSpeedLimitBytesPerSecond: speedLimitBytesPerSecond(
+                isEnabled: globalUploadSpeedLimitEnabled,
+                kilobytesPerSecond: globalUploadSpeedLimitKilobytesPerSecond
+            ),
+            perDownloadUploadSpeedLimitBytesPerSecond: speedLimitBytesPerSecond(
+                isEnabled: perDownloadUploadSpeedLimitEnabled,
+                kilobytesPerSecond: perDownloadUploadSpeedLimitKilobytesPerSecond
             ),
             perDownloadConnectionCount: Self.clamped(
                 perDownloadConnectionCount,
@@ -189,8 +322,40 @@ final class AppSettingsStore {
         NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: defaultDestinationPath)
     }
 
+    func chooseTorrentDestination() {
+        guard let folder = FolderSelectionService.chooseFolder(startingAt: torrentDestinationURL) else {
+            return
+        }
+
+        torrentDestinationPath = folder.path
+    }
+
+    func revealTorrentDestination() {
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: torrentDestinationPath)
+    }
+
+    func chooseTorrentWatchFolder() {
+        guard let folder = FolderSelectionService.chooseFolder(startingAt: torrentWatchFolderURL) else {
+            return
+        }
+
+        torrentWatchFolderPath = folder.path
+    }
+
+    func revealTorrentWatchFolder() {
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: torrentWatchFolderPath)
+    }
+
+    func updateTorrentWatchFolderStatus(_ status: TorrentWatchFolderStatus) {
+        torrentWatchFolderStatus = status
+    }
+
     private func notifyTransferSettingsChanged() {
         transferSettingsDidChange?(transferSettings)
+    }
+
+    private func notifyTorrentAutomationSettingsChanged() {
+        torrentAutomationSettingsDidChange?()
     }
 
     private func speedLimitBytesPerSecond(

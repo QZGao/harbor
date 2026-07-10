@@ -28,12 +28,14 @@ private struct DownloadInspectorContent: View {
                     continueInBrowser: continueInBrowser,
                     togglePauseResume: togglePauseResume,
                     retry: retry,
+                    startSeeding: startSeeding,
+                    stopSeeding: stopSeeding,
                     openFile: openFile,
                     revealInFinder: revealInFinder,
                     copySourceURL: copySourceURL
                 )
 
-                DownloadTransferSection(item: item)
+                DownloadTransferSection(item: item, center: center)
                 DownloadStorageSection(item: item)
                 DownloadActivitySection(item: item)
 
@@ -47,6 +49,17 @@ private struct DownloadInspectorContent: View {
                         ),
                         systemImage: "globe",
                         tint: .mint
+                    )
+                }
+
+                if item.backend == .aria2,
+                   item.status == .completed,
+                   let seedingError = item.displayLastError {
+                    DownloadCallout(
+                        title: "Seeding Unavailable",
+                        message: seedingError,
+                        systemImage: "exclamationmark.triangle",
+                        tint: .orange
                     )
                 }
 
@@ -66,6 +79,14 @@ private struct DownloadInspectorContent: View {
 
     private func retry() {
         center.retryDownload(id: item.id)
+    }
+
+    private func startSeeding() {
+        center.startSeeding(id: item.id)
+    }
+
+    private func stopSeeding() {
+        center.stopSeeding(id: item.id)
     }
 
     private func openFile() {
@@ -194,6 +215,8 @@ private struct DownloadHeader: View {
         switch item.status {
         case .downloading:
             .blue
+        case .seeding:
+            .teal
         case .browserSessionRequired:
             .mint
         case .paused:
@@ -245,6 +268,8 @@ private struct DownloadActionRow: View {
     let continueInBrowser: () -> Void
     let togglePauseResume: () -> Void
     let retry: () -> Void
+    let startSeeding: () -> Void
+    let stopSeeding: () -> Void
     let openFile: () -> Void
     let revealInFinder: () -> Void
     let copySourceURL: () -> Void
@@ -292,9 +317,19 @@ private struct DownloadActionRow: View {
             .buttonStyle(LiquidPillButtonStyle(prominent: true))
         } else if item.canPause || item.canResume {
             let isPause = item.canPause
+            let isSeedingTransfer = item.status == .seeding
+                || (item.status == .paused && item.finishedAt != nil && item.shouldSeedAfterDownload)
+            let actionTitle: LocalizedStringResource = if isSeedingTransfer {
+                isPause ? "Pause Seeding" : "Resume Seeding"
+            } else {
+                isPause ? "Pause" : "Resume"
+            }
 
             Button(action: togglePauseResume) {
-                Label(isPause ? "Pause" : "Resume", systemImage: isPause ? "pause.fill" : "play.fill")
+                Label(
+                    actionTitle,
+                    systemImage: isPause ? "pause.fill" : "play.fill"
+                )
             }
             .buttonStyle(LiquidPillButtonStyle(prominent: true))
         } else if item.fileLocationURL != nil {
@@ -326,6 +361,15 @@ private struct DownloadActionRow: View {
             }
 
             Button("Copy Source URL", systemImage: "link", action: copySourceURL)
+
+            if item.backend == .aria2, item.status == .completed {
+                Button("Start Seeding", systemImage: "arrow.up.circle", action: startSeeding)
+            }
+
+            if item.backend == .aria2,
+               item.status == .seeding || (item.status == .paused && item.finishedAt != nil && item.shouldSeedAfterDownload) {
+                Button("Stop Seeding", systemImage: "stop.fill", role: .destructive, action: stopSeeding)
+            }
         } label: {
             Label("More", systemImage: "ellipsis")
         }
@@ -335,6 +379,7 @@ private struct DownloadActionRow: View {
 
 private struct DownloadTransferSection: View {
     let item: DownloadItem
+    let center: DownloadCenter
 
     var body: some View {
         DownloadDetailSection(title: "Transfer") {
@@ -345,8 +390,146 @@ private struct DownloadTransferSection: View {
                     Divider()
                     DownloadValueRow(title: "ETA", value: eta)
                 }
+
+                Divider()
+                TransferLimitControls(item: item, center: center)
             }
         }
+    }
+}
+
+private struct TransferLimitControls: View {
+    private enum LimitMode: String, CaseIterable, Identifiable {
+        case inherit
+        case unlimited
+        case custom
+
+        var id: String { rawValue }
+
+        var title: LocalizedStringResource {
+            switch self {
+            case .inherit:
+                "Inherit"
+            case .unlimited:
+                "Unlimited"
+            case .custom:
+                "Custom"
+            }
+        }
+    }
+
+    let item: DownloadItem
+    let center: DownloadCenter
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 12) {
+                limitRow(
+                    title: "Download Limit",
+                    limitOverride: item.downloadLimitOverride,
+                    fallbackKilobytesPerSecond: 5 * 1_024,
+                    update: { center.setDownloadLimitOverride($0, for: item.id) }
+                )
+
+                if item.backend == .aria2 {
+                    limitRow(
+                        title: "Upload Limit",
+                        limitOverride: item.uploadLimitOverride,
+                        fallbackKilobytesPerSecond: 1 * 1_024,
+                        update: { center.setUploadLimitOverride($0, for: item.id) }
+                    )
+                }
+            }
+            .disabled(isBrowserAssistedDownload)
+
+            if isBrowserAssistedDownload {
+                Text("Speed limits aren’t available for browser-assisted downloads.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if item.backend == .ytDlp, item.isRunning {
+                Text("Media limit changes apply when the download is resumed.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 9)
+    }
+
+    private var isBrowserAssistedDownload: Bool {
+        item.status == .browserSessionRequired
+            || center.activeBrowserSession?.downloadID == item.id
+    }
+
+    private func limitRow(
+        title: LocalizedStringResource,
+        limitOverride: TransferLimitOverride,
+        fallbackKilobytesPerSecond: Int,
+        update: @escaping (TransferLimitOverride) -> Void
+    ) -> some View {
+        let mode = Binding<LimitMode>(
+            get: { limitMode(for: limitOverride) },
+            set: { newMode in
+                switch newMode {
+                case .inherit:
+                    update(.inherit)
+                case .unlimited:
+                    update(.unlimited)
+                case .custom:
+                    update(.limited(kilobytesPerSecond: customValue(for: limitOverride, fallback: fallbackKilobytesPerSecond)))
+                }
+            }
+        )
+
+        let customValueBinding = Binding<Int>(
+            get: { customValue(for: limitOverride, fallback: fallbackKilobytesPerSecond) },
+            set: { update(.limited(kilobytesPerSecond: AppSettingsStore.clampedSpeedLimitKilobytes($0))) }
+        )
+
+        return LabeledContent {
+            HStack(spacing: 8) {
+                Picker(title, selection: mode) {
+                    ForEach(LimitMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 105)
+
+                if mode.wrappedValue == .custom {
+                    TextField("Speed", value: customValueBinding, format: .number)
+                        .monospacedDigit()
+                        .frame(width: 88)
+                    Text("KB/s")
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } label: {
+            Text(title)
+        }
+    }
+
+    private func limitMode(for limitOverride: TransferLimitOverride) -> LimitMode {
+        switch limitOverride {
+        case .inherit:
+            .inherit
+        case .unlimited:
+            .unlimited
+        case .limited:
+            .custom
+        }
+    }
+
+    private func customValue(
+        for limitOverride: TransferLimitOverride,
+        fallback: Int
+    ) -> Int {
+        if case let .limited(kilobytesPerSecond) = limitOverride {
+            return kilobytesPerSecond
+        }
+
+        return fallback
     }
 }
 
@@ -563,6 +746,8 @@ private struct DownloadActivitySection: View {
             if entries.contains(where: { $0.kind == .started || $0.kind == .resumed }) == false {
                 appendSyntheticEvent(kind: .started, timestamp: item.startedAt ?? item.updatedAt, to: &entries)
             }
+        case .seeding:
+            appendSyntheticEvent(kind: .seedingStarted, timestamp: item.finishedAt ?? item.updatedAt, to: &entries)
         case .browserSessionRequired:
             appendSyntheticEvent(kind: .browserSessionRequired, timestamp: item.updatedAt, to: &entries)
         case .paused:
@@ -725,6 +910,10 @@ private extension DownloadActivityKind {
             LocalizedStringResource("Resumed", comment: "Timeline activity status")
         case .paused:
             LocalizedStringResource("Paused", comment: "Timeline activity status")
+        case .seedingStarted:
+            LocalizedStringResource("Seeding Started", comment: "Timeline activity status")
+        case .seedingStopped:
+            LocalizedStringResource("Seeding Stopped", comment: "Timeline activity status")
         case .browserSessionRequired:
             LocalizedStringResource("Needs Browser", comment: "Timeline activity status")
         case .completed:
@@ -748,6 +937,10 @@ private extension DownloadActivityKind {
             "forward.fill"
         case .paused:
             "pause.fill"
+        case .seedingStarted:
+            "arrow.up.circle.fill"
+        case .seedingStopped:
+            "stop.fill"
         case .browserSessionRequired:
             "globe"
         case .completed:
@@ -769,6 +962,10 @@ private extension DownloadActivityKind {
             .green
         case .paused:
             .yellow
+        case .seedingStarted:
+            .teal
+        case .seedingStopped:
+            .secondary
         case .browserSessionRequired:
             .mint
         case .completed:
@@ -782,9 +979,9 @@ private extension DownloadActivityKind {
 
     var sortPriority: Int {
         switch self {
-        case .cancelled, .failed, .completed:
+        case .cancelled, .failed, .completed, .seedingStopped:
             8
-        case .paused, .browserSessionRequired:
+        case .paused, .browserSessionRequired, .seedingStarted:
             7
         case .resumed:
             6
