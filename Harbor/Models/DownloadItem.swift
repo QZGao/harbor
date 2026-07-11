@@ -638,6 +638,13 @@ final class DownloadItem: Identifiable {
         status.isRunning
     }
 
+    var isPausedSeeder: Bool {
+        backend == .aria2
+            && status == .paused
+            && finishedAt != nil
+            && shouldSeedAfterDownload
+    }
+
     var canPause: Bool {
         status == .preparing || status == .downloading || status == .seeding
     }

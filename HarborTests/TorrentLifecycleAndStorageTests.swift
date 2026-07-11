@@ -39,6 +39,92 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
         XCTAssertEqual(item.activityEvents.last?.kind, .seedingStopped)
     }
 
+    func testPausedSeederIsNotCancellableAsAFreshDownload() {
+        let suiteName = "HarborTests.PausedSeederCancellation.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let center = DownloadCenter(settings: AppSettingsStore(userDefaults: userDefaults))
+        let item = DownloadItem(
+            sourceURL: URL(fileURLWithPath: "/tmp/example.torrent"),
+            sourceKind: .torrentFile,
+            backend: .aria2,
+            preferredFilename: nil,
+            destinationFolderPath: "/tmp",
+            status: .paused,
+            finishedAt: .now,
+            backendIdentifier: nil,
+            shouldSeedAfterDownload: true
+        )
+        center.downloads = [item]
+
+        XCTAssertTrue(item.isPausedSeeder)
+        XCTAssertFalse(center.canCancelDownloads(ids: [item.id]))
+
+        center.cancelDownload(id: item.id)
+
+        XCTAssertEqual(item.status, .completed)
+        XCTAssertFalse(item.shouldSeedAfterDownload)
+    }
+
+    func testWatchedTorrentSourceIsTrashedWhileImportRemainsPaused() async throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborWatchedCleanupTests-\(UUID().uuidString)", isDirectory: true)
+        let watchDirectoryURL = rootURL.appendingPathComponent("Watch", isDirectory: true)
+        let managedDirectoryURL = rootURL.appendingPathComponent("Managed", isDirectory: true)
+        let applicationSupportURL = rootURL.appendingPathComponent("Application Support", isDirectory: true)
+        try fileManager.createDirectory(at: watchDirectoryURL, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: rootURL) }
+
+        let key = "HARBOR_APPLICATION_SUPPORT_DIR"
+        let previousValue = getenv(key).map { String(cString: $0) }
+        defer {
+            if let previousValue {
+                setenv(key, previousValue, 1)
+            } else {
+                unsetenv(key)
+            }
+        }
+        setenv(key, applicationSupportURL.path, 1)
+
+        let suiteName = "HarborTests.WatchedCleanup.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        settings.startDownloadsAutomatically = false
+        settings.removeWatchedTorrentAfterImport = true
+        settings.torrentDestinationPath = rootURL.appendingPathComponent("Downloads", isDirectory: true).path
+
+        let store = ManagedTorrentSourceStore(
+            fileManager: fileManager,
+            directoryURL: managedDirectoryURL
+        )
+        let center = DownloadCenter(
+            settings: settings,
+            managedTorrentSourceStore: store
+        )
+        let torrentURL = watchDirectoryURL.appendingPathComponent("watched.torrent")
+        try Data("paused watched torrent".utf8).write(to: torrentURL)
+
+        center.receiveWatchedTorrent(torrentURL)
+
+        for _ in 0 ..< 40 {
+            if center.downloads.count == 1,
+               fileManager.fileExists(atPath: torrentURL.path) == false {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+
+        XCTAssertEqual(center.downloads.count, 1)
+        XCTAssertEqual(center.downloads.first?.status, .paused)
+        XCTAssertFalse(fileManager.fileExists(atPath: torrentURL.path))
+    }
+
     func testPrepareLocalTorrentCreatesStableDeduplicatedManagedCopy() async throws {
         let fileManager = FileManager.default
         let rootURL = fileManager.temporaryDirectory

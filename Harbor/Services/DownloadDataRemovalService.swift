@@ -29,7 +29,7 @@ struct DownloadDataRemovalService {
         self.fileManager = fileManager
     }
 
-    nonisolated func resolveTopLevelPayloadURLs(
+    nonisolated func resolvePayloadURLs(
         destinationFolderPath: String,
         payloadPaths: [String]
     ) -> DownloadPayloadPathResolution {
@@ -63,23 +63,19 @@ struct DownloadDataRemovalService {
                 continue
             }
 
-            let topLevelComponent = candidateComponents[destinationComponents.count]
-            let topLevelURL = destinationURL
-                .appendingPathComponent(topLevelComponent)
-                .standardizedFileURL
-            let canonicalTopLevelURL = canonicalFileURL(topLevelURL)
-            let canonicalTopLevelComponents = canonicalTopLevelURL.pathComponents
-            guard canonicalTopLevelComponents.count == canonicalDestinationComponents.count + 1,
-                  canonicalTopLevelComponents.starts(with: canonicalDestinationComponents),
-                  topLevelURL != destinationURL else {
+            let canonicalCandidateURL = canonicalFileURL(standardizedCandidateURL)
+            let canonicalCandidateComponents = canonicalCandidateURL.pathComponents
+            guard canonicalCandidateComponents.count > canonicalDestinationComponents.count,
+                  canonicalCandidateComponents.starts(with: canonicalDestinationComponents),
+                  standardizedCandidateURL != destinationURL else {
                 if seenRejectedPaths.insert(payloadPath).inserted {
                     rejectedPaths.append(payloadPath)
                 }
                 continue
             }
 
-            if seenSafePaths.insert(topLevelURL.path).inserted {
-                safeURLs.append(topLevelURL)
+            if seenSafePaths.insert(standardizedCandidateURL.path).inserted {
+                safeURLs.append(standardizedCandidateURL)
             }
         }
 
@@ -93,7 +89,7 @@ struct DownloadDataRemovalService {
         destinationFolderPath: String,
         payloadPaths: [String]
     ) -> DownloadDataRemovalResult {
-        let resolution = resolveTopLevelPayloadURLs(
+        let resolution = resolvePayloadURLs(
             destinationFolderPath: destinationFolderPath,
             payloadPaths: payloadPaths
         )

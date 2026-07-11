@@ -27,6 +27,7 @@ final class DownloadCenter {
     @ObservationIgnored private var isReconcilingSelection = false
     @ObservationIgnored private var mediaStartTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private var torrentStartTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var torrentSourceCleanupIDs: Set<UUID> = []
     @ObservationIgnored private var pendingExternalAddSheetDrafts: [AddDownloadSheetDraft] = []
 
     var downloads: [DownloadItem] = []
@@ -382,7 +383,10 @@ final class DownloadCenter {
 
     var canCancelSelectedDownload: Bool {
         selectedDownloads.contains { item in
-            item.status != .completed && item.status != .cancelled && item.status != .seeding
+            item.status != .completed
+                && item.status != .cancelled
+                && item.status != .seeding
+                && item.isPausedSeeder == false
         }
     }
 
@@ -475,7 +479,7 @@ final class DownloadCenter {
         }
     }
 
-    private func receiveWatchedTorrent(_ url: URL) {
+    func receiveWatchedTorrent(_ url: URL) {
         guard isShuttingDown == false else {
             return
         }
@@ -605,11 +609,12 @@ final class DownloadCenter {
         insertDownload(request)
     }
 
+    @discardableResult
     private func insertDownload(
         _ request: AddDownloadRequest,
         managedTorrentSource: ManagedTorrentSource? = nil,
         removeOriginalTorrentAfterImport: Bool = false
-    ) {
+    ) -> DownloadItem {
         let backend = backend(for: request.sourceKind)
         let preferredFilename: String?
         if request.sourceKind.supportsCustomFilename {
@@ -650,6 +655,8 @@ final class DownloadCenter {
         } else {
             schedulePersist()
         }
+
+        return item
     }
 
     private func prepareAndQueueTorrent(
@@ -690,11 +697,15 @@ final class DownloadCenter {
                 return
             }
 
-            insertDownload(
+            let item = insertDownload(
                 request,
                 managedTorrentSource: managedSource,
                 removeOriginalTorrentAfterImport: isWatchedImport && settings.removeWatchedTorrentAfterImport
             )
+
+            if isWatchedImport && request.shouldStartImmediately == false {
+                await persistTorrentAndCleanSourceIfNeeded(item)
+            }
         } catch {
             activeAlert = UserAlert(
                 title: String(localized: "Couldn’t Import Torrent"),
@@ -845,13 +856,21 @@ final class DownloadCenter {
 
     func cancelDownloads(ids: Set<UUID>) {
         for item in orderedDownloads(for: ids)
-        where item.status != .completed && item.status != .cancelled && item.status != .seeding {
+        where item.status != .completed
+            && item.status != .cancelled
+            && item.status != .seeding
+            && item.isPausedSeeder == false {
             cancelDownload(id: item.id)
         }
     }
 
     func cancelDownload(id: UUID) {
         guard let item = item(for: id) else {
+            return
+        }
+
+        if item.isPausedSeeder {
+            stopSeeding(id: id)
             return
         }
 
@@ -903,7 +922,7 @@ final class DownloadCenter {
 
     func canRemoveDownloadedData(ids: Set<UUID>) -> Bool {
         orderedDownloads(for: ids).contains { item in
-            let resolution = dataRemovalService.resolveTopLevelPayloadURLs(
+            let resolution = dataRemovalService.resolvePayloadURLs(
                 destinationFolderPath: item.destinationFolderPath,
                 payloadPaths: payloadPaths(for: item)
             )
@@ -914,7 +933,7 @@ final class DownloadCenter {
     func dataRemovalConfirmationMessage(ids: Set<UUID>) -> String {
         let items = orderedDownloads(for: ids)
         let payloadCount = items.reduce(0) { count, item in
-            count + dataRemovalService.resolveTopLevelPayloadURLs(
+            count + dataRemovalService.resolvePayloadURLs(
                 destinationFolderPath: item.destinationFolderPath,
                 payloadPaths: payloadPaths(for: item)
             ).safeURLs.count
@@ -1207,7 +1226,10 @@ final class DownloadCenter {
 
     func canCancelDownloads(ids: Set<UUID>) -> Bool {
         orderedDownloads(for: ids).contains { item in
-            item.status != .completed && item.status != .cancelled
+            item.status != .completed
+                && item.status != .cancelled
+                && item.status != .seeding
+                && item.isPausedSeeder == false
         }
     }
 
@@ -1630,7 +1652,7 @@ final class DownloadCenter {
                 to: refreshedItem.finishedAt == nil ? .downloading : .seeding
             )
             refreshedItem.updatedAt = .now
-            await persistAcceptedTorrentAndCleanSourceIfNeeded(refreshedItem)
+            await persistTorrentAndCleanSourceIfNeeded(refreshedItem)
         } catch {
             guard let refreshedItem = item(for: id) else {
                 return
@@ -1710,7 +1732,16 @@ final class DownloadCenter {
         return URL(fileURLWithPath: managedTorrentSourcePath)
     }
 
-    private func persistAcceptedTorrentAndCleanSourceIfNeeded(_ item: DownloadItem) async {
+    private func persistTorrentAndCleanSourceIfNeeded(_ item: DownloadItem) async {
+        guard item.removeOriginalTorrentAfterImport,
+              torrentSourceCleanupIDs.insert(item.id).inserted else {
+            return
+        }
+
+        defer {
+            torrentSourceCleanupIDs.remove(item.id)
+        }
+
         persistTask?.cancel()
         persistTask = nil
 
@@ -1720,7 +1751,11 @@ final class DownloadCenter {
             schedulePersist()
             activeAlert = UserAlert(
                 title: String(localized: "Couldn’t Save Torrent"),
-                message: String(localized: "The torrent started, but Harbor couldn’t save its state. The original torrent file was left in place.")
+                message: String(
+                    localized: "torrent.import.saveFailed",
+                    defaultValue: "The torrent was imported, but Harbor couldn’t save its state. The original torrent file was left in place.",
+                    comment: "Alert message shown when Harbor cannot persist an imported torrent before source cleanup."
+                )
             )
             return
         }

@@ -197,7 +197,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertTrue(item.canPause)
     }
 
-    func testPayloadResolutionRejectsRootAndTraversalAndDeduplicatesTopLevelPaths() throws {
+    func testPayloadResolutionRejectsRootAndTraversalAndKeepsExactPayloadPaths() throws {
         let fileManager = FileManager.default
         let rootURL = fileManager.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -206,7 +206,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
         try fileManager.createDirectory(at: destinationURL, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: rootURL) }
 
-        let resolution = DownloadDataRemovalService().resolveTopLevelPayloadURLs(
+        let resolution = DownloadDataRemovalService().resolvePayloadURLs(
             destinationFolderPath: destinationURL.path,
             payloadPaths: [
                 "Collection/one.bin",
@@ -221,7 +221,8 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertEqual(
             resolution.safeURLs.map(\.path),
             [
-                destinationURL.appendingPathComponent("Collection").path,
+                destinationURL.appendingPathComponent("Collection/one.bin").path,
+                destinationURL.appendingPathComponent("Collection/two.bin").path,
                 destinationURL.appendingPathComponent("single.iso").path
             ]
         )
