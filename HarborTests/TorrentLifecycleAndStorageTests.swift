@@ -5,13 +5,19 @@ import XCTest
 
 @MainActor
 final class TorrentLifecycleAndStorageTests: XCTestCase {
-    func testPausedSeederWithoutBackendIdentifierCanStopSeeding() {
+    func testPausedSeederWithoutBackendIdentifierCanStopSeeding() async {
         let suiteName = "HarborTests.SeedingLifecycle.\(UUID().uuidString)"
         let userDefaults = UserDefaults(suiteName: suiteName)!
         userDefaults.removePersistentDomain(forName: suiteName)
         defer { userDefaults.removePersistentDomain(forName: suiteName) }
+        let persistenceDirectoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HarborSeedingLifecycleTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: persistenceDirectoryURL) }
 
-        let center = DownloadCenter(settings: AppSettingsStore(userDefaults: userDefaults))
+        let center = DownloadCenter(
+            settings: AppSettingsStore(userDefaults: userDefaults),
+            persistence: DownloadPersistence(directoryURL: persistenceDirectoryURL)
+        )
         let item = DownloadItem(
             sourceURL: URL(fileURLWithPath: "/tmp/example.torrent"),
             sourceKind: .torrentFile,
@@ -37,15 +43,22 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
         XCTAssertFalse(item.shouldSeedAfterDownload)
         XCTAssertNil(item.backendIdentifier)
         XCTAssertEqual(item.activityEvents.last?.kind, .seedingStopped)
+        await center.shutdownForTermination()
     }
 
-    func testPausedSeederIsNotCancellableAsAFreshDownload() {
+    func testPausedSeederIsNotCancellableAsAFreshDownload() async {
         let suiteName = "HarborTests.PausedSeederCancellation.\(UUID().uuidString)"
         let userDefaults = UserDefaults(suiteName: suiteName)!
         userDefaults.removePersistentDomain(forName: suiteName)
         defer { userDefaults.removePersistentDomain(forName: suiteName) }
+        let persistenceDirectoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HarborPausedSeederTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: persistenceDirectoryURL) }
 
-        let center = DownloadCenter(settings: AppSettingsStore(userDefaults: userDefaults))
+        let center = DownloadCenter(
+            settings: AppSettingsStore(userDefaults: userDefaults),
+            persistence: DownloadPersistence(directoryURL: persistenceDirectoryURL)
+        )
         let item = DownloadItem(
             sourceURL: URL(fileURLWithPath: "/tmp/example.torrent"),
             sourceKind: .torrentFile,
@@ -66,6 +79,7 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
 
         XCTAssertEqual(item.status, .completed)
         XCTAssertFalse(item.shouldSeedAfterDownload)
+        await center.shutdownForTermination()
     }
 
     func testWatchedTorrentSourceIsTrashedWhileImportRemainsPaused() async throws {
@@ -105,6 +119,7 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
         )
         let center = DownloadCenter(
             settings: settings,
+            persistence: DownloadPersistence(directoryURL: applicationSupportURL),
             managedTorrentSourceStore: store
         )
         let torrentURL = watchDirectoryURL.appendingPathComponent("watched.torrent")
@@ -268,6 +283,106 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
                 persistedStatus: .paused,
                 hasFinishedData: true,
                 shouldSeed: true
+            )
+        )
+    }
+
+    func testMagnetMetadataCompletionWaitsForAria2FollowedPayload() {
+        let metadataSnapshot = TorrentStatusSnapshot(
+            gid: "metadata-gid",
+            status: "complete",
+            totalLength: 21_167,
+            completedLength: 21_167,
+            downloadSpeed: 0,
+            uploadSpeed: 0,
+            isSeeder: false,
+            infoHash: "c8b32b9552e94fba03b8b2a8041e0593649fb4a1",
+            errorMessage: nil,
+            metadataName: "Example Torrent",
+            filePaths: ["[METADATA]Example Torrent"],
+            primaryPath: "[METADATA]Example Torrent",
+            followedBy: ["payload-gid"],
+            following: nil
+        )
+        let metadataLineage = TorrentStatusLineage(
+            rootGID: "metadata-gid",
+            gids: ["metadata-gid"],
+            currentSnapshot: metadataSnapshot
+        )
+
+        XCTAssertTrue(metadataSnapshot.isMetadataDownload)
+        XCTAssertTrue(
+            DownloadCenter.shouldAwaitMagnetPayload(
+                sourceKind: .magnetLink,
+                lineage: metadataLineage
+            )
+        )
+
+        let payloadSnapshot = TorrentStatusSnapshot(
+            gid: "payload-gid",
+            status: "active",
+            totalLength: 4_199_224_677,
+            completedLength: 1_048_576,
+            downloadSpeed: 512_000,
+            uploadSpeed: 0,
+            isSeeder: false,
+            infoHash: "c8b32b9552e94fba03b8b2a8041e0593649fb4a1",
+            errorMessage: nil,
+            metadataName: "Example Torrent",
+            filePaths: ["/Downloads/example.mkv"],
+            primaryPath: "/Downloads/example.mkv",
+            followedBy: [],
+            following: "metadata-gid"
+        )
+        let payloadLineage = TorrentStatusLineage(
+            rootGID: "metadata-gid",
+            gids: ["metadata-gid", "payload-gid"],
+            currentSnapshot: payloadSnapshot
+        )
+
+        XCTAssertFalse(payloadSnapshot.isMetadataDownload)
+        XCTAssertFalse(
+            DownloadCenter.shouldAwaitMagnetPayload(
+                sourceKind: .magnetLink,
+                lineage: payloadLineage
+            )
+        )
+        XCTAssertEqual(payloadLineage.currentSnapshot.gid, "payload-gid")
+        XCTAssertEqual(payloadLineage.currentSnapshot.following, "metadata-gid")
+    }
+
+    func testRestoredMagnetLineageDoesNotTreatPayloadChildAsOrphan() {
+        let orphans = DownloadCenter.orphanedTorrentGIDs(
+            engineGIDs: ["metadata-gid", "payload-gid", "untracked-gid"],
+            retainedGIDs: ["metadata-gid", "payload-gid"]
+        )
+
+        XCTAssertEqual(orphans, ["untracked-gid"])
+    }
+
+    func testMetadataOnlyCompletedMagnetIsEligibleForRepair() {
+        XCTAssertTrue(
+            DownloadCenter.shouldRepairMetadataOnlyMagnetCompletion(
+                sourceKind: .magnetLink,
+                status: .completed,
+                fileLocationPath: "[METADATA]Example Torrent",
+                payloadPaths: []
+            )
+        )
+        XCTAssertFalse(
+            DownloadCenter.shouldRepairMetadataOnlyMagnetCompletion(
+                sourceKind: .magnetLink,
+                status: .completed,
+                fileLocationPath: "/Downloads/example.mkv",
+                payloadPaths: []
+            )
+        )
+        XCTAssertFalse(
+            DownloadCenter.shouldRepairMetadataOnlyMagnetCompletion(
+                sourceKind: .torrentFile,
+                status: .completed,
+                fileLocationPath: "[METADATA]Example Torrent",
+                payloadPaths: []
             )
         )
     }

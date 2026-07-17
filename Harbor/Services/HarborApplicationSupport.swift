@@ -1,8 +1,13 @@
 import Foundation
 
 enum HarborApplicationSupport {
+    nonisolated static var isRunningUnitTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    }
+
     nonisolated static func directoryURL(fileManager: FileManager = .default) -> URL {
         let rootURL = overrideURL()
+            ?? unitTestRootURL(fileManager: fileManager)
             ?? (try? fileManager.url(
                 for: .applicationSupportDirectory,
                 in: .userDomainMask,
@@ -13,6 +18,18 @@ enum HarborApplicationSupport {
                 .appendingPathComponent("Library/Application Support", isDirectory: true)
 
         return rootURL.appendingPathComponent("Harbor", isDirectory: true)
+    }
+
+    private nonisolated static func unitTestRootURL(fileManager: FileManager) -> URL? {
+        guard isRunningUnitTests else {
+            return nil
+        }
+
+        // Keep the application test host from reading or rewriting a user's live Harbor state.
+        return fileManager.temporaryDirectory.appendingPathComponent(
+            "HarborTests-\(ProcessInfo.processInfo.processIdentifier)",
+            isDirectory: true
+        )
     }
 
     private nonisolated static func overrideURL() -> URL? {

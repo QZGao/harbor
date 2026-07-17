@@ -38,6 +38,24 @@ struct TorrentStatusSnapshot: Sendable {
     let metadataName: String?
     let filePaths: [String]
     let primaryPath: String?
+    let followedBy: [String]
+    let following: String?
+
+    nonisolated var isMetadataDownload: Bool {
+        filePaths.contains { path in
+            URL(fileURLWithPath: path).lastPathComponent.hasPrefix("[METADATA]")
+        }
+    }
+}
+
+struct TorrentStatusLineage: Sendable {
+    let rootGID: String
+    let gids: [String]
+    let currentSnapshot: TorrentStatusSnapshot
+
+    nonisolated var isMetadataOnly: Bool {
+        gids.count == 1 && currentSnapshot.isMetadataDownload
+    }
 }
 
 struct TorrentTransferOptions: Equatable, Sendable {
@@ -116,6 +134,8 @@ actor Aria2TorrentService {
         let errorMessage: String?
         let files: [FilePayload]?
         let bittorrent: BittorrentPayload?
+        let followedBy: [String]?
+        let following: String?
     }
 
     private struct FilePayload: Decodable {
@@ -189,10 +209,12 @@ actor Aria2TorrentService {
         do {
             try await applyGlobalOptions(transferSettings)
 
-            for gid in activeGIDs {
+            for rootGID in activeGIDs {
+                let lineage = try? await followedStatus(for: rootGID)
+                let gid = lineage?.currentSnapshot.gid ?? rootGID
                 try? await applyDownloadOptions(
                     transferSettings,
-                    transferOptions: transferOptionsByGID[gid],
+                    transferOptions: transferOptionsByGID[rootGID],
                     gid: gid
                 )
             }
@@ -314,12 +336,14 @@ actor Aria2TorrentService {
     }
 
     func pause(gid: String) async throws {
+        let lineage = try await followedStatus(for: gid)
+        let currentGID = lineage.currentSnapshot.gid
         _ = try await rpcCallWithDaemonRestart(
             method: "aria2.forcePause",
             params: {
                 [
                     try authorizedToken(),
-                    gid
+                    currentGID
                 ]
             },
             as: String.self
@@ -328,12 +352,14 @@ actor Aria2TorrentService {
     }
 
     func unpause(gid: String) async throws {
+        let lineage = try await followedStatus(for: gid)
+        let currentGID = lineage.currentSnapshot.gid
         _ = try await rpcCallWithDaemonRestart(
             method: "aria2.unpause",
             params: {
                 [
                     try authorizedToken(),
-                    gid
+                    currentGID
                 ]
             },
             as: String.self
@@ -349,6 +375,33 @@ actor Aria2TorrentService {
             return
         }
 
+        let lineage = try? await followedStatus(for: gid)
+        let gids = lineage?.gids.reversed() ?? [gid].reversed()
+        var didRemove = false
+
+        for targetGID in gids {
+            didRemove = await removeSingle(gid: targetGID, token: token) || didRemove
+        }
+
+        if didRemove {
+            await persistSessionAfterMutation("remove")
+        }
+    }
+
+    func removeAndConfirmStopped(gid: String) async throws {
+        try await ensureDaemonRunning()
+        let token = try authorizedToken()
+        let lineage = try? await followedStatus(for: gid)
+        let gids = lineage?.gids.reversed() ?? [gid].reversed()
+
+        for targetGID in gids {
+            try await removeSingleAndConfirmStopped(gid: targetGID, token: token)
+        }
+
+        await persistSessionAfterMutation("confirmed remove")
+    }
+
+    private func removeSingle(gid: String, token: String) async -> Bool {
         var didRemove = false
 
         do {
@@ -371,15 +424,10 @@ actor Aria2TorrentService {
             logger.debug("aria2 removeDownloadResult did not remove gid \(gid, privacy: .public): \(error.localizedDescription, privacy: .public)")
         }
 
-        if didRemove {
-            await persistSessionAfterMutation("remove")
-        }
+        return didRemove
     }
 
-    func removeAndConfirmStopped(gid: String) async throws {
-        try await ensureDaemonRunning()
-        let token = try authorizedToken()
-
+    private func removeSingleAndConfirmStopped(gid: String, token: String) async throws {
         do {
             _ = try await rpcCall(method: "aria2.forceRemove", params: [
                 token,
@@ -410,8 +458,6 @@ actor Aria2TorrentService {
                 throw error
             }
         }
-
-        await persistSessionAfterMutation("confirmed remove")
     }
 
     func status(for gid: String) async throws -> TorrentStatusSnapshot {
@@ -432,7 +478,9 @@ actor Aria2TorrentService {
                         "infoHash",
                         "errorMessage",
                         "files",
-                        "bittorrent"
+                        "bittorrent",
+                        "followedBy",
+                        "following"
                     ]
                 ]
             },
@@ -455,7 +503,34 @@ actor Aria2TorrentService {
             errorMessage: payload.errorMessage,
             metadataName: payload.bittorrent?.info?.name,
             filePaths: filePaths,
-            primaryPath: preferredPath(from: filePaths)
+            primaryPath: preferredPath(from: filePaths),
+            followedBy: payload.followedBy ?? [],
+            following: payload.following
+        )
+    }
+
+    func followedStatus(for rootGID: String) async throws -> TorrentStatusLineage {
+        var gids = [rootGID]
+        var visited = Set(gids)
+        var snapshot = try await status(for: rootGID)
+
+        while let nextGID = snapshot.followedBy.first(where: { visited.contains($0) == false }) {
+            do {
+                snapshot = try await status(for: nextGID)
+                gids.append(nextGID)
+                visited.insert(nextGID)
+            } catch {
+                guard isMissingGIDError(error) else {
+                    throw error
+                }
+                break
+            }
+        }
+
+        return TorrentStatusLineage(
+            rootGID: rootGID,
+            gids: gids,
+            currentSnapshot: snapshot
         )
     }
 
@@ -494,6 +569,7 @@ actor Aria2TorrentService {
             // TODO: Replace indefinite seeding with per-torrent ratio/time policies when Harbor exposes those controls.
             "--seed-ratio=0.0",
             "--bt-save-metadata=true",
+            "--bt-load-saved-metadata=true",
             "--follow-torrent=true",
             "--allow-overwrite=false",
             "--auto-file-renaming=true",

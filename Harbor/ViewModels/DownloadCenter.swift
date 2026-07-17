@@ -128,6 +128,32 @@ final class DownloadCenter {
                     item.taskIdentifier = nil
                     item.speedBytesPerSecond = 0
 
+                    if Self.shouldRepairMetadataOnlyMagnetCompletion(
+                        sourceKind: item.sourceKind,
+                        status: item.status,
+                        fileLocationPath: item.fileLocationPath,
+                        payloadPaths: item.torrentPayloadPaths
+                    ) {
+                        item.status = settings.startDownloadsAutomatically ? .queued : .paused
+                        item.progress = 0
+                        item.bytesWritten = 0
+                        item.expectedBytes = 0
+                        item.finishedAt = nil
+                        item.backendIdentifier = nil
+                        item.fileLocationPath = nil
+                        item.torrentPayloadPaths = []
+                        item.completionNotificationDelivered = false
+                        item.activityEvents.removeAll { $0.kind == .completed }
+                        item.updatedAt = .now
+                        item.lastError = settings.startDownloadsAutomatically
+                            ? nil
+                            : String(
+                                localized: "torrent.metadata.resumeToContinue",
+                                defaultValue: "Torrent metadata was restored. Resume to continue downloading the payload.",
+                                comment: "Status message shown after repairing a magnet that was previously marked complete after metadata retrieval."
+                            )
+                    }
+
                     if item.status == .completed, item.finishedAt == nil {
                         item.finishedAt = item.updatedAt
                     }
@@ -186,8 +212,20 @@ final class DownloadCenter {
                 $0.backend == .aria2 && $0.backendIdentifier != nil
             }
             let persistedGIDs = Set(persistedTorrentItems.compactMap(\.backendIdentifier))
+            var retainedEngineGIDs = persistedGIDs
 
-            for orphanedGID in engineGIDs.subtracting(persistedGIDs) {
+            for item in persistedTorrentItems {
+                guard let rootGID = item.backendIdentifier else {
+                    continue
+                }
+                let lineage = try await torrentService.followedStatus(for: rootGID)
+                retainedEngineGIDs.formUnion(lineage.gids)
+            }
+
+            for orphanedGID in Self.orphanedTorrentGIDs(
+                engineGIDs: engineGIDs,
+                retainedGIDs: retainedEngineGIDs
+            ) {
                 await torrentService.remove(gid: orphanedGID)
             }
 
@@ -208,7 +246,8 @@ final class DownloadCenter {
                     continue
                 }
 
-                let snapshot = try await torrentService.status(for: gid)
+                let lineage = try await torrentService.followedStatus(for: gid)
+                let snapshot = lineage.currentSnapshot
                 if Self.shouldPauseRestoredTorrent(
                     persistedStatus: item.status,
                     engineStatus: snapshot.status
@@ -1584,7 +1623,8 @@ final class DownloadCenter {
         do {
             if let backendIdentifier = currentItem.backendIdentifier {
                 do {
-                    let snapshot = try await torrentService.status(for: backendIdentifier)
+                    let lineage = try await torrentService.followedStatus(for: backendIdentifier)
+                    let snapshot = lineage.currentSnapshot
                     if snapshot.status == "paused" {
                         try await torrentService.unpause(gid: backendIdentifier)
                     } else if snapshot.status == "removed" || snapshot.status == "error" {
@@ -1946,7 +1986,7 @@ final class DownloadCenter {
             let lifecycleVersion = item.updatedAt
 
             do {
-                let snapshot = try await torrentService.status(for: backendIdentifier)
+                let lineage = try await torrentService.followedStatus(for: backendIdentifier)
                 guard let refreshedItem = self.item(for: item.id),
                       refreshedItem === item,
                       refreshedItem.backendIdentifier == backendIdentifier,
@@ -1956,7 +1996,7 @@ final class DownloadCenter {
                       isShuttingDown == false else {
                     continue
                 }
-                await apply(snapshot: snapshot, to: refreshedItem)
+                await apply(lineage: lineage, to: refreshedItem)
                 didMutate = true
             } catch {
                 guard let refreshedItem = self.item(for: item.id),
@@ -2038,7 +2078,59 @@ final class DownloadCenter {
         persistedStatus == .seeding && hasFinishedData && shouldSeed
     }
 
-    private func apply(snapshot: TorrentStatusSnapshot, to item: DownloadItem) async {
+    nonisolated static func shouldRepairMetadataOnlyMagnetCompletion(
+        sourceKind: DownloadSourceKind,
+        status: DownloadStatus,
+        fileLocationPath: String?,
+        payloadPaths: [String]
+    ) -> Bool {
+        guard sourceKind == .magnetLink, status == .completed else {
+            return false
+        }
+
+        return ([fileLocationPath].compactMap { $0 } + payloadPaths).contains { path in
+            URL(fileURLWithPath: path).lastPathComponent.hasPrefix("[METADATA]")
+        }
+    }
+
+    nonisolated static func orphanedTorrentGIDs(
+        engineGIDs: Set<String>,
+        retainedGIDs: Set<String>
+    ) -> Set<String> {
+        engineGIDs.subtracting(retainedGIDs)
+    }
+
+    nonisolated static func shouldAwaitMagnetPayload(
+        sourceKind: DownloadSourceKind,
+        lineage: TorrentStatusLineage
+    ) -> Bool {
+        sourceKind == .magnetLink && lineage.isMetadataOnly
+    }
+
+    private func apply(lineage: TorrentStatusLineage, to item: DownloadItem) async {
+        let snapshot = lineage.currentSnapshot
+
+        if Self.shouldAwaitMagnetPayload(sourceKind: item.sourceKind, lineage: lineage) {
+            item.speedBytesPerSecond = snapshot.downloadSpeed
+            item.uploadBytesPerSecond = snapshot.uploadSpeed
+            item.metadataName = snapshot.metadataName ?? item.metadataName
+            item.updatedAt = .now
+            item.lastError = nil
+            if item.status != .paused {
+                setStatus(for: item, to: .downloading)
+            }
+            return
+        }
+
+        if item.status == .paused,
+           (snapshot.status == "active" || snapshot.status == "waiting") {
+            try? await torrentService.pause(gid: lineage.rootGID)
+            item.speedBytesPerSecond = 0
+            item.uploadBytesPerSecond = 0
+            item.updatedAt = .now
+            return
+        }
+
         item.bytesWritten = snapshot.completedLength
         item.expectedBytes = max(snapshot.totalLength, 0)
         if snapshot.totalLength > 0 {
@@ -2060,7 +2152,7 @@ final class DownloadCenter {
                 || (snapshot.totalLength > 0 && snapshot.completedLength >= snapshot.totalLength && item.finishedAt != nil) {
                 await handleTorrentDataCompletion(
                     item,
-                    gid: snapshot.gid,
+                    gid: lineage.rootGID,
                     continuesSeeding: item.shouldSeedAfterDownload
                 )
             } else {
@@ -2087,7 +2179,7 @@ final class DownloadCenter {
             )
             item.speedBytesPerSecond = 0
             item.uploadBytesPerSecond = 0
-            let gid = snapshot.gid
+            let gid = lineage.rootGID
             item.backendIdentifier = nil
             if item.finishedAt != nil {
                 item.shouldSeedAfterDownload = false
@@ -2103,7 +2195,7 @@ final class DownloadCenter {
         case "complete":
             await handleTorrentDataCompletion(
                 item,
-                gid: snapshot.gid,
+                gid: lineage.rootGID,
                 continuesSeeding: false
             )
 

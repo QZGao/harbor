@@ -4,10 +4,14 @@ actor DownloadPersistence {
     private let fileManager: FileManager
     private let fileURL: URL
 
-    init(fileManager: FileManager = .default) {
+    init(
+        fileManager: FileManager = .default,
+        directoryURL: URL? = nil
+    ) {
         self.fileManager = fileManager
-        let directoryURL = HarborApplicationSupport.directoryURL(fileManager: fileManager)
-        self.fileURL = directoryURL.appendingPathComponent("downloads.json")
+        let resolvedDirectoryURL = directoryURL
+            ?? HarborApplicationSupport.directoryURL(fileManager: fileManager)
+        self.fileURL = resolvedDirectoryURL.appendingPathComponent("downloads.json")
     }
 
     func load() throws -> [DownloadRecord] {
