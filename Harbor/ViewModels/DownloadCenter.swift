@@ -736,15 +736,11 @@ final class DownloadCenter {
                 return
             }
 
-            let item = insertDownload(
+            insertDownload(
                 request,
                 managedTorrentSource: managedSource,
                 removeOriginalTorrentAfterImport: isWatchedImport && settings.removeWatchedTorrentAfterImport
             )
-
-            if isWatchedImport && request.shouldStartImmediately == false {
-                await persistTorrentAndCleanSourceIfNeeded(item)
-            }
         } catch {
             activeAlert = UserAlert(
                 title: String(localized: "Couldn’t Import Torrent"),
@@ -1692,7 +1688,7 @@ final class DownloadCenter {
                 to: refreshedItem.finishedAt == nil ? .downloading : .seeding
             )
             refreshedItem.updatedAt = .now
-            await persistTorrentAndCleanSourceIfNeeded(refreshedItem)
+            schedulePersist()
         } catch {
             guard let refreshedItem = item(for: id) else {
                 return
@@ -1772,8 +1768,10 @@ final class DownloadCenter {
         return URL(fileURLWithPath: managedTorrentSourcePath)
     }
 
-    private func persistTorrentAndCleanSourceIfNeeded(_ item: DownloadItem) async {
-        guard item.removeOriginalTorrentAfterImport,
+    func removeOriginalTorrentSourceAfterCompletionIfNeeded(_ item: DownloadItem) async {
+        guard item.finishedAt != nil,
+              item.status == .completed || item.status == .seeding,
+              item.removeOriginalTorrentAfterImport,
               torrentSourceCleanupIDs.insert(item.id).inserted else {
             return
         }
@@ -2242,6 +2240,7 @@ final class DownloadCenter {
         }
 
         await persistCompletionAndNotifyIfNeeded(item)
+        await removeOriginalTorrentSourceAfterCompletionIfNeeded(item)
 
         startNextQueuedDownloadsIfNeeded()
     }

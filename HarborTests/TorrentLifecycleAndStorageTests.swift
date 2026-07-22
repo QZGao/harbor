@@ -82,7 +82,7 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
         await center.shutdownForTermination()
     }
 
-    func testWatchedTorrentSourceIsTrashedWhileImportRemainsPaused() async throws {
+    func testWatchedTorrentSourceIsTrashedOnlyAfterCompletion() async throws {
         let fileManager = FileManager.default
         let rootURL = fileManager.temporaryDirectory
             .appendingPathComponent("HarborWatchedCleanupTests-\(UUID().uuidString)", isDirectory: true)
@@ -128,16 +128,27 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
         center.receiveWatchedTorrent(torrentURL)
 
         for _ in 0 ..< 40 {
-            if center.downloads.count == 1,
-               fileManager.fileExists(atPath: torrentURL.path) == false {
+            if center.downloads.count == 1 {
                 break
             }
             try await Task.sleep(for: .milliseconds(25))
         }
 
         XCTAssertEqual(center.downloads.count, 1)
-        XCTAssertEqual(center.downloads.first?.status, .paused)
+        let item = try XCTUnwrap(center.downloads.first)
+        XCTAssertEqual(item.status, .paused)
+        XCTAssertTrue(fileManager.fileExists(atPath: torrentURL.path))
+
+        await center.removeOriginalTorrentSourceAfterCompletionIfNeeded(item)
+
+        XCTAssertTrue(fileManager.fileExists(atPath: torrentURL.path))
+
+        item.status = .completed
+        item.finishedAt = .now
+        await center.removeOriginalTorrentSourceAfterCompletionIfNeeded(item)
+
         XCTAssertFalse(fileManager.fileExists(atPath: torrentURL.path))
+        XCTAssertFalse(item.removeOriginalTorrentAfterImport)
     }
 
     func testPrepareLocalTorrentCreatesStableDeduplicatedManagedCopy() async throws {
