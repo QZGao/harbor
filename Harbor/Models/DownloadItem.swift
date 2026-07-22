@@ -113,6 +113,7 @@ struct DownloadRecord: Codable, Sendable {
     let updatedAt: Date
     let lastError: String?
     let resumeData: Data?
+    let requestHeaders: [RequestHeader]
     let backendIdentifier: String?
     let metadataName: String?
     let mediaMetadata: MediaDownloadMetadata?
@@ -137,6 +138,7 @@ struct DownloadRecord: Codable, Sendable {
         case updatedAt
         case lastError
         case resumeData
+        case requestHeaders
         case backendIdentifier
         case metadataName
         case mediaMetadata
@@ -162,6 +164,7 @@ struct DownloadRecord: Codable, Sendable {
         updatedAt: Date,
         lastError: String?,
         resumeData: Data?,
+        requestHeaders: [RequestHeader] = [],
         backendIdentifier: String?,
         metadataName: String?,
         mediaMetadata: MediaDownloadMetadata? = nil,
@@ -185,6 +188,7 @@ struct DownloadRecord: Codable, Sendable {
         self.updatedAt = updatedAt
         self.lastError = lastError
         self.resumeData = resumeData
+        self.requestHeaders = requestHeaders
         self.backendIdentifier = backendIdentifier
         self.metadataName = metadataName
         self.mediaMetadata = mediaMetadata
@@ -211,6 +215,7 @@ struct DownloadRecord: Codable, Sendable {
         self.updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? .now
         self.lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
         self.resumeData = try container.decodeIfPresent(Data.self, forKey: .resumeData)
+        self.requestHeaders = try container.decodeIfPresent([RequestHeader].self, forKey: .requestHeaders) ?? []
         self.backendIdentifier = try container.decodeIfPresent(String.self, forKey: .backendIdentifier)
         self.metadataName = try container.decodeIfPresent(String.self, forKey: .metadataName)
         self.mediaMetadata = try container.decodeIfPresent(MediaDownloadMetadata.self, forKey: .mediaMetadata)
@@ -237,6 +242,7 @@ struct DownloadRecord: Codable, Sendable {
         try container.encode(updatedAt, forKey: .updatedAt)
         try container.encode(lastError, forKey: .lastError)
         try container.encode(resumeData, forKey: .resumeData)
+        try container.encode(requestHeaders, forKey: .requestHeaders)
         try container.encode(backendIdentifier, forKey: .backendIdentifier)
         try container.encode(metadataName, forKey: .metadataName)
         try container.encode(mediaMetadata, forKey: .mediaMetadata)
@@ -272,6 +278,7 @@ final class DownloadItem: Identifiable {
     var metadataName: String?
     var mediaMetadata: MediaDownloadMetadata?
     var mediaFormatPreference: MediaDownloadFormatPreference?
+    var requestHeaders: [RequestHeader]
     var activityEvents: [DownloadActivityEvent]
 
     init(
@@ -299,6 +306,7 @@ final class DownloadItem: Identifiable {
         metadataName: String? = nil,
         mediaMetadata: MediaDownloadMetadata? = nil,
         mediaFormatPreference: MediaDownloadFormatPreference? = nil,
+        requestHeaders: [RequestHeader] = [],
         activityEvents: [DownloadActivityEvent] = []
     ) {
         self.id = id
@@ -325,6 +333,7 @@ final class DownloadItem: Identifiable {
         self.metadataName = metadataName
         self.mediaMetadata = mediaMetadata
         self.mediaFormatPreference = mediaFormatPreference
+        self.requestHeaders = requestHeaders
         self.activityEvents = activityEvents
 
         if self.activityEvents.contains(where: { $0.kind == .added }) == false {
@@ -361,6 +370,7 @@ final class DownloadItem: Identifiable {
             metadataName: record.metadataName,
             mediaMetadata: record.mediaMetadata,
             mediaFormatPreference: record.mediaFormatPreference,
+            requestHeaders: record.requestHeaders,
             activityEvents: record.activityEvents
         )
     }
@@ -524,6 +534,7 @@ final class DownloadItem: Identifiable {
             updatedAt: updatedAt,
             lastError: lastError,
             resumeData: resumeData,
+            requestHeaders: requestHeaders,
             backendIdentifier: backendIdentifier,
             metadataName: metadataName,
             mediaMetadata: mediaMetadata,

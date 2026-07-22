@@ -147,12 +147,16 @@ actor Aria2TorrentService {
     func addDownload(
         sourceKind: DownloadSourceKind,
         sourceURL: URL,
-        destinationFolderPath: String
+        destinationFolderPath: String,
+        requestHeaders: [RequestHeader]
     ) async throws -> String {
         logger.info("Starting torrent add request for source kind \(String(describing: sourceKind), privacy: .public)")
         try await ensureDaemonRunning()
 
-        let options = downloadOptions(destinationFolderPath: destinationFolderPath)
+        let options = downloadOptions(
+            destinationFolderPath: destinationFolderPath,
+            requestHeaders: requestHeaders
+        )
 
         switch sourceKind {
         case .magnetLink:
@@ -170,7 +174,10 @@ actor Aria2TorrentService {
             logger.info("aria2 accepted magnet download with gid \(gid, privacy: .public)")
             return gid
         case .torrentFile:
-            let torrentData = try Data(contentsOf: sourceURL)
+            let torrentData = try await TorrentSourceLoader.load(
+                from: sourceURL,
+                requestHeaders: requestHeaders
+            )
             let gid = try await rpcCallWithDaemonRestart(
                 method: "aria2.addTorrent",
                 params: {
@@ -373,15 +380,22 @@ actor Aria2TorrentService {
         return "token:\(rpcSecret)"
     }
 
-    private func downloadOptions(destinationFolderPath: String) -> [String: String] {
-        var options = [
+    private func downloadOptions(
+        destinationFolderPath: String,
+        requestHeaders: [RequestHeader]
+    ) -> [String: Any] {
+        var options: [String: Any] = [
             "dir": destinationFolderPath,
             "continue": "true",
             "pause": "false"
         ]
 
-        perDownloadOptions(transferSettings).forEach { key, value in
+        for (key, value) in perDownloadOptions(transferSettings) {
             options[key] = value
+        }
+
+        if requestHeaders.isEmpty == false {
+            options["header"] = requestHeaders.map(\.aria2HeaderValue)
         }
 
         return options

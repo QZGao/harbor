@@ -20,6 +20,9 @@ struct AddDownloadSheet: View {
     @State private var torrentFileURL: URL?
     @State private var destinationPath: String
     @State private var shouldStartImmediately: Bool
+    @State private var requestHeaders: [RequestHeader]
+    @State private var isAdvancedSettingsExpanded = false
+    @State private var isRequestHeadersEditorPresented = false
     @State private var validationMessage: String?
     @State private var mediaPreview: MediaDownloadMetadata?
     @State private var mediaPreviewError: String?
@@ -29,6 +32,8 @@ struct AddDownloadSheet: View {
     @State private var isSubmitting = false
     @State private var mediaPreviewTask: Task<Void, Never>?
     @State private var mediaPreviewGeneration = 0
+    @State private var approvedSensitiveTorrentHeaders: [RequestHeader]?
+    @State private var pendingSensitiveHeaderRequest: AddDownloadRequest?
 
     init(
         settings: AppSettingsStore,
@@ -45,6 +50,7 @@ struct AddDownloadSheet: View {
         _torrentFileURL = State(initialValue: draft.torrentFileURL)
         _destinationPath = State(initialValue: draft.destinationFolderURL.path)
         _shouldStartImmediately = State(initialValue: draft.shouldStartImmediately)
+        _requestHeaders = State(initialValue: draft.requestHeaders)
     }
 
     var body: some View {
@@ -96,6 +102,8 @@ struct AddDownloadSheet: View {
                 destinationPicker
 
                 Toggle("Start immediately", isOn: $shouldStartImmediately)
+
+                advancedSettingsSection
             }
             .formStyle(.grouped)
 
@@ -150,6 +158,42 @@ struct AddDownloadSheet: View {
             } else {
                 focusedField = nil
             }
+        }
+        .sheet(isPresented: $isRequestHeadersEditorPresented) {
+            RequestHeadersEditor(
+                requestHeaders: requestHeaders,
+                sourceUsesAria2: currentSourceUsesAria2
+            ) { updatedHeaders, confirmedSensitiveTorrentWarning in
+                requestHeaders = updatedHeaders
+                approvedSensitiveTorrentHeaders = confirmedSensitiveTorrentWarning
+                    ? updatedHeaders
+                    : nil
+                validationMessage = nil
+            }
+        }
+        // Fallback if the source becomes an aria2 job after sensitive headers were saved.
+        .alert(
+            "Sensitive headers may be shared",
+            isPresented: Binding(
+                get: { pendingSensitiveHeaderRequest != nil },
+                set: { isPresented in
+                    if isPresented == false {
+                        pendingSensitiveHeaderRequest = nil
+                    }
+                }
+            )
+        ) {
+            Button("Cancel", role: .cancel) {
+                pendingSensitiveHeaderRequest = nil
+            }
+
+            Button("Continue Download") {
+                continuePendingSensitiveHeaderDownload()
+            }
+        } message: {
+            Text(
+                "The supplied headers contain Cookie or Authorization information. aria2 may send these headers to every HTTP/HTTPS tracker and web seed used by this torrent. Proceed?"
+            )
         }
     }
 
@@ -240,6 +284,29 @@ struct AddDownloadSheet: View {
         }
     }
 
+    private var advancedSettingsSection: some View {
+        DisclosureGroup(isExpanded: $isAdvancedSettingsExpanded) {
+            LabeledContent("Request Headers") {
+                Button("Configure…") {
+                    isRequestHeadersEditorPresented = true
+                }
+            }
+            .padding(.top, 10)
+            .padding(.leading, 24)
+        } label: {
+            HStack {
+                Text("Advanced Settings")
+                Spacer()
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                withAnimation {
+                    isAdvancedSettingsExpanded.toggle()
+                }
+            }
+        }
+    }
+
     private var canSubmit: Bool {
         switch entryMode {
         case .linkOrMagnet:
@@ -287,6 +354,19 @@ struct AddDownloadSheet: View {
     private var parsedLinkURL: URL? {
         let trimmedURL = sourceURLText.trimmingCharacters(in: .whitespacesAndNewlines)
         return URL(string: trimmedURL)
+    }
+
+    private var currentSourceUsesAria2: Bool {
+        switch entryMode {
+        case .torrentFile:
+            true
+        case .linkOrMagnet:
+            if let parsedLinkURL {
+                DownloadSourceKind.detect(from: parsedLinkURL)?.usesAria2 == true
+            } else {
+                false
+            }
+        }
     }
 
     @MainActor
@@ -396,18 +476,52 @@ struct AddDownloadSheet: View {
         let folderURL = URL(fileURLWithPath: destinationPath, isDirectory: true)
         let trimmedFilename = customFilename.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        onSubmit(
-            AddDownloadRequest(
-                sourceKind: sourceKind,
-                sourceURL: sourceURL,
-                customFilename: sourceKind.supportsCustomFilename && trimmedFilename.isEmpty == false ? trimmedFilename : nil,
-                destinationFolder: folderURL,
-                shouldStartImmediately: shouldStartImmediately,
-                mediaMetadata: requestMediaMetadata,
-                mediaFormatPreference: requestMediaFormatPreference
+        guard sourceKind != .mediaURL || requestHeaders.isEmpty else {
+            validationMessage = String(
+                localized: "add.validation.mediaHeadersUnsupported",
+                defaultValue: "Request headers aren’t supported for media downloads.",
+                comment: "Validation message shown when request headers are supplied for a yt-dlp media download."
             )
+            return
+        }
+
+        let request = AddDownloadRequest(
+            sourceKind: sourceKind,
+            sourceURL: sourceURL,
+            customFilename: sourceKind.supportsCustomFilename && trimmedFilename.isEmpty == false ? trimmedFilename : nil,
+            destinationFolder: folderURL,
+            shouldStartImmediately: shouldStartImmediately,
+            requestHeaders: requestHeaders,
+            mediaMetadata: requestMediaMetadata,
+            mediaFormatPreference: requestMediaFormatPreference
         )
+
+        if sourceKind.usesAria2,
+           requestHeaders.triggersSensitiveTorrentWarning,
+           approvedSensitiveTorrentHeaders != requestHeaders {
+            pendingSensitiveHeaderRequest = request
+            return
+        }
+
+        performSubmission(request)
+    }
+
+    @MainActor
+    private func performSubmission(_ request: AddDownloadRequest) {
+        onSubmit(request)
         dismiss()
+    }
+
+    private func continuePendingSensitiveHeaderDownload() {
+        guard let request = pendingSensitiveHeaderRequest,
+              isSubmitting == false else {
+            return
+        }
+
+        pendingSensitiveHeaderRequest = nil
+        isSubmitting = true
+        defer { isSubmitting = false }
+        performSubmission(request)
     }
 
     @ViewBuilder
@@ -510,7 +624,8 @@ struct AddDownloadSheet: View {
 
         guard entryMode == .linkOrMagnet,
               let url = parsedLinkURL,
-              DownloadSourceKind.detect(from: url) == .directURL else {
+              DownloadSourceKind.detect(from: url) == .directURL,
+              isKnownMediaHost(url) else {
             return
         }
 

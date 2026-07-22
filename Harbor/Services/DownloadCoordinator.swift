@@ -28,6 +28,8 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
 
     private struct TaskContext {
         let downloadID: UUID
+        let sourceURL: URL
+        let requestHeaders: [RequestHeader]
         let session: URLSession
         let task: URLSessionDownloadTask
         var transferSample: TransferSample
@@ -75,18 +77,27 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
     }
 
     @discardableResult
-    func startDownload(id: UUID, sourceURL: URL, resumeData: Data?) -> Int {
+    func startDownload(
+        id: UUID,
+        sourceURL: URL,
+        requestHeaders: [RequestHeader],
+        resumeData: Data?
+    ) -> Int {
         let session = makeSession()
         let task: URLSessionDownloadTask
         if let resumeData {
             task = session.downloadTask(withResumeData: resumeData)
         } else {
-            task = session.downloadTask(with: sourceURL)
+            var request = URLRequest(url: sourceURL)
+            requestHeaders.apply(to: &request)
+            task = session.downloadTask(with: request)
         }
 
         let key = makeTaskKey(session: session, taskIdentifier: task.taskIdentifier)
         let context = TaskContext(
             downloadID: id,
+            sourceURL: sourceURL,
+            requestHeaders: requestHeaders,
             session: session,
             task: task,
             transferSample: TransferSample(
@@ -173,6 +184,16 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         withLock {
             let suppressed = suppressedCompletionTaskKeys.remove(taskKey) != nil
             return suppressed && error.domain == NSURLErrorDomain && error.code == NSURLErrorCancelled
+        }
+    }
+
+    private func redirectContext(
+        for taskKey: TaskKey
+    ) -> (sourceURL: URL, requestHeaders: [RequestHeader])? {
+        withLock {
+            contexts[taskKey].map { context in
+                (context.sourceURL, context.requestHeaders)
+            }
         }
     }
 
@@ -298,6 +319,34 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
 }
 
 extension DownloadCoordinator: URLSessionDownloadDelegate, URLSessionTaskDelegate {
+    /// Preserves this download's request headers when URLSession follows a same-origin redirect.
+    ///
+    /// URLSession creates the proposed redirect request and may omit headers such as `Authorization`.
+    /// Looking up the task context keeps the headers scoped to their originating download, while
+    /// `apply(toSameOriginRedirect:originatingAt:)` prevents us from deliberately reapplying them
+    /// after the redirect crosses an HTTP origin boundary. The completion handler must always be
+    /// called; passing the resulting request allows URLSession to continue following the redirect.
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        let taskKey = makeTaskKey(session: session, taskIdentifier: task.taskIdentifier)
+        guard let context = redirectContext(for: taskKey) else {
+            completionHandler(request)
+            return
+        }
+
+        var redirectedRequest = request
+        context.requestHeaders.apply(
+            toSameOriginRedirect: &redirectedRequest,
+            originatingAt: context.sourceURL
+        )
+        completionHandler(redirectedRequest)
+    }
+
     func urlSession(
         _ session: URLSession,
         downloadTask: URLSessionDownloadTask,

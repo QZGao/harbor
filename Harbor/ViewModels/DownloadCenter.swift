@@ -445,7 +445,8 @@ final class DownloadCenter {
             status: request.shouldStartImmediately ? .queued : .paused,
             metadataName: request.mediaMetadata?.title,
             mediaMetadata: request.mediaMetadata,
-            mediaFormatPreference: request.mediaFormatPreference
+            mediaFormatPreference: request.mediaFormatPreference,
+            requestHeaders: request.requestHeaders
         )
 
         if request.sourceKind == .magnetLink {
@@ -900,6 +901,7 @@ final class DownloadCenter {
             item.taskIdentifier = coordinator.startDownload(
                 id: item.id,
                 sourceURL: item.sourceURL,
+                requestHeaders: item.requestHeaders,
                 resumeData: item.resumeData
             )
             item.resumeData = nil
@@ -1017,7 +1019,8 @@ final class DownloadCenter {
                     let replacementIdentifier = try await torrentService.addDownload(
                         sourceKind: refreshedItem.sourceKind,
                         sourceURL: refreshedItem.sourceURL,
-                        destinationFolderPath: refreshedItem.destinationFolderPath
+                        destinationFolderPath: refreshedItem.destinationFolderPath,
+                        requestHeaders: refreshedItem.requestHeaders
                     )
 
                     guard item(for: id) != nil else {
@@ -1031,7 +1034,8 @@ final class DownloadCenter {
                 let backendIdentifier = try await torrentService.addDownload(
                     sourceKind: currentItem.sourceKind,
                     sourceURL: currentItem.sourceURL,
-                    destinationFolderPath: currentItem.destinationFolderPath
+                    destinationFolderPath: currentItem.destinationFolderPath,
+                    requestHeaders: currentItem.requestHeaders
                 )
                 guard item(for: id) != nil else {
                     await torrentService.remove(gid: backendIdentifier)
@@ -2062,7 +2066,15 @@ final class DownloadCenter {
 
         persistTask?.cancel()
         persistTask = Task { [persistence] in
-            try? await Task.sleep(for: .milliseconds(250))
+            do {
+                try await Task.sleep(for: .milliseconds(250))
+            } catch {
+                return
+            }
+
+            guard Task.isCancelled == false else {
+                return
+            }
             try? await persistence.save(records)
         }
     }
