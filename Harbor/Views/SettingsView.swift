@@ -43,10 +43,6 @@ struct SettingsView: View {
                     TorrentWatchStatusRow(status: settings.torrentWatchFolderStatus)
                 }
 
-                Toggle(
-                    "Move imported torrent files to Trash",
-                    isOn: $settings.removeWatchedTorrentAfterImport
-                )
                 Toggle("Seed new torrents after downloading", isOn: $settings.seedNewTorrents)
             }
 

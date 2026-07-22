@@ -30,7 +30,6 @@ final class AppSettingsStore {
         static let torrentDestinationPath = "torrentDestinationPath"
         static let torrentWatchFolderPath = "torrentWatchFolderPath"
         static let torrentWatchFolderEnabled = "torrentWatchFolderEnabled"
-        static let removeWatchedTorrentAfterImport = "removeWatchedTorrentAfterImport"
         static let seedNewTorrents = "seedNewTorrents"
         static let maxConcurrentDownloads = "maxConcurrentDownloads"
         static let startDownloadsAutomatically = "startDownloadsAutomatically"
@@ -77,13 +76,6 @@ final class AppSettingsStore {
     var torrentWatchFolderEnabled: Bool {
         didSet {
             userDefaults.set(torrentWatchFolderEnabled, forKey: Keys.torrentWatchFolderEnabled)
-            notifyTorrentAutomationSettingsChanged()
-        }
-    }
-
-    var removeWatchedTorrentAfterImport: Bool {
-        didSet {
-            userDefaults.set(removeWatchedTorrentAfterImport, forKey: Keys.removeWatchedTorrentAfterImport)
             notifyTorrentAutomationSettingsChanged()
         }
     }
@@ -202,7 +194,6 @@ final class AppSettingsStore {
         self.torrentWatchFolderPath = userDefaults.string(forKey: Keys.torrentWatchFolderPath)
             ?? defaultDownloadsPath
         self.torrentWatchFolderEnabled = userDefaults.bool(forKey: Keys.torrentWatchFolderEnabled)
-        self.removeWatchedTorrentAfterImport = userDefaults.bool(forKey: Keys.removeWatchedTorrentAfterImport)
         if userDefaults.object(forKey: Keys.seedNewTorrents) == nil {
             self.seedNewTorrents = true
         } else {

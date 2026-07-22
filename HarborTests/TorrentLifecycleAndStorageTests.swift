@@ -82,7 +82,7 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
         await center.shutdownForTermination()
     }
 
-    func testWatchedTorrentSourceIsTrashedOnlyAfterCompletion() async throws {
+    func testRemovingTorrentFromListTrashesSourceButKeepsPayload() async throws {
         let fileManager = FileManager.default
         let rootURL = fileManager.temporaryDirectory
             .appendingPathComponent("HarborWatchedCleanupTests-\(UUID().uuidString)", isDirectory: true)
@@ -110,7 +110,6 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
 
         let settings = AppSettingsStore(userDefaults: userDefaults)
         settings.startDownloadsAutomatically = false
-        settings.removeWatchedTorrentAfterImport = true
         settings.torrentDestinationPath = rootURL.appendingPathComponent("Downloads", isDirectory: true).path
 
         let store = ManagedTorrentSourceStore(
@@ -136,19 +135,21 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
 
         XCTAssertEqual(center.downloads.count, 1)
         let item = try XCTUnwrap(center.downloads.first)
-        XCTAssertEqual(item.status, .paused)
+        let payloadURL = rootURL.appendingPathComponent("Downloads/payload.bin")
+        try fileManager.createDirectory(
+            at: payloadURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("downloaded payload".utf8).write(to: payloadURL)
+        item.torrentPayloadPaths = [payloadURL.path]
+
         XCTAssertTrue(fileManager.fileExists(atPath: torrentURL.path))
 
-        await center.removeOriginalTorrentSourceAfterCompletionIfNeeded(item)
+        center.removeDownload(id: item.id)
 
-        XCTAssertTrue(fileManager.fileExists(atPath: torrentURL.path))
-
-        item.status = .completed
-        item.finishedAt = .now
-        await center.removeOriginalTorrentSourceAfterCompletionIfNeeded(item)
-
+        XCTAssertTrue(center.downloads.isEmpty)
         XCTAssertFalse(fileManager.fileExists(atPath: torrentURL.path))
-        XCTAssertFalse(item.removeOriginalTorrentAfterImport)
+        XCTAssertTrue(fileManager.fileExists(atPath: payloadURL.path))
     }
 
     func testPrepareLocalTorrentCreatesStableDeduplicatedManagedCopy() async throws {

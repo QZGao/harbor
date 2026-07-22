@@ -4631,34 +4631,6 @@
         }
       }
     },
-    "Move imported torrent files to Trash" : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "Move imported torrent files to Trash"
-          }
-        },
-        "es" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Mover los archivos torrent importados a la papelera"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Sposta i file torrent importati nel Cestino"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "将已导入的 Torrent 文件移到废纸篓"
-          }
-        }
-      }
-    },
     "Move to Trash" : {
       "localizations" : {
         "en" : {
@@ -5882,30 +5854,30 @@
         }
       }
     },
-    "The watched torrent file changed after Harbor imported it, so Harbor left the current file untouched." : {
+    "The torrent file changed after Harbor imported it, so Harbor left the current file untouched." : {
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "The watched torrent file changed after Harbor imported it, so Harbor left the current file untouched."
+            "value" : "The torrent file changed after Harbor imported it, so Harbor left the current file untouched."
           }
         },
         "es" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "El archivo torrent vigilado cambió después de que Harbor lo importara, por lo que Harbor dejó intacto el archivo actual."
+            "value" : "El archivo torrent cambió después de que Harbor lo importara, por lo que Harbor dejó intacto el archivo actual."
           }
         },
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Il file torrent monitorato è cambiato dopo l’importazione, quindi Harbor ha lasciato intatto il file attuale."
+            "value" : "Il file torrent è cambiato dopo l’importazione, quindi Harbor ha lasciato intatto il file attuale."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "监视的 Torrent 文件在 Harbor 导入后发生了变化，因此 Harbor 未改动当前文件。"
+            "value" : "Torrent 文件在 Harbor 导入后发生了变化，因此 Harbor 未改动当前文件。"
           }
         }
       }

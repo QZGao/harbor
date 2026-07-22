@@ -27,7 +27,6 @@ final class DownloadCenter {
     @ObservationIgnored private var isReconcilingSelection = false
     @ObservationIgnored private var mediaStartTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private var torrentStartTasks: [UUID: Task<Void, Never>] = [:]
-    @ObservationIgnored private var torrentSourceCleanupIDs: Set<UUID> = []
     @ObservationIgnored private var pendingExternalAddSheetDrafts: [AddDownloadSheetDraft] = []
 
     var downloads: [DownloadItem] = []
@@ -651,8 +650,7 @@ final class DownloadCenter {
     @discardableResult
     private func insertDownload(
         _ request: AddDownloadRequest,
-        managedTorrentSource: ManagedTorrentSource? = nil,
-        removeOriginalTorrentAfterImport: Bool = false
+        managedTorrentSource: ManagedTorrentSource? = nil
     ) -> DownloadItem {
         let backend = backend(for: request.sourceKind)
         let preferredFilename: String?
@@ -678,8 +676,7 @@ final class DownloadCenter {
             mediaFormatPreference: request.mediaFormatPreference,
             torrentFingerprint: managedTorrentSource?.fingerprint,
             managedTorrentSourcePath: managedTorrentSource?.managedURL.path,
-            shouldSeedAfterDownload: backend == .aria2 ? settings.seedNewTorrents : false,
-            removeOriginalTorrentAfterImport: removeOriginalTorrentAfterImport
+            shouldSeedAfterDownload: backend == .aria2 ? settings.seedNewTorrents : false
         )
 
         if request.sourceKind == .magnetLink {
@@ -738,8 +735,7 @@ final class DownloadCenter {
 
             insertDownload(
                 request,
-                managedTorrentSource: managedSource,
-                removeOriginalTorrentAfterImport: isWatchedImport && settings.removeWatchedTorrentAfterImport
+                managedTorrentSource: managedSource
             )
         } catch {
             activeAlert = UserAlert(
@@ -1110,6 +1106,7 @@ final class DownloadCenter {
         }
 
         let removedPrimarySelection = selectedDownloadID == id
+        moveOriginalTorrentFileToTrashIfNeeded(for: item)
         removeManagedTorrentSourceIfNeeded(for: item)
         downloads.removeAll { $0.id == id }
         selectedDownloadIDs.remove(id)
@@ -1124,6 +1121,40 @@ final class DownloadCenter {
         }
     }
 
+    private func moveOriginalTorrentFileToTrashIfNeeded(for item: DownloadItem) {
+        guard item.sourceKind == .torrentFile,
+              item.sourceURL.isFileURL,
+              FileManager.default.fileExists(atPath: item.sourceURL.path) else {
+            return
+        }
+
+        let didAccessSecurityScopedResource = item.sourceURL.startAccessingSecurityScopedResource()
+        defer {
+            if didAccessSecurityScopedResource {
+                item.sourceURL.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        guard let expectedFingerprint = item.torrentFingerprint,
+              let data = try? Data(contentsOf: item.sourceURL, options: .mappedIfSafe),
+              ManagedTorrentSourceStore.fingerprint(for: data) == expectedFingerprint else {
+            activeAlert = UserAlert(
+                title: String(localized: "Torrent File Was Left in Place"),
+                message: String(localized: "The torrent file changed after Harbor imported it, so Harbor left the current file untouched.")
+            )
+            return
+        }
+
+        do {
+            try FileManager.default.trashItem(at: item.sourceURL, resultingItemURL: nil)
+        } catch {
+            activeAlert = UserAlert(
+                title: String(localized: "Couldn’t Move Torrent File to Trash"),
+                message: error.localizedDescription
+            )
+        }
+    }
+
     private func removeManagedTorrentSourceIfNeeded(for item: DownloadItem) {
         guard let managedTorrentSourcePath = item.managedTorrentSourcePath else {
             return
@@ -1135,6 +1166,7 @@ final class DownloadCenter {
     func clearCompleted() {
         let completedItems = downloads.filter { $0.status == .completed }
         cleanupBackendIdentifiers(for: completedItems)
+        completedItems.forEach { moveOriginalTorrentFileToTrashIfNeeded(for: $0) }
         completedItems.forEach { removeManagedTorrentSourceIfNeeded(for: $0) }
         downloads.removeAll { $0.status == .completed }
         selectedDownloadIDs = selectedDownloadIDs.filter { id in
@@ -1149,6 +1181,7 @@ final class DownloadCenter {
     func clearFailed() {
         let failedItems = downloads.filter { $0.status == .failed }
         cleanupBackendIdentifiers(for: failedItems)
+        failedItems.forEach { moveOriginalTorrentFileToTrashIfNeeded(for: $0) }
         failedItems.forEach { removeManagedTorrentSourceIfNeeded(for: $0) }
         downloads.removeAll { $0.status == .failed }
         selectedDownloadIDs = selectedDownloadIDs.filter { id in
@@ -1768,80 +1801,6 @@ final class DownloadCenter {
         return URL(fileURLWithPath: managedTorrentSourcePath)
     }
 
-    func removeOriginalTorrentSourceAfterCompletionIfNeeded(_ item: DownloadItem) async {
-        guard item.finishedAt != nil,
-              item.status == .completed || item.status == .seeding,
-              item.removeOriginalTorrentAfterImport,
-              torrentSourceCleanupIDs.insert(item.id).inserted else {
-            return
-        }
-
-        defer {
-            torrentSourceCleanupIDs.remove(item.id)
-        }
-
-        persistTask?.cancel()
-        persistTask = nil
-
-        do {
-            try await persistence.save(downloads.map { $0.makeRecord() })
-        } catch {
-            schedulePersist()
-            activeAlert = UserAlert(
-                title: String(localized: "Couldn’t Save Torrent"),
-                message: String(
-                    localized: "torrent.import.saveFailed",
-                    defaultValue: "The torrent was imported, but Harbor couldn’t save its state. The original torrent file was left in place.",
-                    comment: "Alert message shown when Harbor cannot persist an imported torrent before source cleanup."
-                )
-            )
-            return
-        }
-
-        guard item.removeOriginalTorrentAfterImport else {
-            return
-        }
-
-        let originalURL = item.sourceURL
-        guard originalURL.isFileURL else {
-            item.removeOriginalTorrentAfterImport = false
-            schedulePersist()
-            return
-        }
-
-        guard FileManager.default.fileExists(atPath: originalURL.path) else {
-            item.removeOriginalTorrentAfterImport = false
-            schedulePersist()
-            return
-        }
-
-        guard let expectedFingerprint = item.torrentFingerprint,
-              await managedTorrentSourceStore.torrent(
-                at: originalURL,
-                matches: expectedFingerprint
-              ) else {
-            item.removeOriginalTorrentAfterImport = false
-            activeAlert = UserAlert(
-                title: String(localized: "Torrent File Was Left in Place"),
-                message: String(localized: "The watched torrent file changed after Harbor imported it, so Harbor left the current file untouched.")
-            )
-            schedulePersist()
-            return
-        }
-
-        do {
-            try FileManager.default.trashItem(at: originalURL, resultingItemURL: nil)
-        } catch {
-            activeAlert = UserAlert(
-                title: String(localized: "Couldn’t Move Torrent File to Trash"),
-                message: error.localizedDescription
-            )
-        }
-
-        item.removeOriginalTorrentAfterImport = false
-        schedulePersist()
-    }
-
     private func pauseDownload(id: UUID) {
         guard let item = item(for: id) else {
             return
@@ -2240,7 +2199,6 @@ final class DownloadCenter {
         }
 
         await persistCompletionAndNotifyIfNeeded(item)
-        await removeOriginalTorrentSourceAfterCompletionIfNeeded(item)
 
         startNextQueuedDownloadsIfNeeded()
     }
