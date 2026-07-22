@@ -1806,6 +1806,11 @@ final class DownloadCenter {
             return
         }
 
+        if item.status == .seeding, item.finishedAt != nil {
+            stopSeeding(id: id)
+            return
+        }
+
         let shouldWaitForMediaProcess = item.backend == .ytDlp
             && (item.backendIdentifier != nil || mediaStartTasks[id] != nil)
 

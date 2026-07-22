@@ -5,7 +5,7 @@ import XCTest
 
 @MainActor
 final class TorrentLifecycleAndStorageTests: XCTestCase {
-    func testPausedSeederWithoutBackendIdentifierCanStopSeeding() async {
+    func testPausingSeederStopsSeedingAndMarksItCompleted() async {
         let suiteName = "HarborTests.SeedingLifecycle.\(UUID().uuidString)"
         let userDefaults = UserDefaults(suiteName: suiteName)!
         userDefaults.removePersistentDomain(forName: suiteName)
@@ -32,12 +32,6 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
         center.downloads = [item]
 
         center.pauseDownloads(ids: [item.id])
-
-        XCTAssertEqual(item.status, .paused)
-        XCTAssertTrue(item.shouldSeedAfterDownload)
-        XCTAssertNil(item.backendIdentifier)
-
-        center.stopSeeding(id: item.id)
 
         XCTAssertEqual(item.status, .completed)
         XCTAssertFalse(item.shouldSeedAfterDownload)
