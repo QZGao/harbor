@@ -23,7 +23,7 @@ struct AddDownloadSheet: View {
     @State private var validationMessage: String?
     @State private var mediaPreview: MediaDownloadMetadata?
     @State private var mediaPreviewError: String?
-    @State private var mediaFormatPreference: MediaDownloadFormatPreference = .bestMP4
+    @State private var mediaFormatPreference: MediaDownloadFormatPreference = .original
     @State private var hasMediaSavePermission = false
     @State private var isResolvingMedia = false
     @State private var isSubmitting = false
@@ -166,7 +166,7 @@ struct AddDownloadSheet: View {
             }
         }
 
-        if let mediaPreview {
+        else if let mediaPreview {
             LabeledContent("Media") {
                 HStack(spacing: 12) {
                     mediaThumbnail(for: mediaPreview)
@@ -183,34 +183,52 @@ struct AddDownloadSheet: View {
                 }
             }
 
-            Picker("Format", selection: $mediaFormatPreference) {
-                ForEach(MediaDownloadFormatPreference.allCases) { preference in
-                    Text(preference.title).tag(preference)
+            LabeledContent("Format") {
+                ScrollView {
+                    Picker("", selection: $mediaFormatPreference) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Original")
+                            Text("Let yt-dlp choose the best available streams")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .tag(MediaDownloadFormatPreference.original)
+
+                        ForEach(mediaPreview.capabilities.formatOptions) { format in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(mediaFormatTitle(format))
+                                Text(mediaFormatDetails(format))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .tag(MediaDownloadFormatPreference.specific(format.id))
+                        }
+                    }
+                    .pickerStyle(.radioGroup)
+                    .labelsHidden()
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .frame(
+                    minHeight: min(
+                        CGFloat(mediaPreview.capabilities.formatOptions.count + 1) * 40,
+                        220
+                    ),
+                    maxHeight: 220
+                )
             }
 
             Toggle("I own this content or have permission to save it", isOn: $hasMediaSavePermission)
         } else if let mediaPreviewError, shouldShowMediaPreviewError {
             LabeledContent("Media") {
-                VStack(alignment: .leading, spacing: 8) {
-                    Label(mediaPreviewError, systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    Text("Harbor can still try this link with yt-dlp.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                Label(mediaPreviewError, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-
-            Toggle("I own this content or have permission to save it", isOn: $hasMediaSavePermission)
         } else if parsedLinkURL.map(isKnownMediaHost) == true {
             LabeledContent("Media") {
-                Text("Harbor will try this link with yt-dlp.")
+                Text("Harbor will check this link with yt-dlp.")
                     .foregroundStyle(.secondary)
             }
-
-            Toggle("I own this content or have permission to save it", isOn: $hasMediaSavePermission)
         }
     }
 
@@ -253,19 +271,16 @@ struct AddDownloadSheet: View {
                 return false
             }
 
-            if mediaPreview != nil {
-                return hasMediaSavePermission
+            if let mediaPreview {
+                return mediaPreview.capabilities.supportsVideoDownload
+                    && hasMediaSavePermission
             }
 
-            if isKnownMediaHost(parsedURL) {
-                return isResolvingMedia == false && hasMediaSavePermission
-            }
-
-            if isResolvingMedia, shouldWaitForMediaPreview(for: parsedURL) {
+            if isResolvingMedia {
                 return false
             }
 
-            return true
+            return isKnownMediaHost(parsedURL) == false
 
         case .torrentFile:
             guard let torrentFileURL else {
@@ -329,21 +344,20 @@ struct AddDownloadSheet: View {
             if detectedKind == .directURL {
                 if let mediaPreview {
                     resolvedMediaPreview = mediaPreview
-                } else if shouldWaitForMediaPreview(for: parsedURL) {
+                } else {
                     resolvedMediaPreview = await resolveMediaPreview(
                         for: parsedURL,
-                        showErrors: true,
+                        showErrors: isKnownMediaHost(parsedURL),
                         generation: generation
                     )
-                } else {
-                    resolvedMediaPreview = nil
                 }
             } else {
                 resolvedMediaPreview = nil
             }
 
             if detectedKind == .directURL,
-               let metadata = resolvedMediaPreview {
+               let metadata = resolvedMediaPreview,
+               metadata.capabilities.supportsVideoDownload {
                 guard hasMediaSavePermission else {
                     validationMessage = String(
                         localized: "add.validation.mediaPermission",
@@ -356,21 +370,13 @@ struct AddDownloadSheet: View {
                 sourceKind = .mediaURL
                 requestMediaMetadata = metadata
                 requestMediaFormatPreference = mediaFormatPreference
-            } else if detectedKind == .directURL, isKnownMediaHost(parsedURL) {
-                guard hasMediaSavePermission else {
-                    validationMessage = String(
-                        localized: "add.validation.mediaPermission",
-                        defaultValue: "Confirm that you own this content or have permission to save it.",
-                        comment: "Validation message shown when a media URL is detected but permission has not been confirmed."
-                    )
-                    return
-                }
-
-                sourceKind = .mediaURL
-                requestMediaFormatPreference = mediaFormatPreference
             } else {
-                if mediaPreviewError != nil, isKnownMediaHost(parsedURL) {
-                    validationMessage = mediaPreviewError
+                if isKnownMediaHost(parsedURL) {
+                    validationMessage = mediaPreviewError ?? String(
+                        localized: "add.validation.mediaUnavailable",
+                        defaultValue: "yt-dlp couldn’t verify a downloadable video format for this link.",
+                        comment: "Validation message shown when a known media site does not provide a verified downloadable video format."
+                    )
                     focusedField = .sourceURL
                     return
                 }
@@ -464,6 +470,102 @@ struct AddDownloadSheet: View {
             .joined(separator: " • ")
     }
 
+    private func mediaFormatTitle(_ format: MediaDownloadFormatOption) -> String {
+        let resolution: String
+        if let height = format.height {
+            resolution = "\(height)p"
+        } else if let width = format.width {
+            resolution = "\(width) px"
+        } else {
+            resolution = String(
+                localized: "media.format.video",
+                defaultValue: "Video",
+                comment: "Fallback resolution label for a media format whose dimensions are unknown."
+            )
+        }
+
+        return "\(resolution) \(format.container.uppercased())"
+    }
+
+    private func mediaFormatDetails(_ format: MediaDownloadFormatOption) -> String {
+        var details = [mediaCodecTitle(format.videoCodec)]
+
+        if let audioCodec = format.audioCodec {
+            details.append(mediaCodecTitle(audioCodec))
+        } else {
+            details.append(
+                String(
+                    localized: "media.format.noAudio",
+                    defaultValue: "No audio",
+                    comment: "Media format detail shown when the selected video stream has no audio."
+                )
+            )
+        }
+
+        if let framesPerSecond = format.framesPerSecond, framesPerSecond > 0 {
+            details.append("\(framesPerSecond.formatted(.number.precision(.fractionLength(0...2)))) fps")
+        }
+
+        if let dynamicRange = format.dynamicRange,
+           dynamicRange.caseInsensitiveCompare("SDR") != .orderedSame {
+            details.append(dynamicRange)
+        }
+
+        if let bitrateKbps = format.bitrateKbps,
+           bitrateKbps.isFinite,
+           bitrateKbps > 0 {
+            details.append(
+                "\(bitrateKbps.formatted(.number.precision(.fractionLength(0)))) kbps"
+            )
+        }
+
+        if format.estimatedBytes > 0 {
+            details.append(DownloadFormatting.byteString(format.estimatedBytes))
+        }
+
+        return details.joined(separator: " • ")
+    }
+
+    private func mediaCodecTitle(_ codec: String) -> String {
+        let normalizedCodec = codec.lowercased()
+
+        if normalizedCodec.hasPrefix("avc1") || normalizedCodec.hasPrefix("h264") {
+            return "H.264"
+        }
+
+        if normalizedCodec.hasPrefix("hev1")
+            || normalizedCodec.hasPrefix("hvc1")
+            || normalizedCodec.hasPrefix("hevc") {
+            return "HEVC"
+        }
+
+        if normalizedCodec.hasPrefix("av01") || normalizedCodec == "av1" {
+            return "AV1"
+        }
+
+        if normalizedCodec.hasPrefix("vp9") {
+            return "VP9"
+        }
+
+        if normalizedCodec.hasPrefix("vp8") {
+            return "VP8"
+        }
+
+        if normalizedCodec.hasPrefix("mp4a") || normalizedCodec == "aac" {
+            return "AAC"
+        }
+
+        if normalizedCodec.hasPrefix("opus") {
+            return "Opus"
+        }
+
+        if normalizedCodec.hasPrefix("vorbis") {
+            return "Vorbis"
+        }
+
+        return codec.uppercased()
+    }
+
     private func mediaTypeTitle(for metadata: MediaDownloadMetadata) -> String {
         if metadata.isCollection {
             let template = String(
@@ -546,8 +648,18 @@ struct AddDownloadSheet: View {
         }
 
         do {
-            guard let metadata = try await mediaPreviewProvider(url),
-                  isUsableMediaMetadata(metadata) else {
+            guard let metadata = try await mediaPreviewProvider(url) else {
+                return nil
+            }
+
+            guard isUsableMediaMetadata(metadata) else {
+                if showErrors, mediaPreviewGeneration == generation {
+                    mediaPreviewError = String(
+                        localized: "add.validation.mediaUnavailable",
+                        defaultValue: "yt-dlp couldn’t verify a downloadable video format for this link.",
+                        comment: "Validation message shown when a known media site does not provide a verified downloadable video format."
+                    )
+                }
                 return nil
             }
 
@@ -557,7 +669,7 @@ struct AddDownloadSheet: View {
             }
 
             mediaPreview = metadata
-            mediaFormatPreference = metadata.defaultFormatPreference
+            mediaFormatPreference = .original
             hasMediaSavePermission = false
             return metadata
         } catch {
@@ -573,16 +685,11 @@ struct AddDownloadSheet: View {
         mediaPreviewError = nil
         isResolvingMedia = false
         hasMediaSavePermission = false
-        mediaFormatPreference = .bestMP4
+        mediaFormatPreference = .original
     }
 
     private func isUsableMediaMetadata(_ metadata: MediaDownloadMetadata) -> Bool {
-        let extractorKey = metadata.extractorKey?.lowercased()
-        return metadata.mediaType != .unknown || extractorKey != "generic"
-    }
-
-    private func shouldWaitForMediaPreview(for url: URL) -> Bool {
-        isKnownMediaHost(url)
+        metadata.capabilities.supportsVideoDownload
     }
 
     private func isKnownMediaHost(_ url: URL) -> Bool {

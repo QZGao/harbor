@@ -954,7 +954,7 @@ final class DownloadCenter {
                 metadata: currentItem.mediaMetadata,
                 formatPreference: currentItem.mediaFormatPreference
                     ?? currentItem.mediaMetadata?.defaultFormatPreference
-                    ?? .bestMP4
+                    ?? .original
             )
 
             guard let refreshedItem = item(for: id) else {

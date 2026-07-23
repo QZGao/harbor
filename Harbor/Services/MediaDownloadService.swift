@@ -30,6 +30,11 @@ enum MediaDownloadError: LocalizedError {
 actor MediaDownloadService {
     typealias EventHandler = @Sendable (MediaDownloadEvent) -> Void
 
+    /// bv*: best available format containing video, may alreadt contain audio;
+    /// +ba: add best available audio and merge them;
+    /// /b: fallback to best combined video+audio format.
+    private nonisolated static let bestAvailableVideoFormatSelector = "bv*+ba/b"
+
     private enum TerminationReason {
         case pause
         case cancel
@@ -78,7 +83,15 @@ actor MediaDownloadService {
     func metadata(for url: URL) async throws -> MediaDownloadMetadata {
         let runtime = try resolvedRuntime()
         let output = try await runMetadataCommand(runtime: runtime, url: url)
-        return try MediaDownloadMetadataParser.metadata(from: output, sourceURL: url)
+        let metadata = try MediaDownloadMetadataParser.metadata(from: output, sourceURL: url)
+
+        guard metadata.capabilities.supportsVideoDownload else {
+            throw MediaDownloadError.unsupported(
+                "yt-dlp couldn’t verify a downloadable video format for this link."
+            )
+        }
+
+        return metadata
     }
 
     func startDownload(
@@ -92,6 +105,12 @@ actor MediaDownloadService {
             return existing.process.processIdentifier
         }
 
+        guard metadata?.capabilities.supportsVideoDownload == true else {
+            throw MediaDownloadError.unsupported(
+                "This download does not have a verified yt-dlp video format."
+            )
+        }
+
         let runtime = try resolvedRuntime()
         cleanupOrphanedMediaProcessesIfNeeded(runtime: runtime)
 
@@ -99,7 +118,7 @@ actor MediaDownloadService {
         try fileManager.createDirectory(at: temporaryFolder, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: destinationFolder, withIntermediateDirectories: true)
 
-        let arguments = downloadArguments(
+        let arguments = try downloadArguments(
             runtime: runtime,
             sourceURL: sourceURL,
             destinationFolder: destinationFolder,
@@ -124,7 +143,15 @@ actor MediaDownloadService {
             }
         )
 
-        let expectedBytes = metadata?.expectedBytes ?? 0
+        let expectedBytes: Int64
+        switch formatPreference {
+        case .original:
+            expectedBytes = metadata?.expectedBytes ?? 0
+        case let .specific(optionID):
+            expectedBytes = metadata?.capabilities.formatOptions.first(where: {
+                $0.id == optionID
+            })?.estimatedBytes ?? 0
+        }
         runningDownloads[id] = RunningDownload(
             id: id,
             process: process,
@@ -326,7 +353,10 @@ actor MediaDownloadService {
             "15",
             "--dump-single-json",
             "--flat-playlist",
-            "--skip-download",
+            "--simulate",
+            "--check-all-formats",
+            "--ffmpeg-location",
+            runtime.ffmpegURL.deletingLastPathComponent().path,
             url.absoluteString
         ]
 
@@ -362,7 +392,7 @@ actor MediaDownloadService {
                     state.process = process
 
                     Task {
-                        try? await Task.sleep(for: .seconds(45))
+                        try? await Task.sleep(for: .seconds(120))
                         guard state.markTimedOut() else {
                             return
                         }
@@ -390,7 +420,7 @@ actor MediaDownloadService {
         temporaryFolder: URL,
         metadata: MediaDownloadMetadata?,
         formatPreference: MediaDownloadFormatPreference
-    ) -> [String] {
+    ) throws -> [String] {
         var arguments = [
             "--ignore-config",
             "--no-cache-dir",
@@ -418,15 +448,31 @@ actor MediaDownloadService {
         }
 
         switch formatPreference {
-        case .bestMP4:
+        case .original:
             arguments.append(contentsOf: [
                 "--format",
-                "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bestvideo+bestaudio/best",
-                "--merge-output-format",
-                "mp4"
+                Self.bestAvailableVideoFormatSelector
             ])
-        case .original:
-            break
+        case let .specific(optionID):
+            guard let format = metadata?.capabilities.formatOptions.first(where: {
+                $0.id == optionID
+            }) else {
+                throw MediaDownloadError.unsupported(
+                    "The selected media format is no longer available."
+                )
+            }
+
+            arguments.append(contentsOf: [
+                "--format",
+                format.selector
+            ])
+
+            if let mergeOutputFormat = format.mergeOutputFormat {
+                arguments.append(contentsOf: [
+                    "--merge-output-format",
+                    mergeOutputFormat
+                ])
+            }
         }
 
         arguments.append(sourceURL.absoluteString)
