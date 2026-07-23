@@ -28,19 +28,20 @@ struct RootView: View {
                     ideal: Layout.sidebarIdealWidth,
                     max: Layout.sidebarMaxWidth
                 )
-        } content: {
+        } detail: {
             DownloadsContentView(center: center)
                 .navigationSplitViewColumnWidth(
                     min: Layout.contentMinWidth,
                     ideal: Layout.contentIdealWidth
                 )
-        } detail: {
-            DownloadDetailView(center: center)
-                .navigationSplitViewColumnWidth(
-                    min: Layout.inspectorMinWidth,
-                    ideal: Layout.inspectorIdealWidth,
-                    max: Layout.inspectorMaxWidth
-                )
+                .inspector(isPresented: inspectorPresentation) {
+                    DownloadDetailView(center: center)
+                        .inspectorColumnWidth(
+                            min: Layout.inspectorMinWidth,
+                            ideal: Layout.inspectorIdealWidth,
+                            max: Layout.inspectorMaxWidth
+                        )
+                }
         }
         .navigationSplitViewStyle(.balanced)
         .searchable(text: $center.searchText, placement: .toolbar, prompt: "Search downloads")
@@ -108,6 +109,17 @@ struct RootView: View {
                     .allowsHitTesting(false)
             }
         }
+    }
+
+    private var inspectorPresentation: Binding<Bool> {
+        Binding(
+            get: { center.selectedDownload != nil },
+            set: { isPresented in
+                if isPresented == false {
+                    center.selectedDownloadIDs = []
+                }
+            }
+        )
     }
 
     private func loadExternalAddSources(_ providers: [NSItemProvider]) -> Bool {

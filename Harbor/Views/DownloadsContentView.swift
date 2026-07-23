@@ -104,9 +104,12 @@ struct DownloadsContentView: View {
         } description: {
             Text(emptyDescription)
         } actions: {
-            Button("Add Download") {
+            Button {
                 center.presentAddSheet()
+            } label: {
+                Label("Add Download", systemImage: "plus")
             }
+            .buttonStyle(LiquidPillButtonStyle(prominent: true))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
