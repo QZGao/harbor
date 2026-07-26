@@ -369,8 +369,10 @@ private struct DownloadTransferSection: View {
                     DownloadValueRow(title: "ETA", value: eta)
                 }
 
-                Divider()
-                TransferLimitControls(item: item, center: center)
+                if HarborFeatureFlags.perDownloadTransferLimits {
+                    Divider()
+                    TransferLimitControls(item: item, center: center)
+                }
             }
         }
     }

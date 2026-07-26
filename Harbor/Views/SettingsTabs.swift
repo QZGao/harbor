@@ -101,11 +101,13 @@ struct BandwidthSettingsTab: View {
                     kilobytesPerSecond: $settings.globalSpeedLimitKilobytesPerSecond
                 )
 
-                SpeedLimitRow(
-                    title: "Default Download Limit",
-                    isEnabled: $settings.perDownloadSpeedLimitEnabled,
-                    kilobytesPerSecond: $settings.perDownloadSpeedLimitKilobytesPerSecond
-                )
+                if HarborFeatureFlags.perDownloadTransferLimits {
+                    SpeedLimitRow(
+                        title: "Default Download Limit",
+                        isEnabled: $settings.perDownloadSpeedLimitEnabled,
+                        kilobytesPerSecond: $settings.perDownloadSpeedLimitKilobytesPerSecond
+                    )
+                }
             }
 
             Section("Upload Limits") {
@@ -115,11 +117,13 @@ struct BandwidthSettingsTab: View {
                     kilobytesPerSecond: $settings.globalUploadSpeedLimitKilobytesPerSecond
                 )
 
-                SpeedLimitRow(
-                    title: "Default Torrent Upload Limit",
-                    isEnabled: $settings.perDownloadUploadSpeedLimitEnabled,
-                    kilobytesPerSecond: $settings.perDownloadUploadSpeedLimitKilobytesPerSecond
-                )
+                if HarborFeatureFlags.perDownloadTransferLimits {
+                    SpeedLimitRow(
+                        title: "Default Torrent Upload Limit",
+                        isEnabled: $settings.perDownloadUploadSpeedLimitEnabled,
+                        kilobytesPerSecond: $settings.perDownloadUploadSpeedLimitKilobytesPerSecond
+                    )
+                }
             }
         }
         .formStyle(.grouped)
