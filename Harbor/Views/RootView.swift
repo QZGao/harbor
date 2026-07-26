@@ -28,19 +28,20 @@ struct RootView: View {
                     ideal: Layout.sidebarIdealWidth,
                     max: Layout.sidebarMaxWidth
                 )
-        } content: {
+        } detail: {
             DownloadsContentView(center: center)
                 .navigationSplitViewColumnWidth(
                     min: Layout.contentMinWidth,
                     ideal: Layout.contentIdealWidth
                 )
-        } detail: {
-            DownloadDetailView(center: center)
-                .navigationSplitViewColumnWidth(
-                    min: Layout.inspectorMinWidth,
-                    ideal: Layout.inspectorIdealWidth,
-                    max: Layout.inspectorMaxWidth
-                )
+                .inspector(isPresented: inspectorPresentation) {
+                    DownloadDetailView(center: center)
+                        .inspectorColumnWidth(
+                            min: Layout.inspectorMinWidth,
+                            ideal: Layout.inspectorIdealWidth,
+                            max: Layout.inspectorMaxWidth
+                        )
+                }
         }
         .navigationSplitViewStyle(.balanced)
         .searchable(text: $center.searchText, placement: .toolbar, prompt: "Search downloads")
@@ -92,7 +93,7 @@ struct RootView: View {
         }
         // TODO: Revisit customizable toolbars after macOS 26 stops crashing while restoring toolbar items during file opens.
         .toolbar {
-            DownloadToolbarContent(center: center)
+            DownloadToolbarContent(center: center, settings: settings)
         }
         .onDrop(
             of: DownloadSourceImportService.supportedContentTypes,
@@ -108,6 +109,17 @@ struct RootView: View {
                     .allowsHitTesting(false)
             }
         }
+    }
+
+    private var inspectorPresentation: Binding<Bool> {
+        Binding(
+            get: { center.selectedDownload != nil },
+            set: { isPresented in
+                if isPresented == false {
+                    center.selectedDownloadIDs = []
+                }
+            }
+        )
     }
 
     private func loadExternalAddSources(_ providers: [NSItemProvider]) -> Bool {
@@ -147,6 +159,7 @@ private struct DownloadDropTargetOverlay: View {
 
 private struct DownloadToolbarContent: ToolbarContent {
     @Bindable var center: DownloadCenter
+    @Bindable var settings: AppSettingsStore
 
     var body: some ToolbarContent {
         ToolbarItem(placement: .primaryAction) {
@@ -171,6 +184,38 @@ private struct DownloadToolbarContent: ToolbarContent {
                     ? center.hasPausableDownloads == false
                     : center.hasResumableDownloads == false
             )
+        }
+
+        ToolbarItem(placement: .primaryAction) {
+            Menu {
+                Toggle("Limit Downloads", isOn: $settings.globalSpeedLimitEnabled)
+
+                Text(
+                    settings.globalSpeedLimitEnabled
+                        ? DownloadFormatting.speedString(Double(settings.globalSpeedLimitKilobytesPerSecond) * 1_024)
+                        : String(localized: "Unlimited")
+                )
+                .foregroundStyle(.secondary)
+
+                Divider()
+
+                Toggle("Limit Uploads", isOn: $settings.globalUploadSpeedLimitEnabled)
+
+                Text(
+                    settings.globalUploadSpeedLimitEnabled
+                        ? DownloadFormatting.speedString(Double(settings.globalUploadSpeedLimitKilobytesPerSecond) * 1_024)
+                        : String(localized: "Unlimited")
+                )
+                .foregroundStyle(.secondary)
+
+                Divider()
+
+                SettingsLink {
+                    Label("Edit Limits…", systemImage: "gearshape")
+                }
+            } label: {
+                Label("Speed Limits", systemImage: "speedometer")
+            }
         }
 
         ToolbarItem(placement: .primaryAction) {

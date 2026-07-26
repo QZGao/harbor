@@ -11,6 +11,8 @@ struct DownloadStatusBadge: View {
             .orange
         case .downloading:
             .blue
+        case .seeding:
+            .purple
         case .browserSessionRequired:
             .mint
         case .paused:
