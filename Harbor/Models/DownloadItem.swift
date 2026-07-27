@@ -5,6 +5,7 @@ enum DownloadStatus: String, Codable, CaseIterable, Sendable {
     case queued
     case preparing
     case downloading
+    case seeding
     case browserSessionRequired
     case paused
     case completed
@@ -19,6 +20,8 @@ enum DownloadStatus: String, Codable, CaseIterable, Sendable {
             LocalizedStringResource("status.preparing", defaultValue: "Preparing")
         case .downloading:
             LocalizedStringResource("status.downloading", defaultValue: "Downloading")
+        case .seeding:
+            LocalizedStringResource("status.seeding", defaultValue: "Seeding")
         case .browserSessionRequired:
             LocalizedStringResource("status.needsBrowser", defaultValue: "Browser Session Required")
         case .paused:
@@ -40,6 +43,8 @@ enum DownloadStatus: String, Codable, CaseIterable, Sendable {
             "ellipsis.circle"
         case .downloading:
             "arrow.down.circle.fill"
+        case .seeding:
+            "arrow.up.circle.fill"
         case .browserSessionRequired:
             "globe"
         case .paused:
@@ -57,7 +62,7 @@ enum DownloadStatus: String, Codable, CaseIterable, Sendable {
         switch self {
         case .completed, .failed, .cancelled:
             true
-        case .queued, .preparing, .downloading, .browserSessionRequired, .paused:
+        case .queued, .preparing, .downloading, .seeding, .browserSessionRequired, .paused:
             false
         }
     }
@@ -73,6 +78,8 @@ enum DownloadActivityKind: String, Codable, Sendable {
     case started
     case resumed
     case paused
+    case seedingStarted
+    case seedingStopped
     case browserSessionRequired
     case completed
     case failed
@@ -118,6 +125,14 @@ struct DownloadRecord: Codable, Sendable {
     let metadataName: String?
     let mediaMetadata: MediaDownloadMetadata?
     let mediaFormatPreference: MediaDownloadFormatPreference?
+    let downloadLimitOverride: TransferLimitOverride
+    let uploadLimitOverride: TransferLimitOverride
+    let torrentFingerprint: String?
+    let managedTorrentSourcePath: String?
+    let torrentPayloadPaths: [String]
+    let shouldSeedAfterDownload: Bool
+    let removeOriginalTorrentAfterImport: Bool
+    let completionNotificationDelivered: Bool
     let activityEvents: [DownloadActivityEvent]
 
     private enum CodingKeys: String, CodingKey {
@@ -143,6 +158,14 @@ struct DownloadRecord: Codable, Sendable {
         case metadataName
         case mediaMetadata
         case mediaFormatPreference
+        case downloadLimitOverride
+        case uploadLimitOverride
+        case torrentFingerprint
+        case managedTorrentSourcePath
+        case torrentPayloadPaths
+        case shouldSeedAfterDownload
+        case removeOriginalTorrentAfterImport
+        case completionNotificationDelivered
         case activityEvents
     }
 
@@ -169,6 +192,14 @@ struct DownloadRecord: Codable, Sendable {
         metadataName: String?,
         mediaMetadata: MediaDownloadMetadata? = nil,
         mediaFormatPreference: MediaDownloadFormatPreference? = nil,
+        downloadLimitOverride: TransferLimitOverride = .inherit,
+        uploadLimitOverride: TransferLimitOverride = .inherit,
+        torrentFingerprint: String? = nil,
+        managedTorrentSourcePath: String? = nil,
+        torrentPayloadPaths: [String] = [],
+        shouldSeedAfterDownload: Bool? = nil,
+        removeOriginalTorrentAfterImport: Bool = false,
+        completionNotificationDelivered: Bool? = nil,
         activityEvents: [DownloadActivityEvent] = []
     ) {
         self.id = id
@@ -193,6 +224,15 @@ struct DownloadRecord: Codable, Sendable {
         self.metadataName = metadataName
         self.mediaMetadata = mediaMetadata
         self.mediaFormatPreference = mediaFormatPreference
+        self.downloadLimitOverride = downloadLimitOverride
+        self.uploadLimitOverride = uploadLimitOverride
+        self.torrentFingerprint = torrentFingerprint
+        self.managedTorrentSourcePath = managedTorrentSourcePath
+        self.torrentPayloadPaths = torrentPayloadPaths
+        self.shouldSeedAfterDownload = shouldSeedAfterDownload
+            ?? (backend == .aria2 || sourceKind == .magnetLink || sourceKind == .torrentFile)
+        self.removeOriginalTorrentAfterImport = removeOriginalTorrentAfterImport
+        self.completionNotificationDelivered = completionNotificationDelivered ?? (status == .completed)
         self.activityEvents = activityEvents
     }
 
@@ -220,6 +260,33 @@ struct DownloadRecord: Codable, Sendable {
         self.metadataName = try container.decodeIfPresent(String.self, forKey: .metadataName)
         self.mediaMetadata = try container.decodeIfPresent(MediaDownloadMetadata.self, forKey: .mediaMetadata)
         self.mediaFormatPreference = try container.decodeIfPresent(MediaDownloadFormatPreference.self, forKey: .mediaFormatPreference)
+        self.downloadLimitOverride = try container.decodeIfPresent(
+            TransferLimitOverride.self,
+            forKey: .downloadLimitOverride
+        ) ?? .inherit
+        self.uploadLimitOverride = try container.decodeIfPresent(
+            TransferLimitOverride.self,
+            forKey: .uploadLimitOverride
+        ) ?? .inherit
+        self.torrentFingerprint = try container.decodeIfPresent(String.self, forKey: .torrentFingerprint)
+        self.managedTorrentSourcePath = try container.decodeIfPresent(String.self, forKey: .managedTorrentSourcePath)
+        self.torrentPayloadPaths = try container.decodeIfPresent([String].self, forKey: .torrentPayloadPaths) ?? []
+        self.shouldSeedAfterDownload = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .shouldSeedAfterDownload
+        ) ?? Self.shouldSeedLegacyTorrent(
+            backend: backend,
+            sourceKind: sourceKind,
+            status: status
+        )
+        self.removeOriginalTorrentAfterImport = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .removeOriginalTorrentAfterImport
+        ) ?? false
+        self.completionNotificationDelivered = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .completionNotificationDelivered
+        ) ?? (status == .completed)
         self.activityEvents = try container.decodeIfPresent([DownloadActivityEvent].self, forKey: .activityEvents) ?? []
     }
 
@@ -247,7 +314,24 @@ struct DownloadRecord: Codable, Sendable {
         try container.encode(metadataName, forKey: .metadataName)
         try container.encode(mediaMetadata, forKey: .mediaMetadata)
         try container.encode(mediaFormatPreference, forKey: .mediaFormatPreference)
+        try container.encode(downloadLimitOverride, forKey: .downloadLimitOverride)
+        try container.encode(uploadLimitOverride, forKey: .uploadLimitOverride)
+        try container.encode(torrentFingerprint, forKey: .torrentFingerprint)
+        try container.encode(managedTorrentSourcePath, forKey: .managedTorrentSourcePath)
+        try container.encode(torrentPayloadPaths, forKey: .torrentPayloadPaths)
+        try container.encode(shouldSeedAfterDownload, forKey: .shouldSeedAfterDownload)
+        try container.encode(removeOriginalTorrentAfterImport, forKey: .removeOriginalTorrentAfterImport)
+        try container.encode(completionNotificationDelivered, forKey: .completionNotificationDelivered)
         try container.encode(activityEvents, forKey: .activityEvents)
+    }
+
+    private static func shouldSeedLegacyTorrent(
+        backend: DownloadBackend,
+        sourceKind: DownloadSourceKind,
+        status: DownloadStatus
+    ) -> Bool {
+        let isTorrent = backend == .aria2 || sourceKind == .magnetLink || sourceKind == .torrentFile
+        return isTorrent && status != .completed
     }
 }
 
@@ -279,6 +363,14 @@ final class DownloadItem: Identifiable {
     var mediaMetadata: MediaDownloadMetadata?
     var mediaFormatPreference: MediaDownloadFormatPreference?
     var requestHeaders: [RequestHeader]
+    var downloadLimitOverride: TransferLimitOverride
+    var uploadLimitOverride: TransferLimitOverride
+    var torrentFingerprint: String?
+    var managedTorrentSourcePath: String?
+    var torrentPayloadPaths: [String]
+    var shouldSeedAfterDownload: Bool
+    var removeOriginalTorrentAfterImport: Bool
+    var completionNotificationDelivered: Bool
     var activityEvents: [DownloadActivityEvent]
 
     init(
@@ -307,6 +399,14 @@ final class DownloadItem: Identifiable {
         mediaMetadata: MediaDownloadMetadata? = nil,
         mediaFormatPreference: MediaDownloadFormatPreference? = nil,
         requestHeaders: [RequestHeader] = [],
+        downloadLimitOverride: TransferLimitOverride = .inherit,
+        uploadLimitOverride: TransferLimitOverride = .inherit,
+        torrentFingerprint: String? = nil,
+        managedTorrentSourcePath: String? = nil,
+        torrentPayloadPaths: [String] = [],
+        shouldSeedAfterDownload: Bool? = nil,
+        removeOriginalTorrentAfterImport: Bool = false,
+        completionNotificationDelivered: Bool? = nil,
         activityEvents: [DownloadActivityEvent] = []
     ) {
         self.id = id
@@ -334,6 +434,15 @@ final class DownloadItem: Identifiable {
         self.mediaMetadata = mediaMetadata
         self.mediaFormatPreference = mediaFormatPreference
         self.requestHeaders = requestHeaders
+        self.downloadLimitOverride = downloadLimitOverride
+        self.uploadLimitOverride = uploadLimitOverride
+        self.torrentFingerprint = torrentFingerprint
+        self.managedTorrentSourcePath = managedTorrentSourcePath
+        self.torrentPayloadPaths = torrentPayloadPaths
+        self.shouldSeedAfterDownload = shouldSeedAfterDownload
+            ?? (backend == .aria2 || sourceKind == .magnetLink || sourceKind == .torrentFile)
+        self.removeOriginalTorrentAfterImport = removeOriginalTorrentAfterImport
+        self.completionNotificationDelivered = completionNotificationDelivered ?? (status == .completed)
         self.activityEvents = activityEvents
 
         if self.activityEvents.contains(where: { $0.kind == .added }) == false {
@@ -371,11 +480,43 @@ final class DownloadItem: Identifiable {
             mediaMetadata: record.mediaMetadata,
             mediaFormatPreference: record.mediaFormatPreference,
             requestHeaders: record.requestHeaders,
+            downloadLimitOverride: record.downloadLimitOverride,
+            uploadLimitOverride: record.uploadLimitOverride,
+            torrentFingerprint: record.torrentFingerprint,
+            managedTorrentSourcePath: record.managedTorrentSourcePath,
+            torrentPayloadPaths: record.torrentPayloadPaths,
+            shouldSeedAfterDownload: record.shouldSeedAfterDownload,
+            removeOriginalTorrentAfterImport: record.removeOriginalTorrentAfterImport,
+            completionNotificationDelivered: record.completionNotificationDelivered,
             activityEvents: record.activityEvents
         )
     }
 
     var displayName: String {
+        if isTorrent {
+            if let metadataName, metadataName.isEmpty == false {
+                return metadataName
+            }
+
+            if sourceKind == .magnetLink {
+                let metadata = MagnetLinkMetadata(url: sourceURL)
+                if let displayName = metadata.displayName {
+                    return displayName
+                }
+
+                if let infoHash = metadata.infoHash {
+                    return infoHash
+                }
+            }
+
+            if sourceKind == .torrentFile {
+                let torrentName = sourceURL.deletingPathExtension().lastPathComponent
+                if torrentName.isEmpty == false {
+                    return torrentName
+                }
+            }
+        }
+
         if let fileLocationURL {
             return fileLocationURL.lastPathComponent
         }
@@ -487,7 +628,7 @@ final class DownloadItem: Identifiable {
         switch status {
         case .queued, .preparing, .downloading:
             return String(localized: "Waiting", comment: "Speed status fallback")
-        case .browserSessionRequired, .paused, .completed, .failed, .cancelled:
+        case .seeding, .browserSessionRequired, .paused, .completed, .failed, .cancelled:
             return "-"
         }
     }
@@ -507,8 +648,15 @@ final class DownloadItem: Identifiable {
         status.isRunning
     }
 
+    var isPausedSeeder: Bool {
+        backend == .aria2
+            && status == .paused
+            && finishedAt != nil
+            && shouldSeedAfterDownload
+    }
+
     var canPause: Bool {
-        status == .preparing || status == .downloading
+        status == .preparing || status == .downloading || status == .seeding
     }
 
     var canResume: Bool {
@@ -539,6 +687,14 @@ final class DownloadItem: Identifiable {
             metadataName: metadataName,
             mediaMetadata: mediaMetadata,
             mediaFormatPreference: mediaFormatPreference,
+            downloadLimitOverride: downloadLimitOverride,
+            uploadLimitOverride: uploadLimitOverride,
+            torrentFingerprint: torrentFingerprint,
+            managedTorrentSourcePath: managedTorrentSourcePath,
+            torrentPayloadPaths: torrentPayloadPaths,
+            shouldSeedAfterDownload: shouldSeedAfterDownload,
+            removeOriginalTorrentAfterImport: removeOriginalTorrentAfterImport,
+            completionNotificationDelivered: completionNotificationDelivered,
             activityEvents: activityEvents
         )
     }
@@ -606,5 +762,9 @@ final class DownloadItem: Identifiable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         return path.isEmpty ? nil : path
+    }
+
+    private var isTorrent: Bool {
+        backend == .aria2 || sourceKind == .magnetLink || sourceKind == .torrentFile
     }
 }

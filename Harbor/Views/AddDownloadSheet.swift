@@ -19,6 +19,7 @@ struct AddDownloadSheet: View {
     @State private var customFilename: String
     @State private var torrentFileURL: URL?
     @State private var destinationPath: String
+    @State private var hasCustomizedDestination = false
     @State private var shouldStartImmediately: Bool
     @State private var requestHeaders: [RequestHeader]
     @State private var isAdvancedSettingsExpanded = false
@@ -75,6 +76,7 @@ struct AddDownloadSheet: View {
                         .focused($focusedField, equals: Field.sourceURL)
                         .onChange(of: sourceURLText) {
                             scheduleMediaPreviewRefresh()
+                            updateDestinationForDetectedSourceIfNeeded()
                         }
 
                     TextField("Optional file name override", text: $customFilename)
@@ -158,6 +160,7 @@ struct AddDownloadSheet: View {
             } else {
                 focusedField = nil
             }
+            updateDestinationForDetectedSourceIfNeeded()
         }
         .sheet(isPresented: $isRequestHeadersEditorPresented) {
             RequestHeadersEditor(
@@ -274,12 +277,14 @@ struct AddDownloadSheet: View {
                     }
 
                     destinationPath = folder.path
+                    hasCustomizedDestination = true
                 }
 
                 Button("Use Default") {
-                    destinationPath = settings.defaultDestinationPath
+                    destinationPath = sourceAwareDefaultDestinationPath
+                    hasCustomizedDestination = false
                 }
-                .disabled(destinationPath == settings.defaultDestinationPath)
+                .disabled(destinationPath == sourceAwareDefaultDestinationPath)
             }
         }
     }
@@ -305,6 +310,33 @@ struct AddDownloadSheet: View {
                 }
             }
         }
+    }
+
+    private var sourceAwareDefaultDestinationPath: String {
+        switch entryMode {
+        case .torrentFile:
+            return settings.torrentDestinationPath
+        case .linkOrMagnet:
+            guard let parsedLinkURL,
+                  let sourceKind = DownloadSourceKind.detect(from: parsedLinkURL) else {
+                return settings.defaultDestinationPath
+            }
+
+            switch sourceKind {
+            case .magnetLink, .torrentFile:
+                return settings.torrentDestinationPath
+            case .directURL, .mediaURL:
+                return settings.defaultDestinationPath
+            }
+        }
+    }
+
+    private func updateDestinationForDetectedSourceIfNeeded() {
+        guard hasCustomizedDestination == false else {
+            return
+        }
+
+        destinationPath = sourceAwareDefaultDestinationPath
     }
 
     private var canSubmit: Bool {

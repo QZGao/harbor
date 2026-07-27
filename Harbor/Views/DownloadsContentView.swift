@@ -5,6 +5,7 @@ struct DownloadsContentView: View {
 
     @AppStorage("downloads.table.columnCustomization")
     private var columnCustomization = TableColumnCustomization<DownloadItem>()
+    @State private var pendingDataRemovalIDs: Set<UUID> = []
 
     var body: some View {
         @Bindable var center = center
@@ -44,7 +45,11 @@ struct DownloadsContentView: View {
                     .defaultVisibility(.visible)
 
                     TableColumn("Speed") { item in
-                        Text(item.speedText)
+                        Text(
+                            item.status == .seeding
+                                ? DownloadFormatting.throughputString(item.uploadBytesPerSecond)
+                                : item.speedText
+                        )
                             .monospacedDigit()
                     }
                     .customizationID("speed")
@@ -67,6 +72,30 @@ struct DownloadsContentView: View {
             }
         }
         .navigationTitle(center.selectedFilter.title)
+        .confirmationDialog(
+            "Move Download Data to Trash?",
+            isPresented: Binding(
+                get: { pendingDataRemovalIDs.isEmpty == false },
+                set: { isPresented in
+                    if isPresented == false {
+                        pendingDataRemovalIDs = []
+                    }
+                }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Move to Trash", role: .destructive) {
+                let ids = pendingDataRemovalIDs
+                pendingDataRemovalIDs = []
+                center.removeDownloadsAndData(ids: ids)
+            }
+
+            Button("Cancel", role: .cancel) {
+                pendingDataRemovalIDs = []
+            }
+        } message: {
+            Text(center.dataRemovalConfirmationMessage(ids: pendingDataRemovalIDs))
+        }
     }
 
     private var emptyState: some View {
@@ -75,9 +104,12 @@ struct DownloadsContentView: View {
         } description: {
             Text(emptyDescription)
         } actions: {
-            Button("Add Download") {
+            Button {
                 center.presentAddSheet()
+            } label: {
+                Label("Add Download", systemImage: "plus")
             }
+            .buttonStyle(LiquidPillButtonStyle(prominent: true))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -154,6 +186,20 @@ struct DownloadsContentView: View {
             }
         }
 
+        if targetIDs.count == 1, item.backend == .aria2, item.status == .completed {
+            Button("Start Seeding") {
+                center.startSeeding(id: item.id)
+            }
+        }
+
+        if targetIDs.count == 1,
+           item.backend == .aria2,
+           item.status == .seeding || (item.status == .paused && item.finishedAt != nil && item.shouldSeedAfterDownload) {
+            Button("Stop Seeding") {
+                center.stopSeeding(id: item.id)
+            }
+        }
+
         Button("Cancel Download") {
             center.cancelDownloads(ids: targetIDs)
         }
@@ -171,6 +217,12 @@ struct DownloadsContentView: View {
 
         Button("Remove from List", role: .destructive) {
             center.removeDownloads(ids: targetIDs)
+        }
+
+        if center.canRemoveDownloadedData(ids: targetIDs) {
+            Button("Remove and Move Data to Trash…", role: .destructive) {
+                pendingDataRemovalIDs = targetIDs
+            }
         }
     }
 }

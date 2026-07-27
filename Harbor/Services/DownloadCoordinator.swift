@@ -32,8 +32,10 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         let requestHeaders: [RequestHeader]
         let session: URLSession
         let task: URLSessionDownloadTask
+        var speedLimitOverride: TransferLimitOverride
         var transferSample: TransferSample
         var isThrottled = false
+        var throttleGeneration: UInt64 = 0
     }
 
     private let eventHandler: EventHandler
@@ -71,9 +73,34 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
     }
 
     func updateTransferSettings(_ transferSettings: DownloadTransferSettings) {
-        withLock {
+        let tasksToResume = withLock { () -> [URLSessionDownloadTask] in
             self.transferSettings = transferSettings
+            return releaseThrottledTasksLocked()
         }
+        tasksToResume.forEach { $0.resume() }
+    }
+
+    func updateSpeedLimitOverride(
+        _ speedLimitOverride: TransferLimitOverride,
+        for id: UUID
+    ) {
+        let tasksToResume = withLock { () -> [URLSessionDownloadTask] in
+            guard let taskKey = taskKeysByDownloadID[id],
+                  var context = contexts[taskKey] else {
+                return []
+            }
+
+            context.speedLimitOverride = speedLimitOverride
+            var tasks: [URLSessionDownloadTask] = []
+            if context.isThrottled {
+                context.isThrottled = false
+                context.throttleGeneration &+= 1
+                tasks.append(context.task)
+            }
+            contexts[taskKey] = context
+            return tasks
+        }
+        tasksToResume.forEach { $0.resume() }
     }
 
     @discardableResult
@@ -81,7 +108,8 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         id: UUID,
         sourceURL: URL,
         requestHeaders: [RequestHeader],
-        resumeData: Data?
+        resumeData: Data?,
+        speedLimitOverride: TransferLimitOverride = .inherit
     ) -> Int {
         let session = makeSession()
         let task: URLSessionDownloadTask
@@ -100,6 +128,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
             requestHeaders: requestHeaders,
             session: session,
             task: task,
+            speedLimitOverride: speedLimitOverride,
             transferSample: TransferSample(
                 lastTotalBytesWritten: 0,
                 sampleDate: .now,
@@ -219,17 +248,19 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         "\(ObjectIdentifier(session))-\(taskIdentifier)"
     }
 
-    private func throttleDelay(
+    nonisolated static func throttleDelay(
         deltaBytes: Int64,
         elapsed: TimeInterval,
         activeTransferCount: Int,
-        transferSettings: DownloadTransferSettings
+        transferSettings: DownloadTransferSettings,
+        speedLimitOverride: TransferLimitOverride
     ) -> TimeInterval? {
         guard elapsed > 0,
               deltaBytes > 0,
               let effectiveLimit = effectiveSpeedLimit(
                 activeTransferCount: activeTransferCount,
-                transferSettings: transferSettings
+                transferSettings: transferSettings,
+                speedLimitOverride: speedLimitOverride
               ),
               effectiveLimit > 0 else {
             return nil
@@ -241,12 +272,13 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
             return nil
         }
 
-        return min(max(delay, 0.1), 2.0)
+        return max(delay, 0.1)
     }
 
-    private func effectiveSpeedLimit(
+    nonisolated static func effectiveSpeedLimit(
         activeTransferCount: Int,
-        transferSettings: DownloadTransferSettings
+        transferSettings: DownloadTransferSettings,
+        speedLimitOverride: TransferLimitOverride
     ) -> Int64? {
         var limits: [Int64] = []
 
@@ -254,7 +286,9 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
             limits.append(max(globalSpeedLimit / Int64(max(activeTransferCount, 1)), 1))
         }
 
-        if let perDownloadSpeedLimit = transferSettings.perDownloadSpeedLimitBytesPerSecond {
+        if let perDownloadSpeedLimit = speedLimitOverride.resolvedBytesPerSecond(
+            inheriting: transferSettings.perDownloadSpeedLimitBytesPerSecond
+        ) {
             limits.append(perDownloadSpeedLimit)
         }
 
@@ -263,31 +297,66 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
 
     private func suspendForThrottle(taskKey: TaskKey, delay: TimeInterval) {
         var shouldSuspend = false
+        var throttleGeneration: UInt64?
         let task = updateContext(for: taskKey) { context in
             guard context.isThrottled == false else {
                 return
             }
 
             context.isThrottled = true
+            context.throttleGeneration &+= 1
+            throttleGeneration = context.throttleGeneration
             shouldSuspend = true
         }?.task
 
-        guard shouldSuspend, let task else {
+        guard shouldSuspend, let task, let throttleGeneration else {
             return
         }
 
         task.suspend()
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.resumeThrottledTask(taskKey: taskKey)
+            self?.resumeThrottledTask(
+                taskKey: taskKey,
+                throttleGeneration: throttleGeneration
+            )
         }
     }
 
-    private func resumeThrottledTask(taskKey: TaskKey) {
+    private func resumeThrottledTask(
+        taskKey: TaskKey,
+        throttleGeneration: UInt64
+    ) {
+        var shouldResume = false
         let task = updateContext(for: taskKey) { context in
+            guard context.isThrottled,
+                  context.throttleGeneration == throttleGeneration else {
+                return
+            }
+
             context.isThrottled = false
+            shouldResume = true
         }?.task
 
-        task?.resume()
+        if shouldResume {
+            task?.resume()
+        }
+    }
+
+    private func releaseThrottledTasksLocked() -> [URLSessionDownloadTask] {
+        var tasks: [URLSessionDownloadTask] = []
+
+        for taskKey in Array(contexts.keys) {
+            guard var context = contexts[taskKey], context.isThrottled else {
+                continue
+            }
+
+            context.isThrottled = false
+            context.throttleGeneration &+= 1
+            contexts[taskKey] = context
+            tasks.append(context.task)
+        }
+
+        return tasks
     }
 
     private func withLock<T>(_ work: () -> T) -> T {
@@ -366,11 +435,12 @@ extension DownloadCoordinator: URLSessionDownloadDelegate, URLSessionTaskDelegat
 
             let deltaBytes = totalBytesWritten - context.transferSample.lastTotalBytesWritten
             let speed = elapsed > 0 ? Double(deltaBytes) / elapsed : context.transferSample.speedBytesPerSecond
-            throttleDelay = self.throttleDelay(
+            throttleDelay = Self.throttleDelay(
                 deltaBytes: deltaBytes,
                 elapsed: elapsed,
                 activeTransferCount: contexts.count,
-                transferSettings: transferSettings
+                transferSettings: transferSettings,
+                speedLimitOverride: context.speedLimitOverride
             )
             context.transferSample = TransferSample(
                 lastTotalBytesWritten: totalBytesWritten,
