@@ -12,7 +12,9 @@ struct HarborApp: App {
         _settings = State(initialValue: settings)
         _center = State(initialValue: DownloadCenter(settings: settings))
         _updater = StateObject(
-            wrappedValue: PreviewRuntime.isActive ? AppUpdater.preview(canCheckForUpdates: false) : AppUpdater()
+            wrappedValue: PreviewRuntime.isActive || HarborApplicationSupport.isRunningUnitTests
+                ? AppUpdater.preview(canCheckForUpdates: false)
+                : AppUpdater()
         )
     }
 
@@ -23,7 +25,8 @@ struct HarborApp: App {
                 .task {
                     appDelegate.center = center
 
-                    guard PreviewRuntime.isActive == false else {
+                    guard PreviewRuntime.isActive == false,
+                          HarborApplicationSupport.isRunningUnitTests == false else {
                         return
                     }
 
@@ -41,8 +44,6 @@ struct HarborApp: App {
 
         Settings {
             SettingsView(settings: settings, updater: updater)
-                .frame(minWidth: 480, idealWidth: 500, minHeight: 340)
-                .padding(20)
         }
         .windowResizability(.contentSize)
     }

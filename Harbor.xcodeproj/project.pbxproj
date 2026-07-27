@@ -10,7 +10,18 @@
 		0D5F5A5C2F700E1900A1B2C3 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 0D5F5A5B2F700E1900A1B2C3 /* Sparkle */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		0D4700072F90000000A1B2C3 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 0DA35C4C2F6338930095E98E /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 0DA35C532F6338930095E98E;
+			remoteInfo = Harbor;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
+		0D4700012F90000000A1B2C3 /* HarborTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = HarborTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		0DA35C542F6338930095E98E /* Harbor.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Harbor.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -25,6 +36,11 @@
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		0D4700022F90000000A1B2C3 /* HarborTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = HarborTests;
+			sourceTree = "<group>";
+		};
 		0DA35C562F6338930095E98E /* Harbor */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
@@ -36,6 +52,13 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		0D4700032F90000000A1B2C3 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		0DA35C512F6338930095E98E /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -51,6 +74,7 @@
 			isa = PBXGroup;
 			children = (
 				0DA35C562F6338930095E98E /* Harbor */,
+				0D4700022F90000000A1B2C3 /* HarborTests */,
 				0DA35C552F6338930095E98E /* Products */,
 			);
 			sourceTree = "<group>";
@@ -59,6 +83,7 @@
 			isa = PBXGroup;
 			children = (
 				0DA35C542F6338930095E98E /* Harbor.app */,
+				0D4700012F90000000A1B2C3 /* HarborTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -66,6 +91,29 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		0D4700062F90000000A1B2C3 /* HarborTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0D47000B2F90000000A1B2C3 /* Build configuration list for PBXNativeTarget "HarborTests" */;
+			buildPhases = (
+				0D4700052F90000000A1B2C3 /* Sources */,
+				0D4700032F90000000A1B2C3 /* Frameworks */,
+				0D4700042F90000000A1B2C3 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				0D4700082F90000000A1B2C3 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				0D4700022F90000000A1B2C3 /* HarborTests */,
+			);
+			name = HarborTests;
+			packageProductDependencies = (
+			);
+			productName = HarborTests;
+			productReference = 0D4700012F90000000A1B2C3 /* HarborTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		0DA35C532F6338930095E98E /* Harbor */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 0DA35C5F2F6338940095E98E /* Build configuration list for PBXNativeTarget "Harbor" */;
@@ -101,6 +149,10 @@
 				LastSwiftUpdateCheck = 2630;
 				LastUpgradeCheck = 2650;
 				TargetAttributes = {
+					0D4700062F90000000A1B2C3 = {
+						CreatedOnToolsVersion = 26.3;
+						TestTargetID = 0DA35C532F6338930095E98E;
+					};
 					0DA35C532F6338930095E98E = {
 						CreatedOnToolsVersion = 26.3;
 					};
@@ -127,11 +179,19 @@
 			projectRoot = "";
 			targets = (
 				0DA35C532F6338930095E98E /* Harbor */,
+				0D4700062F90000000A1B2C3 /* HarborTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		0D4700042F90000000A1B2C3 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		0DA35C522F6338930095E98E /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -195,6 +255,13 @@
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		0D4700052F90000000A1B2C3 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		0DA35C502F6338930095E98E /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -204,7 +271,63 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		0D4700082F90000000A1B2C3 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 0DA35C532F6338930095E98E /* Harbor */;
+			targetProxy = 0D4700072F90000000A1B2C3 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		0D4700092F90000000A1B2C3 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
+				PRODUCT_BUNDLE_IDENTIFIER = co.hapy.HarborTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Harbor.app/Contents/MacOS/Harbor";
+			};
+			name = Debug;
+		};
+		0D47000A2F90000000A1B2C3 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
+				PRODUCT_BUNDLE_IDENTIFIER = co.hapy.HarborTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Harbor.app/Contents/MacOS/Harbor";
+			};
+			name = Release;
+		};
 		0DA35C5D2F6338940095E98E /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -339,7 +462,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 24;
+				CURRENT_PROJECT_VERSION = 25;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -354,7 +477,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.6;
-				MARKETING_VERSION = 1.4.3;
+				MARKETING_VERSION = 1.5.0;
 				PRODUCT_BUNDLE_IDENTIFIER = co.hapy.harbor;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -376,7 +499,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 24;
+				CURRENT_PROJECT_VERSION = 25;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -391,7 +514,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.6;
-				MARKETING_VERSION = 1.4.3;
+				MARKETING_VERSION = 1.5.0;
 				PRODUCT_BUNDLE_IDENTIFIER = co.hapy.harbor;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -408,6 +531,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		0D47000B2F90000000A1B2C3 /* Build configuration list for PBXNativeTarget "HarborTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0D4700092F90000000A1B2C3 /* Debug */,
+				0D47000A2F90000000A1B2C3 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		0DA35C4F2F6338930095E98E /* Build configuration list for PBXProject "Harbor" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
