@@ -25,7 +25,7 @@ struct AddDownloadSheet: View {
     @State private var mediaPreview: MediaDownloadMetadata?
     @State private var mediaPreviewError: String?
     @State private var mediaFormatPreference: MediaDownloadFormatPreference = .original
-    @State private var hasMediaSavePermission = false
+    @State private var hasMediaSavePermission = true // Per #40, before nice rights UI gets added
     @State private var isResolvingMedia = false
     @State private var isSubmitting = false
     @State private var mediaPreviewTask: Task<Void, Never>?
@@ -702,7 +702,6 @@ struct AddDownloadSheet: View {
 
             mediaPreview = metadata
             mediaFormatPreference = .original
-            hasMediaSavePermission = false
             return metadata
         } catch {
             if showErrors, mediaPreviewGeneration == generation {
@@ -716,7 +715,7 @@ struct AddDownloadSheet: View {
         mediaPreview = nil
         mediaPreviewError = nil
         isResolvingMedia = false
-        hasMediaSavePermission = false
+        hasMediaSavePermission = true // Per #40, before nice rights UI gets added
         mediaFormatPreference = .original
     }
 
