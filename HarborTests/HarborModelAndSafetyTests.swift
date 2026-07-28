@@ -177,6 +177,23 @@ final class HarborModelAndSafetyTests: XCTestCase {
             selectedArguments[selectedArguments.index(after: selectedLimitIndex)],
             "345678"
         )
+
+        XCTAssertThrowsError(
+            try MediaDownloadService.downloadArguments(
+                runtime: runtime,
+                sourceURL: sourceURL,
+                destinationFolder: destinationURL,
+                temporaryFolder: temporaryURL,
+                metadata: metadata,
+                formatPreference: .specific("unavailable-format"),
+                speedLimitBytesPerSecond: nil
+            )
+        ) { error in
+            XCTAssertEqual(
+                error.localizedDescription,
+                "The selected media format is no longer available."
+            )
+        }
     }
 
     func testLegacyCompletedTorrentDoesNotSeed() throws {

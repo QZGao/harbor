@@ -473,6 +473,28 @@ final class DownloadCenter {
         schedulePersist()
     }
 
+    func setMediaFormatPreference(
+        _ preference: MediaDownloadFormatPreference,
+        for id: UUID
+    ) {
+        guard let item = item(for: id),
+              item.backend == .ytDlp,
+              item.status == .failed else {
+            return
+        }
+
+        if case let .specific(optionID) = preference,
+           item.mediaMetadata?.capabilities.formatOptions.contains(where: {
+               $0.id == optionID
+           }) != true {
+            return
+        }
+
+        item.mediaFormatPreference = preference
+        item.updatedAt = .now
+        schedulePersist()
+    }
+
     func installExternalOpenHandlerIfNeeded() {
         guard hasInstalledExternalOpenHandler == false else {
             return
@@ -1607,28 +1629,13 @@ final class DownloadCenter {
 
             let requestedFormat = readyItem.mediaFormatPreference
                 ?? validatedMetadata.defaultFormatPreference
-            let formatPreference: MediaDownloadFormatPreference
-            switch requestedFormat {
-            case .original:
-                formatPreference = .original
-            case let .specific(optionID):
-                if validatedMetadata.capabilities.formatOptions.contains(where: {
-                    $0.id == optionID
-                }) {
-                    formatPreference = requestedFormat
-                } else {
-                    formatPreference = .original
-                    readyItem.mediaFormatPreference = .original
-                    schedulePersist()
-                }
-            }
 
             let processIdentifier = try await mediaService.startDownload(
                 id: readyItem.id,
                 sourceURL: readyItem.sourceURL,
                 destinationFolder: readyItem.destinationFolderURL,
                 metadata: validatedMetadata,
-                formatPreference: formatPreference,
+                formatPreference: requestedFormat,
                 speedLimitBytesPerSecond: effectiveMediaDownloadLimit(for: readyItem)
             )
 

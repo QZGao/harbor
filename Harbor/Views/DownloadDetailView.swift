@@ -31,6 +31,10 @@ private struct DownloadInspectorContent: View {
                     copySourceURL: copySourceURL
                 )
 
+                if shouldShowMediaFormatRecovery {
+                    MediaFormatRecoverySection(item: item, center: center)
+                }
+
                 DownloadTransferSection(item: item, center: center)
                 DownloadStorageSection(item: item)
                 DownloadActivitySection(item: item)
@@ -65,6 +69,24 @@ private struct DownloadInspectorContent: View {
         .navigationTitle(item.displayName)
     }
 
+    private var shouldShowMediaFormatRecovery: Bool {
+        guard item.backend == .ytDlp,
+              item.status == .failed,
+              let metadata = item.mediaMetadata else {
+            return false
+        }
+
+        if metadata.capabilities.supportsMediaFormatSelection {
+            return true
+        }
+
+        guard case .specific? = item.mediaFormatPreference else {
+            return false
+        }
+
+        return true
+    }
+
     private func continueInBrowser() {
         center.continueInBrowser(id: item.id)
     }
@@ -95,6 +117,101 @@ private struct DownloadInspectorContent: View {
 
     private func copySourceURL() {
         center.copySourceURL(id: item.id)
+    }
+}
+
+private struct MediaFormatRecoverySection: View {
+    let item: DownloadItem
+    let center: DownloadCenter
+
+    var body: some View {
+        DownloadDetailSection(title: "Media Format") {
+            VStack(alignment: .leading, spacing: 12) {
+                if selectedFormatIsUnavailable {
+                    DownloadCallout(
+                        title: "Format No Longer Available",
+                        message: "Choose another format, then retry the download.",
+                        systemImage: "exclamationmark.triangle",
+                        tint: .orange
+                    )
+                }
+
+                Picker("Format", selection: formatSelection) {
+                    if let unavailablePreference {
+                        Text("Unavailable Format")
+                            .tag(unavailablePreference)
+                            .disabled(true)
+                    }
+
+                    Text("Original")
+                        .tag(MediaDownloadFormatPreference.original)
+
+                    ForEach(formatOptions) { format in
+                        Text(formatTitle(format))
+                            .tag(MediaDownloadFormatPreference.specific(format.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(maxWidth: 320, alignment: .leading)
+            }
+        }
+    }
+
+    private var formatOptions: [MediaDownloadFormatOption] {
+        item.mediaMetadata?.capabilities.formatOptions ?? []
+    }
+
+    private var formatSelection: Binding<MediaDownloadFormatPreference> {
+        Binding(
+            get: { item.mediaFormatPreference ?? .original },
+            set: { center.setMediaFormatPreference($0, for: item.id) }
+        )
+    }
+
+    private var unavailablePreference: MediaDownloadFormatPreference? {
+        guard case let .specific(optionID)? = item.mediaFormatPreference,
+              formatOptions.contains(where: { $0.id == optionID }) == false else {
+            return nil
+        }
+
+        return .specific(optionID)
+    }
+
+    private var selectedFormatIsUnavailable: Bool {
+        unavailablePreference != nil
+    }
+
+    private func formatTitle(_ format: MediaDownloadFormatOption) -> String {
+        var components: [String] = []
+
+        if let height = format.height {
+            components.append("\(height)p")
+        } else if let width = format.width {
+            components.append("\(width) px")
+        } else if format.videoCodec != nil {
+            components.append("Video")
+        } else if format.audioCodec != nil {
+            components.append("Audio")
+        } else {
+            components.append("Media")
+        }
+
+        components.append(format.container.uppercased())
+
+        if let codec = format.videoCodec ?? format.audioCodec,
+           let codecFamily = codec.split(separator: ".").first {
+            components.append(codecFamily.uppercased())
+        }
+
+        if let bitrateKbps = format.bitrateKbps,
+           bitrateKbps.isFinite,
+           bitrateKbps > 0 {
+            components.append(
+                "\(bitrateKbps.formatted(.number.precision(.fractionLength(0)))) kbps"
+            )
+        }
+
+        return components.joined(separator: " • ")
     }
 }
 
