@@ -223,16 +223,30 @@ struct AddDownloadSheet: View {
             }
 
             Toggle("I own this content or have permission to save it", isOn: $hasMediaSavePermission)
-        } else if let mediaPreviewError, shouldShowMediaPreviewError {
+        } else if let mediaPreviewError {
             LabeledContent("Media") {
-                Label(mediaPreviewError, systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .trailing, spacing: 8) {
+                    Label(mediaPreviewError, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if canTryAsMedia {
+                        Button("Try as Media") {
+                            tryAsMedia()
+                        }
+                    }
+                }
             }
         } else if parsedLinkURL.map(isKnownMediaHost) == true {
             LabeledContent("Media") {
                 Text("Harbor will check this link with yt-dlp.")
                     .foregroundStyle(.secondary)
+            }
+        } else if canTryAsMedia {
+            LabeledContent("Media") {
+                Button("Try as Media") {
+                    tryAsMedia()
+                }
             }
         }
     }
@@ -325,17 +339,22 @@ struct AddDownloadSheet: View {
         }
     }
 
-    private var shouldShowMediaPreviewError: Bool {
-        guard parsedLinkURL != nil else {
-            return false
-        }
-
-        return parsedLinkURL.map(isKnownMediaHost) == true
-    }
-
     private var parsedLinkURL: URL? {
         let trimmedURL = sourceURLText.trimmingCharacters(in: .whitespacesAndNewlines)
         return URL(string: trimmedURL)
+    }
+
+    private var canTryAsMedia: Bool {
+        guard entryMode == .linkOrMagnet,
+              let url = parsedLinkURL,
+              DownloadSourceKind.detect(from: url) == .directURL,
+              isKnownMediaHost(url) == false,
+              mediaPreview == nil,
+              isResolvingMedia == false else {
+            return false
+        }
+
+        return true
     }
 
     @MainActor
@@ -378,12 +397,14 @@ struct AddDownloadSheet: View {
             if detectedKind == .directURL {
                 if let mediaPreview {
                     resolvedMediaPreview = mediaPreview
-                } else {
+                } else if isKnownMediaHost(parsedURL) {
                     resolvedMediaPreview = await resolveMediaPreview(
                         for: parsedURL,
-                        showErrors: isKnownMediaHost(parsedURL),
+                        showErrors: true,
                         generation: generation
                     )
+                } else {
+                    resolvedMediaPreview = nil
                 }
             } else {
                 resolvedMediaPreview = nil
@@ -662,7 +683,8 @@ struct AddDownloadSheet: View {
 
         guard entryMode == .linkOrMagnet,
               let url = parsedLinkURL,
-              DownloadSourceKind.detect(from: url) == .directURL else {
+              DownloadSourceKind.detect(from: url) == .directURL,
+              isKnownMediaHost(url) else {
             return
         }
 
@@ -676,7 +698,29 @@ struct AddDownloadSheet: View {
 
             _ = await resolveMediaPreview(
                 for: url,
-                showErrors: isKnownMediaHost(url),
+                showErrors: true,
+                generation: generation
+            )
+        }
+    }
+
+    @MainActor
+    private func tryAsMedia() {
+        guard let url = parsedLinkURL,
+              DownloadSourceKind.detect(from: url) == .directURL,
+              isKnownMediaHost(url) == false else {
+            return
+        }
+
+        validationMessage = nil
+        mediaPreviewTask?.cancel()
+        mediaPreviewGeneration += 1
+        let generation = mediaPreviewGeneration
+
+        mediaPreviewTask = Task { @MainActor in
+            _ = await resolveMediaPreview(
+                for: url,
+                showErrors: true,
                 generation: generation
             )
         }
