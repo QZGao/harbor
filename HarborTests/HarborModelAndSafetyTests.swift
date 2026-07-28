@@ -114,7 +114,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             destinationFolder: destinationURL,
             temporaryFolder: temporaryURL,
             metadata: nil,
-            formatPreference: .original,
+            formatPreference: .bestAvailable,
             speedLimitBytesPerSecond: 345_678
         )
         let unlimitedArguments = try MediaDownloadService.downloadArguments(
@@ -123,7 +123,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             destinationFolder: destinationURL,
             temporaryFolder: temporaryURL,
             metadata: nil,
-            formatPreference: .original,
+            formatPreference: .bestAvailable,
             speedLimitBytesPerSecond: nil
         )
 

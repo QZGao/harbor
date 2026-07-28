@@ -143,8 +143,8 @@ private struct MediaFormatRecoverySection: View {
                             .disabled(true)
                     }
 
-                    Text("Original")
-                        .tag(MediaDownloadFormatPreference.original)
+                    Text("Best available")
+                        .tag(MediaDownloadFormatPreference.bestAvailable)
 
                     ForEach(formatOptions) { format in
                         Text(formatTitle(format))
@@ -163,7 +163,7 @@ private struct MediaFormatRecoverySection: View {
 
     private var formatSelection: Binding<MediaDownloadFormatPreference> {
         Binding(
-            get: { item.mediaFormatPreference ?? .original },
+            get: { item.mediaFormatPreference ?? .bestAvailable },
             set: { center.setMediaFormatPreference($0, for: item.id) }
         )
     }

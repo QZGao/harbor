@@ -96,7 +96,7 @@ struct MediaRuntimeSmokeTests {
         try assert(metadata.capabilities.supportsMediaFormatSelection, "Checked media formats should enable the format picker")
         try assert(metadata.supportsMediaDownload, "Checked video formats should enable yt-dlp")
         try assert(metadata.capabilities.formatOptions.count == 5, "Each meaningful checked media output should be listed")
-        try assert(metadata.defaultFormatPreference == .original, "Original should be the default format")
+        try assert(metadata.defaultFormatPreference == .bestAvailable, "Best available should be the default format")
 
         let mp4Pair = metadata.capabilities.formatOptions.first { $0.id == "137+140" }
         try assert(mp4Pair?.container == "mp4", "MP4 video and M4A audio should produce MP4")
@@ -342,7 +342,7 @@ struct MediaRuntimeSmokeTests {
             "Flat collection metadata should not invent video format options"
         )
         try assert(metadata.supportsMediaDownload, "Collections should remain on the automatic yt-dlp path")
-        try assert(metadata.defaultFormatPreference == .original, "Collection default format should preserve originals")
+        try assert(metadata.defaultFormatPreference == .bestAvailable, "Collection default format should be best available")
     }
 
     private static func testFormatPreferenceCoding() throws {
@@ -353,13 +353,24 @@ struct MediaRuntimeSmokeTests {
         )
         try assert(decoded == preference, "An exact format selection should survive persistence")
 
-        let legacyPreference = try JSONDecoder().decode(
+        let bestAvailable = MediaDownloadFormatPreference.bestAvailable
+        let encodedBestAvailable = try JSONEncoder().encode(bestAvailable)
+        try assert(
+            String(decoding: encodedBestAvailable, as: UTF8.self) == #""bestAvailable""#,
+            "Best available should use the current persistence value"
+        )
+
+        let legacyOriginal = try JSONDecoder().decode(
+            MediaDownloadFormatPreference.self,
+            from: Data(#""original""#.utf8)
+        )
+        let legacyBestMP4 = try JSONDecoder().decode(
             MediaDownloadFormatPreference.self,
             from: Data(#""bestMP4""#.utf8)
         )
         try assert(
-            legacyPreference == .original,
-            "The removed Best MP4 preference should migrate to Original"
+            legacyOriginal == .bestAvailable && legacyBestMP4 == .bestAvailable,
+            "Legacy automatic format preferences should migrate to Best available"
         )
     }
 

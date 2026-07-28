@@ -143,7 +143,7 @@ actor MediaDownloadService {
 
         let expectedBytes: Int64
         switch formatPreference {
-        case .original:
+        case .bestAvailable:
             expectedBytes = metadata?.expectedBytes ?? 0
         case let .specific(optionID):
             expectedBytes = metadata?.capabilities.formatOptions.first(where: {

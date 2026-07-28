@@ -8,7 +8,7 @@ enum MediaDownloadType: String, Codable, Sendable {
 }
 
 enum MediaDownloadFormatPreference: Codable, Equatable, Hashable, Sendable {
-    case original
+    case bestAvailable
     case specific(String)
 
     private enum CodingKeys: String, CodingKey {
@@ -17,6 +17,7 @@ enum MediaDownloadFormatPreference: Codable, Equatable, Hashable, Sendable {
     }
 
     private enum Kind: String, Codable {
+        case bestAvailable
         case original
         case specific
     }
@@ -24,8 +25,8 @@ enum MediaDownloadFormatPreference: Codable, Equatable, Hashable, Sendable {
     nonisolated init(from decoder: Decoder) throws {
         if let legacyValue = try? decoder.singleValueContainer().decode(String.self) {
             switch legacyValue {
-            case "original", "bestMP4":
-                self = .original
+            case "bestAvailable", "original", "bestMP4":
+                self = .bestAvailable
                 return
             default:
                 throw DecodingError.dataCorrupted(
@@ -39,8 +40,8 @@ enum MediaDownloadFormatPreference: Codable, Equatable, Hashable, Sendable {
 
         let container = try decoder.container(keyedBy: CodingKeys.self)
         switch try container.decode(Kind.self, forKey: .kind) {
-        case .original:
-            self = .original
+        case .bestAvailable, .original:
+            self = .bestAvailable
         case .specific:
             self = .specific(try container.decode(String.self, forKey: .optionID))
         }
@@ -48,9 +49,9 @@ enum MediaDownloadFormatPreference: Codable, Equatable, Hashable, Sendable {
 
     nonisolated func encode(to encoder: Encoder) throws {
         switch self {
-        case .original:
+        case .bestAvailable:
             var container = encoder.singleValueContainer()
-            try container.encode("original")
+            try container.encode("bestAvailable")
         case let .specific(optionID):
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(Kind.specific, forKey: .kind)
@@ -229,7 +230,7 @@ struct MediaDownloadMetadata: Codable, Equatable, Sendable {
     }
 
     nonisolated var defaultFormatPreference: MediaDownloadFormatPreference {
-        .original
+        .bestAvailable
     }
 }
 

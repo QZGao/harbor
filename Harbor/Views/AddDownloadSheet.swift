@@ -24,7 +24,7 @@ struct AddDownloadSheet: View {
     @State private var validationMessage: String?
     @State private var mediaPreview: MediaDownloadMetadata?
     @State private var mediaPreviewError: String?
-    @State private var mediaFormatPreference: MediaDownloadFormatPreference = .original
+    @State private var mediaFormatPreference: MediaDownloadFormatPreference = .bestAvailable
     @State private var hasMediaSavePermission = true // Per #40, before nice rights UI gets added
     @State private var isResolvingMedia = false
     @State private var isSubmitting = false
@@ -191,12 +191,12 @@ struct AddDownloadSheet: View {
                     ScrollView {
                         Picker("", selection: $mediaFormatPreference) {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Original")
+                                Text("Best available")
                                 Text("Let yt-dlp choose the best available streams")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
-                            .tag(MediaDownloadFormatPreference.original)
+                            .tag(MediaDownloadFormatPreference.bestAvailable)
 
                             ForEach(mediaPreview.capabilities.formatOptions) { format in
                                 VStack(alignment: .leading, spacing: 2) {
@@ -763,7 +763,7 @@ struct AddDownloadSheet: View {
             }
 
             mediaPreview = metadata
-            mediaFormatPreference = .original
+            mediaFormatPreference = .bestAvailable
             return metadata
         } catch {
             if showErrors, mediaPreviewGeneration == generation {
@@ -778,7 +778,7 @@ struct AddDownloadSheet: View {
         mediaPreviewError = nil
         isResolvingMedia = false
         hasMediaSavePermission = true // Per #40, before nice rights UI gets added
-        mediaFormatPreference = .original
+        mediaFormatPreference = .bestAvailable
     }
 
     private func isUsableMediaMetadata(_ metadata: MediaDownloadMetadata) -> Bool {
