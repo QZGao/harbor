@@ -30,11 +30,6 @@ enum MediaDownloadError: LocalizedError {
 actor MediaDownloadService {
     typealias EventHandler = @Sendable (MediaDownloadEvent) -> Void
 
-    /// bv*: best available format containing video, which may already contain audio;
-    /// +ba: add best available audio and merge them;
-    /// /b: fallback to best combined video+audio format.
-    private nonisolated static let bestAvailableVideoFormatSelector = "bv*+ba/b"
-
     private enum TerminationReason {
         case pause
         case cancel
@@ -86,9 +81,9 @@ actor MediaDownloadService {
         let output = try await runMetadataCommand(runtime: runtime, url: url)
         let metadata = try MediaDownloadMetadataParser.metadata(from: output, sourceURL: url)
 
-        guard metadata.capabilities.supportsVideoDownload else {
+        guard metadata.supportsMediaDownload else {
             throw MediaDownloadError.unsupported(
-                "yt-dlp couldn’t verify a downloadable video format for this link."
+                "yt-dlp couldn’t verify downloadable media for this link."
             )
         }
 
@@ -107,9 +102,9 @@ actor MediaDownloadService {
             return existing.process.processIdentifier
         }
 
-        guard metadata?.capabilities.supportsVideoDownload == true else {
+        guard metadata?.supportsMediaDownload == true else {
             throw MediaDownloadError.unsupported(
-                "This download does not have a verified yt-dlp video format."
+                "yt-dlp couldn’t verify downloadable media for this download."
             )
         }
 
@@ -478,13 +473,7 @@ actor MediaDownloadService {
             ])
         }
 
-        switch formatPreference {
-        case .original:
-            arguments.append(contentsOf: [
-                "--format",
-                Self.bestAvailableVideoFormatSelector
-            ])
-        case let .specific(optionID):
+        if case let .specific(optionID) = formatPreference {
             guard let format = metadata?.capabilities.formatOptions.first(where: {
                 $0.id == optionID
             }) else {

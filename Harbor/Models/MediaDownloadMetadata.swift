@@ -60,10 +60,10 @@ enum MediaDownloadFormatPreference: Codable, Equatable, Hashable, Sendable {
 }
 
 struct MediaDownloadFormatOption: Codable, Equatable, Identifiable, Sendable {
-    let videoFormatID: String
-    let audioFormatID: String?
+    let formatID: String
+    let audioFormatID: String? // merge with video if formatID is video-only
     let container: String
-    let videoCodec: String
+    let videoCodec: String?
     let audioCodec: String?
     let width: Int?
     let height: Int?
@@ -73,16 +73,32 @@ struct MediaDownloadFormatOption: Codable, Equatable, Identifiable, Sendable {
     let estimatedBytes: Int64
     let mergeOutputFormat: String?
 
+    // Keep the existing coding keys because format options are persisted.
+    private enum CodingKeys: String, CodingKey {
+        case formatID = "videoFormatID"
+        case audioFormatID
+        case container
+        case videoCodec
+        case audioCodec
+        case width
+        case height
+        case framesPerSecond
+        case dynamicRange
+        case bitrateKbps
+        case estimatedBytes
+        case mergeOutputFormat
+    }
+
     nonisolated var id: String {
         selector
     }
 
     nonisolated var selector: String {
         guard let audioFormatID else {
-            return videoFormatID
+            return formatID
         }
 
-        return "\(videoFormatID)+\(audioFormatID)"
+        return "\(formatID)+\(audioFormatID)"
     }
 }
 
@@ -114,7 +130,7 @@ struct MediaDownloadCapabilities: Codable, Equatable, Sendable {
         try container.encode(formatOptions, forKey: .formatOptions)
     }
 
-    nonisolated var supportsVideoDownload: Bool {
+    nonisolated var supportsMediaFormatSelection: Bool {
         formatOptions.isEmpty == false
     }
 }
@@ -197,6 +213,21 @@ struct MediaDownloadMetadata: Codable, Equatable, Sendable {
         entryCount > 1 || mediaType == .collection
     }
 
+    /// Whether the source should stay on Harbor's yt-dlp download path.
+    nonisolated var supportsMediaDownload: Bool {
+        if capabilities.supportsMediaFormatSelection || mediaType != .unknown {
+            return true
+        }
+
+        guard let extractorKey = extractorKey?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            extractorKey.isEmpty == false else {
+            return false
+        } // Normalize.
+
+        return extractorKey.caseInsensitiveCompare("generic") != .orderedSame // "generic" denotes extractorKey not recognized by yt-dlp
+    }
+
     nonisolated var defaultFormatPreference: MediaDownloadFormatPreference {
         .original
     }
@@ -245,7 +276,7 @@ enum MediaDownloadMetadataParser {
             return .collection
         }
 
-        if capabilities.supportsVideoDownload {
+        if capabilities.formatOptions.contains(where: { $0.videoCodec != nil }) {
             return .video
         }
 
@@ -273,57 +304,82 @@ enum MediaDownloadMetadataParser {
             format.hasNoVideo && format.hasAudio && format.normalizedFormatID != nil
         }
         let options = checkedFormats.compactMap { format -> MediaDownloadFormatOption? in
-            guard format.hasVideo,
-                  let videoFormatID = format.normalizedFormatID,
-                  let videoCodec = format.normalizedVideoCodec,
-                  let videoContainer = format.normalizedExtension else {
+            guard let formatID = format.normalizedFormatID,
+                  let container = format.normalizedExtension else {
                 return nil
             }
 
-            if format.hasAudio {
+            if format.hasVideo {
+                guard let videoCodec = format.normalizedVideoCodec else {
+                    return nil
+                }
+
+                if format.hasAudio {
+                    return MediaDownloadFormatOption(
+                        formatID: formatID,
+                        audioFormatID: nil,
+                        container: container,
+                        videoCodec: videoCodec,
+                        audioCodec: format.normalizedAudioCodec,
+                        width: format.width,
+                        height: format.height,
+                        framesPerSecond: format.framesPerSecond,
+                        dynamicRange: format.normalizedDynamicRange,
+                        bitrateKbps: format.totalBitrateKbps,
+                        estimatedBytes: format.expectedBytes,
+                        mergeOutputFormat: nil
+                    )
+                }
+
+                guard format.hasNoAudio else {
+                    return nil
+                }
+
+                let audioFormat = bestAudioFormat(
+                    forVideoContainer: container,
+                    from: audioFormats
+                )
+                let audioFormatID = audioFormat?.normalizedFormatID
+                let outputContainer = outputContainer(
+                    videoContainer: container,
+                    audioContainer: audioFormat?.normalizedExtension
+                )
+
                 return MediaDownloadFormatOption(
-                    videoFormatID: videoFormatID,
-                    audioFormatID: nil,
-                    container: videoContainer,
+                    formatID: formatID,
+                    audioFormatID: audioFormatID,
+                    container: outputContainer,
                     videoCodec: videoCodec,
-                    audioCodec: format.normalizedAudioCodec,
+                    audioCodec: audioFormat?.normalizedAudioCodec,
                     width: format.width,
                     height: format.height,
                     framesPerSecond: format.framesPerSecond,
                     dynamicRange: format.normalizedDynamicRange,
-                    bitrateKbps: format.totalBitrateKbps,
-                    estimatedBytes: format.expectedBytes,
-                    mergeOutputFormat: nil
+                    bitrateKbps: combinedBitrate(video: format, audio: audioFormat),
+                    estimatedBytes: combinedSize(video: format, audio: audioFormat),
+                    mergeOutputFormat: audioFormat == nil ? nil : outputContainer
                 )
             }
 
-            guard format.hasNoAudio else {
+            guard format.hasNoVideo,
+                  format.hasAudio,
+                  let audioCodec = format.normalizedAudioCodec else {
                 return nil
             }
 
-            let audioFormat = bestAudioFormat(
-                forVideoContainer: videoContainer,
-                from: audioFormats
-            )
-            let audioFormatID = audioFormat?.normalizedFormatID
-            let outputContainer = outputContainer(
-                videoContainer: videoContainer,
-                audioContainer: audioFormat?.normalizedExtension
-            )
-
             return MediaDownloadFormatOption(
-                videoFormatID: videoFormatID,
-                audioFormatID: audioFormatID,
-                container: outputContainer,
-                videoCodec: videoCodec,
-                audioCodec: audioFormat?.normalizedAudioCodec,
-                width: format.width,
-                height: format.height,
-                framesPerSecond: format.framesPerSecond,
-                dynamicRange: format.normalizedDynamicRange,
-                bitrateKbps: combinedBitrate(video: format, audio: audioFormat),
-                estimatedBytes: combinedSize(video: format, audio: audioFormat),
-                mergeOutputFormat: audioFormat == nil ? nil : outputContainer
+                formatID: formatID,
+                audioFormatID: nil,
+                container: container,
+                videoCodec: nil,
+                audioCodec: audioCodec,
+                width: nil,
+                height: nil,
+                framesPerSecond: nil,
+                dynamicRange: nil,
+                bitrateKbps: format.totalBitrateKbps,
+                estimatedBytes: format.expectedBytes,
+                mergeOutputFormat: nil
             )
         }
 
@@ -451,7 +507,7 @@ enum MediaDownloadMetadataParser {
 
     private nonisolated struct FormatOptionIdentity: Hashable {
         let container: String
-        let videoCodec: String
+        let videoCodec: String?
         let audioCodec: String?
         let width: Int?
         let height: Int?
@@ -462,7 +518,7 @@ enum MediaDownloadMetadataParser {
 
         nonisolated init(_ option: MediaDownloadFormatOption) {
             container = option.container
-            videoCodec = option.videoCodec.lowercased()
+            videoCodec = option.videoCodec?.lowercased()
             audioCodec = option.audioCodec?.lowercased()
             width = option.width
             height = option.height

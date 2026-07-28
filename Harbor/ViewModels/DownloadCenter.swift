@@ -1585,7 +1585,7 @@ final class DownloadCenter {
         do {
             let validatedMetadata: MediaDownloadMetadata
             if let metadata = currentItem.mediaMetadata,
-               metadata.capabilities.supportsVideoDownload {
+               metadata.supportsMediaDownload {
                 validatedMetadata = metadata
             } else {
                 validatedMetadata = try await mediaService.metadata(for: currentItem.sourceURL)

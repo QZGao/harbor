@@ -9,10 +9,10 @@ struct MediaRuntimeSmokeTests {
         try testMetadataParserCombinedMP4Video()
         try testMetadataParserVideoWithoutAudio()
         try testMetadataParserRejectsExtensionOnlyFile()
-        try testMetadataParserRejectsUnverifiedVideoFormats()
+        try testMetadataParserExposesAudioWithoutUnverifiedVideo()
         try testMetadataParserCollection()
         try testFormatPreferenceCoding()
-        try testLegacyMetadataDecodingFailsClosed()
+        try testLegacyMetadataDecoding()
         try testProgressAndFinalPathParsers()
         try testManagedChildProcessTerminatesProcessGroup()
         print("Media runtime smoke tests passed")
@@ -93,8 +93,9 @@ struct MediaRuntimeSmokeTests {
         try assert(metadata.title == "Sample Short", "Video title should parse")
         try assert(metadata.platform == "Youtube", "Extractor key should become platform")
         try assert(metadata.mediaType == .video, "Checked video formats should classify the source as video")
-        try assert(metadata.capabilities.supportsVideoDownload, "Checked video formats should enable yt-dlp")
-        try assert(metadata.capabilities.formatOptions.count == 3, "Each meaningful checked video output should be listed")
+        try assert(metadata.capabilities.supportsMediaFormatSelection, "Checked media formats should enable the format picker")
+        try assert(metadata.supportsMediaDownload, "Checked video formats should enable yt-dlp")
+        try assert(metadata.capabilities.formatOptions.count == 5, "Each meaningful checked media output should be listed")
         try assert(metadata.defaultFormatPreference == .original, "Original should be the default format")
 
         let mp4Pair = metadata.capabilities.formatOptions.first { $0.id == "137+140" }
@@ -109,6 +110,13 @@ struct MediaRuntimeSmokeTests {
         let combined = metadata.capabilities.formatOptions.first { $0.id == "18" }
         try assert(combined?.audioFormatID == nil, "A combined format should use one exact format ID")
         try assert(combined?.mergeOutputFormat == nil, "A combined format should not request a merge")
+
+        let audioSelectors = Set(
+            metadata.capabilities.formatOptions
+                .filter { $0.videoCodec == nil }
+                .map(\.selector)
+        )
+        try assert(audioSelectors == ["140", "251"], "Checked audio-only formats should be selectable")
 
         let roundTrip = try JSONDecoder().decode(
             MediaDownloadMetadata.self,
@@ -166,7 +174,11 @@ struct MediaRuntimeSmokeTests {
             sourceURL: URL(string: "https://video.example.test/variants")!
         )
 
-        let selectors = Set(metadata.capabilities.formatOptions.map(\.selector))
+        let selectors = Set(
+            metadata.capabilities.formatOptions
+                .filter { $0.videoCodec != nil }
+                .map(\.selector)
+        )
         try assert(
             selectors == ["133+140", "134+140"],
             "Formats with meaningfully different bitrates and sizes should both remain available"
@@ -192,7 +204,7 @@ struct MediaRuntimeSmokeTests {
             sourceURL: URL(string: "https://video.example.test/combined")!
         )
 
-        try assert(metadata.capabilities.supportsVideoDownload, "Combined MP4 should enable yt-dlp")
+        try assert(metadata.capabilities.supportsMediaFormatSelection, "Combined MP4 should enable the format picker")
         try assert(metadata.capabilities.formatOptions.map(\.selector) == ["18"], "Combined MP4 should be selectable directly")
     }
 
@@ -247,9 +259,17 @@ struct MediaRuntimeSmokeTests {
             metadata.capabilities == .unavailable,
             "An extension-only result must remain a direct download"
         )
+        try assert(metadata.supportsMediaDownload == false, "A Generic MOBI file must remain a direct download")
+
+        let imageMetadata = try MediaDownloadMetadataParser.metadata(
+            from: Data(#"{"id":"image","extractor_key":"Generic","ext":"jpg"}"#.utf8),
+            sourceURL: URL(string: "https://files.example.test/image.jpg")!
+        )
+        try assert(imageMetadata.mediaType == .image, "A recognized image should remain media")
+        try assert(imageMetadata.supportsMediaDownload, "Image media should remain on the automatic yt-dlp path")
     }
 
-    private static func testMetadataParserRejectsUnverifiedVideoFormats() throws {
+    private static func testMetadataParserExposesAudioWithoutUnverifiedVideo() throws {
         let json = """
         {
           "id": "unverified",
@@ -287,8 +307,13 @@ struct MediaRuntimeSmokeTests {
         )
 
         try assert(
-            metadata.capabilities == .unavailable,
-            "Unknown-codec and possibly DRM-protected formats must not enable yt-dlp"
+            metadata.capabilities.formatOptions.map(\.selector) == ["audio-only"],
+            "The checked audio format should remain while unverified video formats are excluded"
+        )
+        try assert(metadata.capabilities.supportsMediaFormatSelection, "Checked audio should enable the media format picker")
+        try assert(
+            metadata.supportsMediaDownload,
+            "A successful non-Generic extractor should remain on the automatic yt-dlp path"
         )
     }
 
@@ -314,8 +339,9 @@ struct MediaRuntimeSmokeTests {
         try assert(metadata.expectedBytes == 2000, "Collection expected bytes should use largest known entry")
         try assert(
             metadata.capabilities == .unavailable,
-            "Flat collection metadata without checked video formats should not enable yt-dlp"
+            "Flat collection metadata should not invent video format options"
         )
+        try assert(metadata.supportsMediaDownload, "Collections should remain on the automatic yt-dlp path")
         try assert(metadata.defaultFormatPreference == .original, "Collection default format should preserve originals")
     }
 
@@ -337,7 +363,7 @@ struct MediaRuntimeSmokeTests {
         )
     }
 
-    private static func testLegacyMetadataDecodingFailsClosed() throws {
+    private static func testLegacyMetadataDecoding() throws {
         let json = """
         {
           "title": "Legacy Video",
@@ -354,7 +380,7 @@ struct MediaRuntimeSmokeTests {
         let metadata = try JSONDecoder().decode(MediaDownloadMetadata.self, from: json)
         try assert(
             metadata.capabilities == .unavailable,
-            "Persisted metadata without checked capabilities must not enable yt-dlp"
+            "Missing legacy capabilities should decode as unavailable"
         )
     }
 

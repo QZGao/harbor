@@ -186,38 +186,40 @@ struct AddDownloadSheet: View {
                 }
             }
 
-            LabeledContent("Format") {
-                ScrollView {
-                    Picker("", selection: $mediaFormatPreference) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Original")
-                            Text("Let yt-dlp choose the best available streams")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        .tag(MediaDownloadFormatPreference.original)
-
-                        ForEach(mediaPreview.capabilities.formatOptions) { format in
+            if mediaPreview.capabilities.supportsMediaFormatSelection {
+                LabeledContent("Format") {
+                    ScrollView {
+                        Picker("", selection: $mediaFormatPreference) {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(mediaFormatTitle(format))
-                                Text(mediaFormatDetails(format))
+                                Text("Original")
+                                Text("Let yt-dlp choose the best available streams")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
-                            .tag(MediaDownloadFormatPreference.specific(format.id))
+                            .tag(MediaDownloadFormatPreference.original)
+
+                            ForEach(mediaPreview.capabilities.formatOptions) { format in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(mediaFormatTitle(format))
+                                    Text(mediaFormatDetails(format))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .tag(MediaDownloadFormatPreference.specific(format.id))
+                            }
                         }
+                        .pickerStyle(.radioGroup)
+                        .labelsHidden()
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .pickerStyle(.radioGroup)
-                    .labelsHidden()
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(
+                        minHeight: min(
+                            CGFloat(mediaPreview.capabilities.formatOptions.count + 1) * 40,
+                            220
+                        ),
+                        maxHeight: 220
+                    )
                 }
-                .frame(
-                    minHeight: min(
-                        CGFloat(mediaPreview.capabilities.formatOptions.count + 1) * 40,
-                        220
-                    ),
-                    maxHeight: 220
-                )
             }
 
             Toggle("I own this content or have permission to save it", isOn: $hasMediaSavePermission)
@@ -304,7 +306,7 @@ struct AddDownloadSheet: View {
             }
 
             if let mediaPreview {
-                return mediaPreview.capabilities.supportsVideoDownload
+                return mediaPreview.supportsMediaDownload
                     && hasMediaSavePermission
             }
 
@@ -389,7 +391,7 @@ struct AddDownloadSheet: View {
 
             if detectedKind == .directURL,
                let metadata = resolvedMediaPreview,
-               metadata.capabilities.supportsVideoDownload {
+               metadata.supportsMediaDownload {
                 guard hasMediaSavePermission else {
                     validationMessage = String(
                         localized: "add.validation.mediaPermission",
@@ -406,8 +408,8 @@ struct AddDownloadSheet: View {
                 if isKnownMediaHost(parsedURL) {
                     validationMessage = mediaPreviewError ?? String(
                         localized: "add.validation.mediaUnavailable",
-                        defaultValue: "yt-dlp couldn’t verify a downloadable video format for this link.",
-                        comment: "Validation message shown when a known media site does not provide a verified downloadable video format."
+                        defaultValue: "yt-dlp couldn’t verify downloadable media for this link.",
+                        comment: "Validation message shown when a known media site does not provide verified downloadable media."
                     )
                     focusedField = .sourceURL
                     return
@@ -503,28 +505,44 @@ struct AddDownloadSheet: View {
     }
 
     private func mediaFormatTitle(_ format: MediaDownloadFormatOption) -> String {
-        let resolution: String
+        let mediaKind: String
         if let height = format.height {
-            resolution = "\(height)p"
+            mediaKind = "\(height)p"
         } else if let width = format.width {
-            resolution = "\(width) px"
-        } else {
-            resolution = String(
+            mediaKind = "\(width) px"
+        } else if format.videoCodec != nil {
+            mediaKind = String(
                 localized: "media.format.video",
                 defaultValue: "Video",
-                comment: "Fallback resolution label for a media format whose dimensions are unknown."
+                comment: "Fallback label for a video format whose dimensions are unknown."
+            )
+        } else if format.audioCodec != nil {
+            mediaKind = String(
+                localized: "media.format.audio",
+                defaultValue: "Audio",
+                comment: "Label for an audio-only media format."
+            )
+        } else {
+            mediaKind = String(
+                localized: "media.format.media",
+                defaultValue: "Media",
+                comment: "Fallback label for a media format whose type is unknown."
             )
         }
 
-        return "\(resolution) \(format.container.uppercased())"
+        return "\(mediaKind) \(format.container.uppercased())"
     }
 
     private func mediaFormatDetails(_ format: MediaDownloadFormatOption) -> String {
-        var details = [mediaCodecTitle(format.videoCodec)]
+        var details: [String] = []
+
+        if let videoCodec = format.videoCodec {
+            details.append(mediaCodecTitle(videoCodec))
+        }
 
         if let audioCodec = format.audioCodec {
             details.append(mediaCodecTitle(audioCodec))
-        } else {
+        } else if format.videoCodec != nil {
             details.append(
                 String(
                     localized: "media.format.noAudio",
@@ -688,8 +706,8 @@ struct AddDownloadSheet: View {
                 if showErrors, mediaPreviewGeneration == generation {
                     mediaPreviewError = String(
                         localized: "add.validation.mediaUnavailable",
-                        defaultValue: "yt-dlp couldn’t verify a downloadable video format for this link.",
-                        comment: "Validation message shown when a known media site does not provide a verified downloadable video format."
+                        defaultValue: "yt-dlp couldn’t verify downloadable media for this link.",
+                        comment: "Validation message shown when a known media site does not provide verified downloadable media."
                     )
                 }
                 return nil
@@ -720,7 +738,7 @@ struct AddDownloadSheet: View {
     }
 
     private func isUsableMediaMetadata(_ metadata: MediaDownloadMetadata) -> Bool {
-        metadata.capabilities.supportsVideoDownload
+        metadata.supportsMediaDownload
     }
 
     private func isKnownMediaHost(_ url: URL) -> Bool {

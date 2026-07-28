@@ -98,7 +98,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertNil(options["seed-time"])
     }
 
-    func testMediaDownloadArgumentsCombineFormatSelectionAndLimitRate() throws {
+    func testMediaDownloadArgumentsKeepAutomaticAndExactFormatPathsSeparate() throws {
         let runtime = MediaRuntimeResolution(
             ytDlpURL: URL(fileURLWithPath: "/tmp/yt-dlp"),
             ffmpegURL: URL(fileURLWithPath: "/tmp/ffmpeg"),
@@ -130,14 +130,11 @@ final class HarborModelAndSafetyTests: XCTestCase {
         let limitIndex = try XCTUnwrap(limitedArguments.firstIndex(of: "--limit-rate"))
         XCTAssertEqual(limitedArguments[limitedArguments.index(after: limitIndex)], "345678")
         XCTAssertFalse(unlimitedArguments.contains("--limit-rate"))
-        let originalFormatIndex = try XCTUnwrap(limitedArguments.firstIndex(of: "--format"))
-        XCTAssertEqual(
-            limitedArguments[limitedArguments.index(after: originalFormatIndex)],
-            "bv*+ba/b"
-        )
+        XCTAssertFalse(limitedArguments.contains("--format"))
+        XCTAssertFalse(unlimitedArguments.contains("--format"))
 
         let format = MediaDownloadFormatOption(
-            videoFormatID: "137",
+            formatID: "137",
             audioFormatID: "140",
             container: "mp4",
             videoCodec: "avc1.640028",
