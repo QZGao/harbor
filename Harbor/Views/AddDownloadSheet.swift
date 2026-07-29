@@ -189,14 +189,14 @@ struct AddDownloadSheet: View {
             if mediaPreview.capabilities.supportsMediaFormatSelection {
                 LabeledContent("Format") {
                     ScrollView {
-                        Picker("", selection: $mediaFormatPreference) {
+                        Picker("", selection: primaryFormatSelection) {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Best available")
                                 Text("Let yt-dlp choose the best available streams")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
-                            .tag(MediaDownloadFormatPreference.bestAvailable)
+                            .tag(String?.none)
 
                             ForEach(mediaPreview.capabilities.formatOptions) { format in
                                 VStack(alignment: .leading, spacing: 2) {
@@ -205,11 +205,7 @@ struct AddDownloadSheet: View {
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
-                                .tag(
-                                    MediaDownloadFormatPreference.specific(
-                                        MediaDownloadFormatSelection(format: format)
-                                    )
-                                )
+                                .tag(Optional(format.id))
                             }
                         }
                         .pickerStyle(.radioGroup)
@@ -223,6 +219,42 @@ struct AddDownloadSheet: View {
                         ),
                         maxHeight: 220
                     )
+                }
+
+                if let selectedFormat {
+                    if selectedFormat.isVideoOnly {
+                        LabeledContent("Audio") {
+                            if mediaPreview.capabilities.audioFormatOptions.isEmpty {
+                                Text("No audio available")
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Picker("", selection: audioFormatSelection) {
+                                    Text("No audio")
+                                        .tag(String?.none)
+
+                                    ForEach(mediaPreview.capabilities.audioFormatOptions) { audioFormat in
+                                        Text(mediaAudioFormatTitle(audioFormat))
+                                            .tag(Optional(audioFormat.id))
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .labelsHidden()
+                                .frame(maxWidth: 360, alignment: .trailing)
+                            }
+                        }
+                    } else if selectedFormat.hasVideo, selectedFormat.hasAudio {
+                        LabeledContent("Audio") {
+                            Text("Included in selected format")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if let mergeOutputFormat = selectedFormatSelection?.mergeOutputFormat {
+                        LabeledContent("Output") {
+                            Text(mergeOutputFormat.uppercased())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
             }
 
@@ -253,6 +285,66 @@ struct AddDownloadSheet: View {
                 }
             }
         }
+    }
+
+    private var selectedFormatSelection: MediaDownloadFormatSelection? {
+        guard case let .specific(selection) = mediaFormatPreference else {
+            return nil
+        }
+
+        return selection
+    }
+
+    private var selectedFormat: MediaDownloadFormatOption? {
+        guard let mediaPreview,
+              let formatID = selectedFormatSelection?.formatID else {
+            return nil
+        }
+
+        return mediaPreview.capabilities.formatOption(id: formatID)
+    }
+
+    private var primaryFormatSelection: Binding<String?> {
+        Binding(
+            get: {
+                selectedFormatSelection?.formatID
+            },
+            set: { formatID in
+                guard let formatID else {
+                    mediaFormatPreference = .bestAvailable
+                    return
+                }
+
+                guard let mediaPreview,
+                      let format = mediaPreview.capabilities.formatOption(id: formatID) else {
+                    return
+                }
+
+                mediaFormatPreference = .specific(
+                    mediaPreview.capabilities.defaultSelection(for: format)
+                )
+            }
+        )
+    }
+
+    private var audioFormatSelection: Binding<String?> {
+        Binding(
+            get: {
+                selectedFormatSelection?.audioFormatID
+            },
+            set: { audioFormatID in
+                guard let mediaPreview,
+                      let selectedFormat,
+                      let selection = mediaPreview.capabilities.selection(
+                          for: selectedFormat,
+                          audioFormatID: audioFormatID
+                      ) else {
+                    return
+                }
+
+                mediaFormatPreference = .specific(selection)
+            }
+        )
     }
 
     private var destinationPicker: some View {
@@ -561,6 +653,20 @@ struct AddDownloadSheet: View {
     private func mediaFormatDetails(_ format: MediaDownloadFormatOption) -> String {
         var details: [String] = []
 
+        if format.hasAudio,
+           let language = format.language?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           language.isEmpty == false {
+            details.append(language.uppercased())
+        }
+
+        if format.hasAudio,
+           let formatNote = format.formatNote?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           formatNote.isEmpty == false {
+            details.append(formatNote)
+        }
+
         if let videoCodec = format.videoCodec {
             details.append(mediaCodecTitle(videoCodec))
         }
@@ -570,11 +676,22 @@ struct AddDownloadSheet: View {
         } else if format.videoCodec != nil {
             details.append(
                 String(
-                    localized: "media.format.noAudio",
-                    defaultValue: "No audio",
-                    comment: "Media format detail shown when the selected video stream has no audio."
+                    localized: "media.format.separateAudio",
+                    defaultValue: "Separate audio",
+                    comment: "Media format detail shown when a video stream requires a separate audio selection."
                 )
             )
+        }
+
+        if let audioChannels = format.audioChannels, audioChannels > 0 {
+            switch audioChannels {
+            case 1:
+                details.append("Mono")
+            case 2:
+                details.append("Stereo")
+            default:
+                details.append("\(audioChannels) channels")
+            }
         }
 
         if let framesPerSecond = format.framesPerSecond, framesPerSecond > 0 {
@@ -599,6 +716,49 @@ struct AddDownloadSheet: View {
         }
 
         return details.joined(separator: " • ")
+    }
+
+    private func mediaAudioFormatTitle(_ format: MediaDownloadFormatOption) -> String {
+        var components: [String] = []
+
+        if let language = format.language?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           language.isEmpty == false {
+            components.append(language.uppercased())
+        }
+
+        if let formatNote = format.formatNote?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           formatNote.isEmpty == false {
+            components.append(formatNote)
+        }
+
+        components.append(format.container.uppercased())
+
+        if let audioCodec = format.audioCodec {
+            components.append(mediaCodecTitle(audioCodec))
+        }
+
+        if let bitrateKbps = format.bitrateKbps,
+           bitrateKbps.isFinite,
+           bitrateKbps > 0 {
+            components.append(
+                "\(bitrateKbps.formatted(.number.precision(.fractionLength(0)))) kbps"
+            )
+        }
+
+        if let audioChannels = format.audioChannels, audioChannels > 0 {
+            switch audioChannels {
+            case 1:
+                components.append("Mono")
+            case 2:
+                components.append("Stereo")
+            default:
+                components.append("\(audioChannels) channels")
+            }
+        }
+
+        return components.joined(separator: " • ")
     }
 
     private func mediaCodecTitle(_ codec: String) -> String {

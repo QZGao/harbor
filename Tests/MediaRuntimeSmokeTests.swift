@@ -46,7 +46,24 @@ struct MediaRuntimeSmokeTests {
               "acodec": "mp4a.40.2",
               "has_drm": false,
               "abr": 128,
-              "filesize": 100000
+              "filesize": 100000,
+              "language": "en",
+              "format_note": "English (Original)",
+              "audio_channels": 2,
+              "language_preference": 10
+            },
+            {
+              "format_id": "140-fr",
+              "ext": "m4a",
+              "vcodec": "none",
+              "acodec": "mp4a.40.2",
+              "has_drm": false,
+              "abr": 192,
+              "filesize": 150000,
+              "language": "fr",
+              "format_note": "French Dub",
+              "audio_channels": 2,
+              "language_preference": 0
             },
             {
               "format_id": "248",
@@ -67,7 +84,11 @@ struct MediaRuntimeSmokeTests {
               "acodec": "opus",
               "has_drm": false,
               "abr": 160,
-              "filesize": 120000
+              "filesize": 120000,
+              "language": "en",
+              "format_note": "English (Original)",
+              "audio_channels": 2,
+              "language_preference": 20
             },
             {
               "format_id": "18",
@@ -95,34 +116,63 @@ struct MediaRuntimeSmokeTests {
         try assert(metadata.mediaType == .video, "Checked video formats should classify the source as video")
         try assert(metadata.capabilities.supportsMediaFormatSelection, "Checked media formats should enable the format picker")
         try assert(metadata.supportsMediaDownload, "Checked video formats should enable yt-dlp")
-        try assert(metadata.capabilities.formatOptions.count == 5, "Each meaningful checked media output should be listed")
+        try assert(metadata.capabilities.formatOptions.count == 6, "Each checked media stream should be listed independently")
         try assert(metadata.defaultFormatPreference == .bestAvailable, "Best available should be the default format")
 
-        let mp4Pair = metadata.capabilities.formatOptions.first { $0.id == "137+140" }
-        try assert(mp4Pair?.container == "mp4", "MP4 video and M4A audio should produce MP4")
-        try assert(mp4Pair?.mergeOutputFormat == "mp4", "Paired MP4 streams should request an MP4 merge")
-        try assert(mp4Pair?.estimatedBytes == 4_100_000, "Paired stream sizes should be combined")
+        guard let mp4Video = metadata.capabilities.formatOption(id: "137"),
+              let webMVideo = metadata.capabilities.formatOption(id: "248") else {
+            throw TestFailure("Checked video streams should remain available by their own IDs")
+        }
+        let defaultMP4Selection = metadata.capabilities.defaultSelection(for: mp4Video)
+        try assert(
+            defaultMP4Selection.selector == "137+251",
+            "The visible default should prefer yt-dlp's language/default ranking over container compatibility"
+        )
+        try assert(defaultMP4Selection.mergeOutputFormat == "mkv", "Incompatible preferred streams should merge as MKV")
+        try assert(defaultMP4Selection.estimatedBytes == 4_120_000, "Selected stream sizes should be combined")
 
-        let webMPair = metadata.capabilities.formatOptions.first { $0.id == "248+251" }
-        try assert(webMPair?.container == "webm", "WebM video and audio should produce WebM")
-        try assert(webMPair?.mergeOutputFormat == "webm", "Paired WebM streams should request a WebM merge")
+        let frenchSelection = metadata.capabilities.selection(
+            for: mp4Video,
+            audioFormatID: "140-fr"
+        )
+        try assert(
+            frenchSelection?.selector == "137+140-fr",
+            "Users should be able to explicitly select a different audio language"
+        )
+        try assert(
+            frenchSelection?.mergeOutputFormat == "mp4",
+            "An explicitly selected compatible M4A track should merge as MP4"
+        )
+        try assert(
+            metadata.capabilities.selection(
+                for: mp4Video,
+                audioFormatID: nil
+            )?.selector == "137",
+            "Users should be able to explicitly download a video-only stream without audio"
+        )
+
+        let webMSelection = metadata.capabilities.defaultSelection(for: webMVideo)
+        try assert(webMSelection.selector == "248+251", "WebM video should visibly default to compatible WebM audio")
+        try assert(webMSelection.mergeOutputFormat == "webm", "WebM streams should merge as WebM")
 
         let combined = metadata.capabilities.formatOptions.first { $0.id == "18" }
-        try assert(combined?.audioFormatID == nil, "A combined format should use one exact format ID")
-        try assert(combined?.mergeOutputFormat == nil, "A combined format should not request a merge")
+        let combinedSelection = combined.map {
+            MediaDownloadFormatSelection(format: $0)
+        }
+        try assert(combinedSelection?.audioFormatID == nil, "A combined format should use one exact format ID")
+        try assert(combinedSelection?.mergeOutputFormat == nil, "A combined format should not request a merge")
 
-        let audioSelectors = Set(
-            metadata.capabilities.formatOptions
-                .filter { $0.videoCodec == nil }
-                .map(\.selector)
+        let audioFormatIDs = Set(metadata.capabilities.audioFormatOptions.map(\.formatID))
+        try assert(
+            audioFormatIDs == ["140", "140-fr", "251"],
+            "Every checked audio language should remain independently selectable"
         )
-        try assert(audioSelectors == ["140", "251"], "Checked audio-only formats should be selectable")
 
         let roundTrip = try JSONDecoder().decode(
             MediaDownloadMetadata.self,
             from: JSONEncoder().encode(metadata)
         )
-        try assert(roundTrip == metadata, "Media format options should persist with metadata")
+        try assert(roundTrip == metadata, "An in-memory media catalog should survive Codable round-trip")
     }
 
     private static func testMetadataParserKeepsMeaningfulVariants() throws {
@@ -177,11 +227,19 @@ struct MediaRuntimeSmokeTests {
         let selectors = Set(
             metadata.capabilities.formatOptions
                 .filter { $0.videoCodec != nil }
-                .map(\.selector)
+                .map(\.formatID)
         )
         try assert(
-            selectors == ["133+140", "134+140"],
+            selectors == ["133", "134"],
             "Formats with meaningfully different bitrates and sizes should both remain available"
+        )
+
+        guard let firstVideo = metadata.capabilities.formatOption(id: "133") else {
+            throw TestFailure("The first video stream should be available")
+        }
+        try assert(
+            metadata.capabilities.defaultSelection(for: firstVideo).selector == "133+140",
+            "A video-only stream should offer its compatible audio stream as the visible default"
         )
     }
 
@@ -205,7 +263,7 @@ struct MediaRuntimeSmokeTests {
         )
 
         try assert(metadata.capabilities.supportsMediaFormatSelection, "Combined MP4 should enable the format picker")
-        try assert(metadata.capabilities.formatOptions.map(\.selector) == ["18"], "Combined MP4 should be selectable directly")
+        try assert(metadata.capabilities.formatOptions.map(\.formatID) == ["18"], "Combined MP4 should be selectable directly")
     }
 
     private static func testMetadataParserVideoWithoutAudio() throws {
@@ -234,9 +292,12 @@ struct MediaRuntimeSmokeTests {
         )
 
         let option = metadata.capabilities.formatOptions.first
-        try assert(option?.selector == "silent-video", "A checked silent video should remain selectable")
+        try assert(option?.formatID == "silent-video", "A checked silent video should remain selectable")
         try assert(option?.audioCodec == nil, "A silent video option should not invent an audio stream")
-        try assert(option?.mergeOutputFormat == nil, "A silent video should not request a merge")
+        try assert(
+            option.map { MediaDownloadFormatSelection(format: $0) }?.mergeOutputFormat == nil,
+            "A silent video should not request a merge"
+        )
     }
 
     private static func testMetadataParserRejectsExtensionOnlyFile() throws {
@@ -307,7 +368,7 @@ struct MediaRuntimeSmokeTests {
         )
 
         try assert(
-            metadata.capabilities.formatOptions.map(\.selector) == ["audio-only"],
+            metadata.capabilities.formatOptions.map(\.formatID) == ["audio-only"],
             "The checked audio format should remain while unverified video formats are excluded"
         )
         try assert(metadata.capabilities.supportsMediaFormatSelection, "Checked audio should enable the media format picker")
@@ -346,28 +407,52 @@ struct MediaRuntimeSmokeTests {
     }
 
     private static func testFormatPreferenceCoding() throws {
-        let format = MediaDownloadFormatOption(
+        let videoFormat = MediaDownloadFormatOption(
             formatID: "137",
-            audioFormatID: "140",
             container: "mp4",
             videoCodec: "avc1.640028",
-            audioCodec: "mp4a.40.2",
+            audioCodec: nil,
             width: 1920,
             height: 1080,
             framesPerSecond: 30,
             dynamicRange: "SDR",
             bitrateKbps: 4500,
-            estimatedBytes: 4_100_000,
-            mergeOutputFormat: "mp4"
+            estimatedBytes: 4_000_000
+        )
+        let audioFormat = MediaDownloadFormatOption(
+            formatID: "140",
+            container: "m4a",
+            videoCodec: nil,
+            audioCodec: "mp4a.40.2",
+            width: nil,
+            height: nil,
+            framesPerSecond: nil,
+            dynamicRange: nil,
+            bitrateKbps: 128,
+            estimatedBytes: 100_000,
+            language: "en",
+            formatNote: "English (Original)"
         )
         let preference = MediaDownloadFormatPreference.specific(
-            MediaDownloadFormatSelection(format: format)
+            MediaDownloadFormatSelection(
+                format: videoFormat,
+                audioFormat: audioFormat
+            )
         )
         let decoded = try JSONDecoder().decode(
             MediaDownloadFormatPreference.self,
             from: JSONEncoder().encode(preference)
         )
         try assert(decoded == preference, "An exact format selection should survive persistence")
+        guard case let .specific(decodedSelection) = decoded else {
+            throw TestFailure("The exact selection should remain specific after persistence")
+        }
+        try assert(
+            decodedSelection.formatID == "137"
+                && decodedSelection.audioFormatID == "140"
+                && decodedSelection.selector == "137+140",
+            "The selected video and audio IDs should survive persistence separately"
+        )
 
         let bestAvailable = MediaDownloadFormatPreference.bestAvailable
         let encodedBestAvailable = try JSONEncoder().encode(bestAvailable)
@@ -399,6 +484,41 @@ struct MediaRuntimeSmokeTests {
         try assert(
             legacySelection.selector == "137+140" && legacySelection.requiresFormatProbe,
             "Legacy exact format preferences should request one fresh format probe"
+        )
+
+        let compactSelection = try JSONDecoder().decode(
+            MediaDownloadFormatPreference.self,
+            from: Data(
+                #"""
+                {
+                  "kind": "specific",
+                  "selection": {
+                    "selector": "137+140",
+                    "mergeOutputFormat": "mp4",
+                    "displaySummary": "1080p • MP4 • AVC1",
+                    "estimatedBytes": 4100000
+                  }
+                }
+                """#.utf8
+            )
+        )
+        guard case let .specific(upgradeSelection) = compactSelection else {
+            throw TestFailure("A compact exact format preference should remain exact")
+        }
+        try assert(
+            upgradeSelection.requiresFormatProbe,
+            "Selections saved before separate stream IDs should request one fresh format probe"
+        )
+        let capabilities = MediaDownloadCapabilities(
+            formatOptions: [videoFormat, audioFormat]
+        )
+        let upgradedSelection = capabilities.resolvedSelection(
+            matching: upgradeSelection
+        )
+        try assert(
+            upgradedSelection?.formatID == "137"
+                && upgradedSelection?.audioFormatID == "140",
+            "A compact selector should upgrade to separate video and audio IDs after probing"
         )
     }
 

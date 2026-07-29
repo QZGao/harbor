@@ -133,19 +133,33 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertFalse(limitedArguments.contains("--format"))
         XCTAssertFalse(unlimitedArguments.contains("--format"))
 
-        let format = MediaDownloadFormatOption(
+        let videoFormat = MediaDownloadFormatOption(
             formatID: "137",
-            audioFormatID: "140",
             container: "mp4",
             videoCodec: "avc1.640028",
-            audioCodec: "mp4a.40.2",
+            audioCodec: nil,
             width: 1_920,
             height: 1_080,
             framesPerSecond: 30,
             dynamicRange: "SDR",
             bitrateKbps: 4_500,
-            estimatedBytes: 10_000_000,
-            mergeOutputFormat: "mp4"
+            estimatedBytes: 9_000_000
+        )
+        let audioFormat = MediaDownloadFormatOption(
+            formatID: "140",
+            container: "m4a",
+            videoCodec: nil,
+            audioCodec: "mp4a.40.2",
+            width: nil,
+            height: nil,
+            framesPerSecond: nil,
+            dynamicRange: nil,
+            bitrateKbps: 128,
+            estimatedBytes: 1_000_000,
+            language: "en",
+            formatNote: "English (Original)",
+            audioChannels: 2,
+            languagePreference: 10
         )
         let metadata = MediaDownloadMetadata(
             title: "Video",
@@ -153,12 +167,17 @@ final class HarborModelAndSafetyTests: XCTestCase {
             extractorKey: "Test",
             thumbnailURL: nil,
             webpageURL: sourceURL,
-            expectedBytes: format.estimatedBytes,
+            expectedBytes: 10_000_000,
             mediaType: .video,
             entryCount: 1,
-            capabilities: MediaDownloadCapabilities(formatOptions: [format])
+            capabilities: MediaDownloadCapabilities(
+                formatOptions: [videoFormat, audioFormat]
+            )
         )
-        let selection = MediaDownloadFormatSelection(format: format)
+        let selection = MediaDownloadFormatSelection(
+            format: videoFormat,
+            audioFormat: audioFormat
+        )
         let selectedArguments = try MediaDownloadService.downloadArguments(
             runtime: runtime,
             sourceURL: sourceURL,
@@ -179,24 +198,41 @@ final class HarborModelAndSafetyTests: XCTestCase {
             "345678"
         )
 
-        XCTAssertEqual(selection.displaySummary, "1080p • MP4 • AVC1")
+        XCTAssertEqual(
+            selection.displaySummary,
+            "1080p • MP4 • AVC1 + English (Original)"
+        )
     }
 
     func testMediaRecordPersistsSelectionWithoutFormatCatalog() throws {
         let sourceURL = try XCTUnwrap(URL(string: "https://example.com/video"))
-        let format = MediaDownloadFormatOption(
+        let videoFormat = MediaDownloadFormatOption(
             formatID: "137",
-            audioFormatID: "140",
             container: "mp4",
             videoCodec: "avc1.640028",
-            audioCodec: "mp4a.40.2",
+            audioCodec: nil,
             width: 1_920,
             height: 1_080,
             framesPerSecond: 30,
             dynamicRange: "SDR",
             bitrateKbps: 4_500,
-            estimatedBytes: 10_000_000,
-            mergeOutputFormat: "mp4"
+            estimatedBytes: 9_000_000
+        )
+        let audioFormat = MediaDownloadFormatOption(
+            formatID: "140",
+            container: "m4a",
+            videoCodec: nil,
+            audioCodec: "mp4a.40.2",
+            width: nil,
+            height: nil,
+            framesPerSecond: nil,
+            dynamicRange: nil,
+            bitrateKbps: 128,
+            estimatedBytes: 1_000_000,
+            language: "en",
+            formatNote: "English (Original)",
+            audioChannels: 2,
+            languagePreference: 10
         )
         let metadata = MediaDownloadMetadata(
             title: "Video",
@@ -204,12 +240,17 @@ final class HarborModelAndSafetyTests: XCTestCase {
             extractorKey: "Test",
             thumbnailURL: nil,
             webpageURL: sourceURL,
-            expectedBytes: format.estimatedBytes,
+            expectedBytes: 10_000_000,
             mediaType: .video,
             entryCount: 1,
-            capabilities: MediaDownloadCapabilities(formatOptions: [format])
+            capabilities: MediaDownloadCapabilities(
+                formatOptions: [videoFormat, audioFormat]
+            )
         )
-        let selection = MediaDownloadFormatSelection(format: format)
+        let selection = MediaDownloadFormatSelection(
+            format: videoFormat,
+            audioFormat: audioFormat
+        )
         let item = DownloadItem(
             sourceURL: sourceURL,
             sourceKind: .mediaURL,
@@ -225,7 +266,10 @@ final class HarborModelAndSafetyTests: XCTestCase {
 
         XCTAssertEqual(record.mediaMetadata?.capabilities, .unavailable)
         XCTAssertEqual(record.mediaFormatPreference, .specific(selection))
-        XCTAssertEqual(item.mediaMetadata?.capabilities.formatOptions, [format])
+        XCTAssertEqual(
+            item.mediaMetadata?.capabilities.formatOptions,
+            [videoFormat, audioFormat]
+        )
 
         let encodedRecord = try JSONEncoder().encode(record)
         XCTAssertFalse(String(decoding: encodedRecord, as: UTF8.self).contains("formatOptions"))

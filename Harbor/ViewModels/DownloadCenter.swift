@@ -487,15 +487,13 @@ final class DownloadCenter {
         case .bestAvailable:
             item.mediaFormatPreference = .bestAvailable
         case let .specific(selection):
-            guard let format = item.mediaMetadata?.capabilities.formatOptions.first(where: {
-                $0.id == selection.selector
-            }) else {
+            guard let resolvedSelection = item.mediaMetadata?.capabilities.resolvedSelection(
+                matching: selection
+            ) else {
                 return
             }
 
-            item.mediaFormatPreference = .specific(
-                MediaDownloadFormatSelection(format: format)
-            )
+            item.mediaFormatPreference = .specific(resolvedSelection)
         }
 
         item.updatedAt = .now
@@ -680,6 +678,12 @@ final class DownloadCenter {
 
         refreshedItem.mediaMetadata = metadata
         refreshedItem.metadataName = metadata.title
+        if case let .specific(selection)? = refreshedItem.mediaFormatPreference,
+           let resolvedSelection = metadata.capabilities.resolvedSelection(
+               matching: selection
+           ) {
+            refreshedItem.mediaFormatPreference = .specific(resolvedSelection)
+        }
         refreshedItem.updatedAt = .now
         schedulePersist()
     }
@@ -1632,11 +1636,14 @@ final class DownloadCenter {
 
         do {
             var validatedMetadata: MediaDownloadMetadata
+            let metadataWasProbed: Bool
             if let metadata = currentItem.mediaMetadata,
                metadata.supportsMediaDownload {
                 validatedMetadata = metadata
+                metadataWasProbed = false
             } else {
                 validatedMetadata = try await mediaService.metadata(for: currentItem.sourceURL)
+                metadataWasProbed = true
 
                 guard let refreshedItem = item(for: id),
                       refreshedItem.status == .preparing else {
@@ -1653,11 +1660,7 @@ final class DownloadCenter {
 
             if case let .specific(selection) = requestedFormat,
                selection.requiresFormatProbe {
-                var matchingFormat = validatedMetadata.capabilities.formatOptions.first {
-                    $0.id == selection.selector
-                }
-
-                if matchingFormat == nil {
+                if metadataWasProbed == false {
                     validatedMetadata = try await mediaService.metadata(for: currentItem.sourceURL)
 
                     guard let refreshedItem = item(for: id),
@@ -1667,21 +1670,18 @@ final class DownloadCenter {
 
                     refreshedItem.mediaMetadata = validatedMetadata
                     refreshedItem.metadataName = validatedMetadata.title
-                    matchingFormat = validatedMetadata.capabilities.formatOptions.first {
-                        $0.id == selection.selector
-                    }
                     schedulePersist()
                 }
 
-                guard let matchingFormat else {
+                guard let resolvedSelection = validatedMetadata.capabilities.resolvedSelection(
+                    matching: selection
+                ) else {
                     throw MediaDownloadError.unsupported(
                         MediaDownloadErrorClassifier.selectedFormatUnavailableMessage
                     )
                 }
 
-                requestedFormat = .specific(
-                    MediaDownloadFormatSelection(format: matchingFormat)
-                )
+                requestedFormat = .specific(resolvedSelection)
 
                 guard let refreshedItem = item(for: id),
                       refreshedItem.status == .preparing else {

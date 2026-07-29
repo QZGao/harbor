@@ -74,7 +74,6 @@ enum MediaDownloadFormatPreference: Codable, Equatable, Hashable, Sendable {
 
 struct MediaDownloadFormatOption: Codable, Equatable, Identifiable, Sendable {
     let formatID: String
-    let audioFormatID: String? // merge with video if formatID is video-only
     let container: String
     let videoCodec: String?
     let audioCodec: String?
@@ -84,12 +83,15 @@ struct MediaDownloadFormatOption: Codable, Equatable, Identifiable, Sendable {
     let dynamicRange: String?
     let bitrateKbps: Double?
     let estimatedBytes: Int64
-    let mergeOutputFormat: String?
+    let language: String?
+    let formatNote: String?
+    let audioChannels: Int?
+    let languagePreference: Int?
+    let selectionPreference: Double?
 
     // Retain the existing keys so records written before catalogs became transient still decode.
     private enum CodingKeys: String, CodingKey {
         case formatID = "videoFormatID"
-        case audioFormatID
         case container
         case videoCodec
         case audioCodec
@@ -99,48 +101,120 @@ struct MediaDownloadFormatOption: Codable, Equatable, Identifiable, Sendable {
         case dynamicRange
         case bitrateKbps
         case estimatedBytes
-        case mergeOutputFormat
+        case language
+        case formatNote
+        case audioChannels
+        case languagePreference
+        case selectionPreference
+    }
+
+    nonisolated init(
+        formatID: String,
+        container: String,
+        videoCodec: String?,
+        audioCodec: String?,
+        width: Int?,
+        height: Int?,
+        framesPerSecond: Double?,
+        dynamicRange: String?,
+        bitrateKbps: Double?,
+        estimatedBytes: Int64,
+        language: String? = nil,
+        formatNote: String? = nil,
+        audioChannels: Int? = nil,
+        languagePreference: Int? = nil,
+        selectionPreference: Double? = nil
+    ) {
+        self.formatID = formatID
+        self.container = container
+        self.videoCodec = videoCodec
+        self.audioCodec = audioCodec
+        self.width = width
+        self.height = height
+        self.framesPerSecond = framesPerSecond
+        self.dynamicRange = dynamicRange
+        self.bitrateKbps = bitrateKbps
+        self.estimatedBytes = estimatedBytes
+        self.language = language
+        self.formatNote = formatNote
+        self.audioChannels = audioChannels
+        self.languagePreference = languagePreference
+        self.selectionPreference = selectionPreference
     }
 
     nonisolated var id: String {
-        selector
+        formatID
     }
 
-    nonisolated var selector: String {
-        guard let audioFormatID else {
-            return formatID
-        }
+    nonisolated var hasVideo: Bool {
+        videoCodec != nil
+    }
 
-        return "\(formatID)+\(audioFormatID)"
+    nonisolated var hasAudio: Bool {
+        audioCodec != nil
+    }
+
+    nonisolated var isVideoOnly: Bool {
+        hasVideo && hasAudio == false
+    }
+
+    nonisolated var isAudioOnly: Bool {
+        hasVideo == false && hasAudio
     }
 }
 
 struct MediaDownloadFormatSelection: Codable, Equatable, Hashable, Sendable {
     let selector: String
+    let formatID: String?
+    let audioFormatID: String?
     let mergeOutputFormat: String?
     let displaySummary: String?
     let estimatedBytes: Int64
 
-    nonisolated init(format: MediaDownloadFormatOption) {
-        selector = format.selector
-        mergeOutputFormat = format.mergeOutputFormat
-        displaySummary = Self.displaySummary(for: format)
-        estimatedBytes = format.estimatedBytes
+    nonisolated init(
+        format: MediaDownloadFormatOption,
+        audioFormat: MediaDownloadFormatOption? = nil
+    ) {
+        let selectedAudioFormat = format.isVideoOnly && audioFormat?.isAudioOnly == true
+            ? audioFormat
+            : nil
+
+        formatID = format.formatID
+        audioFormatID = selectedAudioFormat?.formatID
+        selector = selectedAudioFormat.map { "\(format.formatID)+\($0.formatID)" }
+            ?? format.formatID
+        mergeOutputFormat = selectedAudioFormat.map {
+            Self.outputContainer(
+                videoContainer: format.container,
+                audioContainer: $0.container
+            )
+        }
+        displaySummary = Self.displaySummary(
+            for: format,
+            audioFormat: selectedAudioFormat
+        )
+        estimatedBytes = Self.combinedSize(
+            format: format,
+            audioFormat: selectedAudioFormat
+        )
     }
 
     nonisolated init(legacySelector: String) {
         selector = legacySelector
+        formatID = nil
+        audioFormatID = nil
         mergeOutputFormat = nil
         displaySummary = nil
         estimatedBytes = 0
     }
 
     nonisolated var requiresFormatProbe: Bool {
-        displaySummary == nil
+        formatID == nil
     }
 
     private nonisolated static func displaySummary(
-        for format: MediaDownloadFormatOption
+        for format: MediaDownloadFormatOption,
+        audioFormat: MediaDownloadFormatOption?
     ) -> String {
         var components: [String] = []
 
@@ -158,12 +232,67 @@ struct MediaDownloadFormatSelection: Codable, Equatable, Hashable, Sendable {
 
         components.append(format.container.uppercased())
 
+        if format.hasAudio,
+           let language = format.language?.nilIfBlank {
+            components.append(language.uppercased())
+        }
+
+        if format.hasAudio,
+           let formatNote = format.formatNote?.nilIfBlank {
+            components.append(formatNote)
+        }
+
         if let codec = format.videoCodec ?? format.audioCodec,
            let codecFamily = codec.split(separator: ".").first {
             components.append(codecFamily.uppercased())
         }
 
-        return components.joined(separator: " • ")
+        let primarySummary = components.joined(separator: " • ")
+        guard let audioFormat else {
+            return primarySummary
+        }
+
+        let audioSummary = audioFormat.formatNote?.nilIfBlank
+            ?? audioFormat.language?.nilIfBlank?.uppercased()
+            ?? audioFormat.audioCodec?.split(separator: ".").first.map {
+                String($0).uppercased()
+            }
+            ?? audioFormat.container.uppercased()
+        return "\(primarySummary) + \(audioSummary)"
+    }
+
+    private nonisolated static func outputContainer(
+        videoContainer: String,
+        audioContainer: String
+    ) -> String {
+        if ["mp4", "m4v", "mov"].contains(videoContainer),
+           ["m4a", "mp4"].contains(audioContainer) {
+            return "mp4"
+        }
+
+        if videoContainer == "webm", audioContainer == "webm" {
+            return "webm"
+        }
+
+        return "mkv"
+    }
+
+    private nonisolated static func combinedSize(
+        format: MediaDownloadFormatOption,
+        audioFormat: MediaDownloadFormatOption?
+    ) -> Int64 {
+        guard let audioFormat else {
+            return format.estimatedBytes
+        }
+
+        guard format.estimatedBytes > 0, audioFormat.estimatedBytes > 0 else {
+            return 0
+        }
+
+        let (combinedBytes, overflowed) = format.estimatedBytes.addingReportingOverflow(
+            audioFormat.estimatedBytes
+        )
+        return overflowed ? 0 : combinedBytes
     }
 }
 
@@ -197,6 +326,127 @@ struct MediaDownloadCapabilities: Codable, Equatable, Sendable {
 
     nonisolated var supportsMediaFormatSelection: Bool {
         formatOptions.isEmpty == false
+    }
+
+    nonisolated var audioFormatOptions: [MediaDownloadFormatOption] {
+        formatOptions.filter(\.isAudioOnly)
+    }
+
+    nonisolated func formatOption(id: String) -> MediaDownloadFormatOption? {
+        formatOptions.first { $0.id == id }
+    }
+
+    nonisolated func defaultSelection(
+        for format: MediaDownloadFormatOption
+    ) -> MediaDownloadFormatSelection {
+        MediaDownloadFormatSelection(
+            format: format,
+            audioFormat: format.isVideoOnly ? preferredAudioFormat(for: format) : nil
+        )
+    }
+
+    nonisolated func selection(
+        for format: MediaDownloadFormatOption,
+        audioFormatID: String?
+    ) -> MediaDownloadFormatSelection? {
+        guard formatOptions.contains(where: { $0.id == format.id }) else {
+            return nil
+        }
+
+        guard format.isVideoOnly else {
+            return MediaDownloadFormatSelection(format: format)
+        }
+
+        guard let audioFormatID else {
+            return MediaDownloadFormatSelection(format: format)
+        }
+
+        guard let audioFormat = audioFormatOptions.first(where: {
+            $0.id == audioFormatID
+        }) else {
+            return nil
+        }
+
+        return MediaDownloadFormatSelection(
+            format: format,
+            audioFormat: audioFormat
+        )
+    }
+
+    nonisolated func resolvedSelection(
+        matching selection: MediaDownloadFormatSelection
+    ) -> MediaDownloadFormatSelection? {
+        if let formatID = selection.formatID,
+           let format = formatOption(id: formatID) {
+            return self.selection(
+                for: format,
+                audioFormatID: selection.audioFormatID
+            )
+        }
+
+        if let format = formatOption(id: selection.selector) {
+            return MediaDownloadFormatSelection(format: format)
+        }
+
+        for videoFormat in formatOptions where videoFormat.isVideoOnly {
+            for audioFormat in audioFormatOptions
+            where "\(videoFormat.id)+\(audioFormat.id)" == selection.selector {
+                return MediaDownloadFormatSelection(
+                    format: videoFormat,
+                    audioFormat: audioFormat
+                )
+            }
+        }
+
+        return nil
+    }
+
+    private nonisolated func preferredAudioFormat(
+        for videoFormat: MediaDownloadFormatOption
+    ) -> MediaDownloadFormatOption? {
+        let preferredExtensions: Set<String>
+        switch videoFormat.container {
+        case "mp4", "m4v", "mov":
+            preferredExtensions = ["m4a", "mp4"]
+        case "webm":
+            preferredExtensions = ["webm"]
+        default:
+            preferredExtensions = [videoFormat.container]
+        }
+
+        return audioFormatOptions.max { lhs, rhs in
+            let lhsLanguagePreference = lhs.languagePreference ?? Int.min
+            let rhsLanguagePreference = rhs.languagePreference ?? Int.min
+            if lhsLanguagePreference != rhsLanguagePreference {
+                return lhsLanguagePreference < rhsLanguagePreference
+            }
+
+            let lhsSelectionPreference = lhs.selectionPreference ?? -Double.infinity
+            let rhsSelectionPreference = rhs.selectionPreference ?? -Double.infinity
+            if lhsSelectionPreference != rhsSelectionPreference {
+                return lhsSelectionPreference < rhsSelectionPreference
+            }
+
+            let lhsIsContainerCompatible = preferredExtensions.contains(lhs.container)
+            let rhsIsContainerCompatible = preferredExtensions.contains(rhs.container)
+            if lhsIsContainerCompatible != rhsIsContainerCompatible {
+                return lhsIsContainerCompatible == false
+            }
+
+            if lhs.audioChannels != rhs.audioChannels {
+                return (lhs.audioChannels ?? 0) < (rhs.audioChannels ?? 0)
+            }
+
+            if lhs.bitrateKbps != rhs.bitrateKbps {
+                return (lhs.bitrateKbps ?? 0) < (rhs.bitrateKbps ?? 0)
+            }
+
+            if lhs.estimatedBytes != rhs.estimatedBytes {
+                return lhs.estimatedBytes < rhs.estimatedBytes
+            }
+
+            return lhs.id > rhs.id
+        }
     }
 }
 
@@ -386,9 +636,6 @@ enum MediaDownloadMetadataParser {
         for payload: YTDLPInfoPayload
     ) -> [MediaDownloadFormatOption] {
         let checkedFormats = payload.availableFormats.filter(\.isConfirmedDRMFree)
-        let audioFormats = checkedFormats.filter { format in
-            format.hasNoVideo && format.hasAudio && format.normalizedFormatID != nil
-        }
         let options = checkedFormats.compactMap { format -> MediaDownloadFormatOption? in
             guard let formatID = format.normalizedFormatID,
                   let container = format.normalizedExtension else {
@@ -400,50 +647,26 @@ enum MediaDownloadMetadataParser {
                     return nil
                 }
 
-                if format.hasAudio {
-                    return MediaDownloadFormatOption(
-                        formatID: formatID,
-                        audioFormatID: nil,
-                        container: container,
-                        videoCodec: videoCodec,
-                        audioCodec: format.normalizedAudioCodec,
-                        width: format.width,
-                        height: format.height,
-                        framesPerSecond: format.framesPerSecond,
-                        dynamicRange: format.normalizedDynamicRange,
-                        bitrateKbps: format.totalBitrateKbps,
-                        estimatedBytes: format.expectedBytes,
-                        mergeOutputFormat: nil
-                    )
-                }
-
-                guard format.hasNoAudio else {
+                guard format.hasAudio || format.hasNoAudio else {
                     return nil
                 }
 
-                let audioFormat = bestAudioFormat(
-                    forVideoContainer: container,
-                    from: audioFormats
-                )
-                let audioFormatID = audioFormat?.normalizedFormatID
-                let outputContainer = outputContainer(
-                    videoContainer: container,
-                    audioContainer: audioFormat?.normalizedExtension
-                )
-
                 return MediaDownloadFormatOption(
                     formatID: formatID,
-                    audioFormatID: audioFormatID,
-                    container: outputContainer,
+                    container: container,
                     videoCodec: videoCodec,
-                    audioCodec: audioFormat?.normalizedAudioCodec,
+                    audioCodec: format.normalizedAudioCodec,
                     width: format.width,
                     height: format.height,
                     framesPerSecond: format.framesPerSecond,
                     dynamicRange: format.normalizedDynamicRange,
-                    bitrateKbps: combinedBitrate(video: format, audio: audioFormat),
-                    estimatedBytes: combinedSize(video: format, audio: audioFormat),
-                    mergeOutputFormat: audioFormat == nil ? nil : outputContainer
+                    bitrateKbps: format.totalBitrateKbps,
+                    estimatedBytes: format.expectedBytes,
+                    language: format.normalizedLanguage,
+                    formatNote: format.normalizedFormatNote,
+                    audioChannels: format.audioChannels,
+                    languagePreference: format.languagePreference,
+                    selectionPreference: format.preference
                 )
             }
 
@@ -455,7 +678,6 @@ enum MediaDownloadMetadataParser {
 
             return MediaDownloadFormatOption(
                 formatID: formatID,
-                audioFormatID: nil,
                 container: container,
                 videoCodec: nil,
                 audioCodec: audioCodec,
@@ -465,7 +687,11 @@ enum MediaDownloadMetadataParser {
                 dynamicRange: nil,
                 bitrateKbps: format.totalBitrateKbps,
                 estimatedBytes: format.expectedBytes,
-                mergeOutputFormat: nil
+                language: format.normalizedLanguage,
+                formatNote: format.normalizedFormatNote,
+                audioChannels: format.audioChannels,
+                languagePreference: format.languagePreference,
+                selectionPreference: format.preference
             )
         }
 
@@ -475,93 +701,6 @@ enum MediaDownloadMetadataParser {
         }
 
         return uniqueOptions.values.sorted(by: formatOptionComesFirst)
-    }
-
-    private nonisolated static func bestAudioFormat(
-        forVideoContainer videoContainer: String,
-        from audioFormats: [YTDLPFormatPayload]
-    ) -> YTDLPFormatPayload? {
-        let preferredExtensions: Set<String>
-        switch videoContainer {
-        case "mp4", "m4v", "mov":
-            preferredExtensions = ["m4a", "mp4"]
-        case "webm":
-            preferredExtensions = ["webm"]
-        default:
-            preferredExtensions = [videoContainer]
-        }
-
-        let compatibleFormats = audioFormats.filter { format in
-            guard let audioContainer = format.normalizedExtension else {
-                return false
-            }
-
-            return preferredExtensions.contains(audioContainer)
-        }
-        let candidates = compatibleFormats.isEmpty ? audioFormats : compatibleFormats
-
-        return candidates.max { lhs, rhs in
-            if lhs.audioQualityKbps != rhs.audioQualityKbps {
-                return lhs.audioQualityKbps < rhs.audioQualityKbps
-            }
-
-            return lhs.expectedBytes < rhs.expectedBytes
-        }
-    }
-
-    private nonisolated static func outputContainer(
-        videoContainer: String,
-        audioContainer: String?
-    ) -> String {
-        guard let audioContainer else {
-            return videoContainer
-        }
-
-        if ["mp4", "m4v", "mov"].contains(videoContainer),
-           ["m4a", "mp4"].contains(audioContainer) {
-            return "mp4"
-        }
-
-        if videoContainer == "webm", audioContainer == "webm" {
-            return "webm"
-        }
-
-        return "mkv"
-    }
-
-    private nonisolated static func combinedBitrate(
-        video: YTDLPFormatPayload,
-        audio: YTDLPFormatPayload?
-    ) -> Double? {
-        guard let audio else {
-            return video.totalBitrateKbps
-        }
-
-        let videoBitrate = video.videoQualityKbps
-        let audioBitrate = audio.audioQualityKbps
-        guard videoBitrate > 0 || audioBitrate > 0 else {
-            return nil
-        }
-
-        return videoBitrate + audioBitrate
-    }
-
-    private nonisolated static func combinedSize(
-        video: YTDLPFormatPayload,
-        audio: YTDLPFormatPayload?
-    ) -> Int64 {
-        guard let audio else {
-            return video.expectedBytes
-        }
-
-        guard video.expectedBytes > 0, audio.expectedBytes > 0 else {
-            return 0
-        }
-
-        let (combinedBytes, overflowed) = video.expectedBytes.addingReportingOverflow(
-            audio.expectedBytes
-        )
-        return overflowed ? 0 : combinedBytes
     }
 
     private nonisolated static func formatOptionComesFirst(
@@ -580,6 +719,11 @@ enum MediaDownloadMetadataParser {
             return (lhs.framesPerSecond ?? -1) > (rhs.framesPerSecond ?? -1)
         }
 
+        if lhs.isAudioOnly, rhs.isAudioOnly,
+           lhs.languagePreference != rhs.languagePreference {
+            return (lhs.languagePreference ?? Int.min) > (rhs.languagePreference ?? Int.min)
+        }
+
         if lhs.container != rhs.container {
             return lhs.container < rhs.container
         }
@@ -588,7 +732,7 @@ enum MediaDownloadMetadataParser {
             return (lhs.bitrateKbps ?? -1) > (rhs.bitrateKbps ?? -1)
         }
 
-        return lhs.selector < rhs.selector
+        return lhs.formatID < rhs.formatID
     }
 
     private nonisolated struct FormatOptionIdentity: Hashable {
@@ -601,6 +745,11 @@ enum MediaDownloadMetadataParser {
         let dynamicRange: String?
         let bitrateTenths: Int?
         let estimatedBytes: Int64
+        let language: String?
+        let formatNote: String?
+        let audioChannels: Int?
+        let languagePreference: Int?
+        let selectionPreferenceHundredths: Int?
 
         nonisolated init(_ option: MediaDownloadFormatOption) {
             container = option.container
@@ -618,6 +767,18 @@ enum MediaDownloadMetadataParser {
                 bitrateTenths = nil
             }
             estimatedBytes = option.estimatedBytes
+            language = option.language?.lowercased()
+            formatNote = option.formatNote?.lowercased()
+            audioChannels = option.audioChannels
+            languagePreference = option.languagePreference
+            if let selectionPreference = option.selectionPreference,
+               selectionPreference.isFinite,
+               selectionPreference <= Double(Int.max) / 100,
+               selectionPreference >= Double(Int.min) / 100 {
+                selectionPreferenceHundredths = Int((selectionPreference * 100).rounded())
+            } else {
+                selectionPreferenceHundredths = nil
+            }
         }
     }
 
@@ -709,7 +870,12 @@ private nonisolated struct YTDLPInfoPayload: Decodable {
                 dynamicRange: nil,
                 totalBitrate: nil,
                 videoBitrate: nil,
-                audioBitrate: nil
+                audioBitrate: nil,
+                language: nil,
+                formatNote: nil,
+                audioChannels: nil,
+                languagePreference: nil,
+                preference: nil
             )
         ]
     }
@@ -756,6 +922,11 @@ private nonisolated struct YTDLPFormatPayload: Decodable {
     let totalBitrate: Double?
     let videoBitrate: Double?
     let audioBitrate: Double?
+    let language: String?
+    let formatNote: String?
+    let audioChannels: Int?
+    let languagePreference: Int?
+    let preference: Double?
 
     enum CodingKeys: String, CodingKey {
         case formatID = "format_id"
@@ -772,6 +943,11 @@ private nonisolated struct YTDLPFormatPayload: Decodable {
         case totalBitrate = "tbr"
         case videoBitrate = "vbr"
         case audioBitrate = "abr"
+        case language
+        case formatNote = "format_note"
+        case audioChannels = "audio_channels"
+        case languagePreference = "language_preference"
+        case preference
     }
 
     nonisolated var expectedBytes: Int64 {
@@ -796,6 +972,14 @@ private nonisolated struct YTDLPFormatPayload: Decodable {
 
     nonisolated var normalizedDynamicRange: String? {
         dynamicRange?.nilIfBlank
+    }
+
+    nonisolated var normalizedLanguage: String? {
+        language?.nilIfBlank
+    }
+
+    nonisolated var normalizedFormatNote: String? {
+        formatNote?.nilIfBlank
     }
 
     nonisolated var totalBitrateKbps: Double? {
