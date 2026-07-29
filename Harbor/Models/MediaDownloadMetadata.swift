@@ -70,6 +70,15 @@ enum MediaDownloadFormatPreference: Codable, Equatable, Hashable, Sendable {
             try container.encode(selection, forKey: .selection)
         }
     }
+
+    nonisolated func initialExpectedBytes(metadataEstimate: Int64) -> Int64 {
+        switch self {
+        case .bestAvailable:
+            metadataEstimate
+        case let .specific(selection):
+            selection.estimatedBytes
+        }
+    }
 }
 
 struct MediaDownloadFormatOption: Codable, Equatable, Identifiable, Sendable {

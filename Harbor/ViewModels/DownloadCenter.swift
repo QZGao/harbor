@@ -907,7 +907,10 @@ final class DownloadCenter {
             item.backendIdentifier = nil
             item.fileLocationPath = nil
             item.bytesWritten = 0
-            item.expectedBytes = item.mediaMetadata?.expectedBytes ?? 0
+            item.expectedBytes = (item.mediaFormatPreference ?? .bestAvailable)
+                .initialExpectedBytes(
+                    metadataEstimate: item.mediaMetadata?.expectedBytes ?? 0
+                )
             item.progress = 0
         }
 

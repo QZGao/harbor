@@ -202,6 +202,16 @@ final class HarborModelAndSafetyTests: XCTestCase {
             selection.displaySummary,
             "1080p • MP4 • AVC1 + English (Original)"
         )
+        XCTAssertEqual(
+            MediaDownloadFormatPreference.specific(selection)
+                .initialExpectedBytes(metadataEstimate: 243_768_398),
+            selection.estimatedBytes
+        )
+        XCTAssertEqual(
+            MediaDownloadFormatPreference.bestAvailable
+                .initialExpectedBytes(metadataEstimate: 243_768_398),
+            243_768_398
+        )
     }
 
     func testMediaRecordPersistsSelectionWithoutFormatCatalog() throws {

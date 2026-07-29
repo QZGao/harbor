@@ -141,13 +141,9 @@ actor MediaDownloadService {
             }
         )
 
-        let expectedBytes: Int64
-        switch formatPreference {
-        case .bestAvailable:
-            expectedBytes = metadata?.expectedBytes ?? 0
-        case let .specific(selection):
-            expectedBytes = selection.estimatedBytes
-        }
+        let expectedBytes = formatPreference.initialExpectedBytes(
+            metadataEstimate: metadata?.expectedBytes ?? 0
+        )
         runningDownloads[id] = RunningDownload(
             id: id,
             process: process,
