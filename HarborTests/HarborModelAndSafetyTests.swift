@@ -158,13 +158,14 @@ final class HarborModelAndSafetyTests: XCTestCase {
             entryCount: 1,
             capabilities: MediaDownloadCapabilities(formatOptions: [format])
         )
+        let selection = MediaDownloadFormatSelection(format: format)
         let selectedArguments = try MediaDownloadService.downloadArguments(
             runtime: runtime,
             sourceURL: sourceURL,
             destinationFolder: destinationURL,
             temporaryFolder: temporaryURL,
-            metadata: metadata,
-            formatPreference: .specific(format.id),
+            metadata: metadata.persistenceSnapshot,
+            formatPreference: .specific(selection),
             speedLimitBytesPerSecond: 345_678
         )
 
@@ -178,22 +179,65 @@ final class HarborModelAndSafetyTests: XCTestCase {
             "345678"
         )
 
-        XCTAssertThrowsError(
-            try MediaDownloadService.downloadArguments(
-                runtime: runtime,
-                sourceURL: sourceURL,
-                destinationFolder: destinationURL,
-                temporaryFolder: temporaryURL,
-                metadata: metadata,
-                formatPreference: .specific("unavailable-format"),
-                speedLimitBytesPerSecond: nil
-            )
-        ) { error in
-            XCTAssertEqual(
-                error.localizedDescription,
-                "The selected media format is no longer available."
-            )
-        }
+        XCTAssertEqual(selection.displaySummary, "1080p • MP4 • AVC1")
+    }
+
+    func testMediaRecordPersistsSelectionWithoutFormatCatalog() throws {
+        let sourceURL = try XCTUnwrap(URL(string: "https://example.com/video"))
+        let format = MediaDownloadFormatOption(
+            formatID: "137",
+            audioFormatID: "140",
+            container: "mp4",
+            videoCodec: "avc1.640028",
+            audioCodec: "mp4a.40.2",
+            width: 1_920,
+            height: 1_080,
+            framesPerSecond: 30,
+            dynamicRange: "SDR",
+            bitrateKbps: 4_500,
+            estimatedBytes: 10_000_000,
+            mergeOutputFormat: "mp4"
+        )
+        let metadata = MediaDownloadMetadata(
+            title: "Video",
+            platform: "Test",
+            extractorKey: "Test",
+            thumbnailURL: nil,
+            webpageURL: sourceURL,
+            expectedBytes: format.estimatedBytes,
+            mediaType: .video,
+            entryCount: 1,
+            capabilities: MediaDownloadCapabilities(formatOptions: [format])
+        )
+        let selection = MediaDownloadFormatSelection(format: format)
+        let item = DownloadItem(
+            sourceURL: sourceURL,
+            sourceKind: .mediaURL,
+            backend: .ytDlp,
+            preferredFilename: nil,
+            destinationFolderPath: "/tmp/downloads",
+            status: .paused,
+            mediaMetadata: metadata,
+            mediaFormatPreference: .specific(selection)
+        )
+
+        let record = item.makeRecord()
+
+        XCTAssertEqual(record.mediaMetadata?.capabilities, .unavailable)
+        XCTAssertEqual(record.mediaFormatPreference, .specific(selection))
+        XCTAssertEqual(item.mediaMetadata?.capabilities.formatOptions, [format])
+
+        let encodedRecord = try JSONEncoder().encode(record)
+        XCTAssertFalse(String(decoding: encodedRecord, as: UTF8.self).contains("formatOptions"))
+    }
+
+    func testUnavailableExactMediaFormatHasDedicatedError() {
+        XCTAssertEqual(
+            MediaDownloadErrorClassifier.message(
+                from: "ERROR: [youtube] Requested format is not available"
+            ),
+            MediaDownloadErrorClassifier.selectedFormatUnavailableMessage
+        )
     }
 
     func testLegacyCompletedTorrentDoesNotSeed() throws {

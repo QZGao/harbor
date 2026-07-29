@@ -346,7 +346,23 @@ struct MediaRuntimeSmokeTests {
     }
 
     private static func testFormatPreferenceCoding() throws {
-        let preference = MediaDownloadFormatPreference.specific("137+140")
+        let format = MediaDownloadFormatOption(
+            formatID: "137",
+            audioFormatID: "140",
+            container: "mp4",
+            videoCodec: "avc1.640028",
+            audioCodec: "mp4a.40.2",
+            width: 1920,
+            height: 1080,
+            framesPerSecond: 30,
+            dynamicRange: "SDR",
+            bitrateKbps: 4500,
+            estimatedBytes: 4_100_000,
+            mergeOutputFormat: "mp4"
+        )
+        let preference = MediaDownloadFormatPreference.specific(
+            MediaDownloadFormatSelection(format: format)
+        )
         let decoded = try JSONDecoder().decode(
             MediaDownloadFormatPreference.self,
             from: JSONEncoder().encode(preference)
@@ -371,6 +387,18 @@ struct MediaRuntimeSmokeTests {
         try assert(
             legacyOriginal == .bestAvailable && legacyBestMP4 == .bestAvailable,
             "Legacy automatic format preferences should migrate to Best available"
+        )
+
+        let legacySpecific = try JSONDecoder().decode(
+            MediaDownloadFormatPreference.self,
+            from: Data(#"{"kind":"specific","optionID":"137+140"}"#.utf8)
+        )
+        guard case let .specific(legacySelection) = legacySpecific else {
+            throw TestFailure("Legacy exact format preference should remain exact")
+        }
+        try assert(
+            legacySelection.selector == "137+140" && legacySelection.requiresFormatProbe,
+            "Legacy exact format preferences should request one fresh format probe"
         )
     }
 

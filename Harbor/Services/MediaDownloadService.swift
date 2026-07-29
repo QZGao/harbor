@@ -145,10 +145,8 @@ actor MediaDownloadService {
         switch formatPreference {
         case .bestAvailable:
             expectedBytes = metadata?.expectedBytes ?? 0
-        case let .specific(optionID):
-            expectedBytes = metadata?.capabilities.formatOptions.first(where: {
-                $0.id == optionID
-            })?.estimatedBytes ?? 0
+        case let .specific(selection):
+            expectedBytes = selection.estimatedBytes
         }
         runningDownloads[id] = RunningDownload(
             id: id,
@@ -473,21 +471,13 @@ actor MediaDownloadService {
             ])
         }
 
-        if case let .specific(optionID) = formatPreference {
-            guard let format = metadata?.capabilities.formatOptions.first(where: {
-                $0.id == optionID
-            }) else {
-                throw MediaDownloadError.unsupported(
-                    "The selected media format is no longer available."
-                )
-            }
-
+        if case let .specific(selection) = formatPreference {
             arguments.append(contentsOf: [
                 "--format",
-                format.selector
+                selection.selector
             ])
 
-            if let mergeOutputFormat = format.mergeOutputFormat {
+            if let mergeOutputFormat = selection.mergeOutputFormat {
                 arguments.append(contentsOf: [
                     "--merge-output-format",
                     mergeOutputFormat
@@ -752,6 +742,9 @@ enum MediaDownloadFinalPathParser {
 }
 
 enum MediaDownloadErrorClassifier {
+    nonisolated static let selectedFormatUnavailableMessage =
+        "The selected media format is no longer available."
+
     nonisolated static func message(from stderr: String) -> String {
         let normalized = stderr.lowercased()
 
@@ -770,8 +763,11 @@ enum MediaDownloadErrorClassifier {
             return "yt-dlp couldn’t access a downloadable media stream for this link."
         }
 
-        if normalized.contains("requested format is not available")
-            || normalized.contains("no video formats found")
+        if normalized.contains("requested format is not available") {
+            return selectedFormatUnavailableMessage
+        }
+
+        if normalized.contains("no video formats found")
             || normalized.contains("no formats found") {
             return "No downloadable media format was available for this link."
         }

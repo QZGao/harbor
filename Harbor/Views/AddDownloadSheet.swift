@@ -205,7 +205,11 @@ struct AddDownloadSheet: View {
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
-                                .tag(MediaDownloadFormatPreference.specific(format.id))
+                                .tag(
+                                    MediaDownloadFormatPreference.specific(
+                                        MediaDownloadFormatSelection(format: format)
+                                    )
+                                )
                             }
                         }
                         .pickerStyle(.radioGroup)

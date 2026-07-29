@@ -137,9 +137,9 @@ private struct MediaFormatRecoverySection: View {
                 }
 
                 Picker("Format", selection: formatSelection) {
-                    if let unavailablePreference {
-                        Text("Unavailable Format")
-                            .tag(unavailablePreference)
+                    if case let .specific(selection)? = unavailablePreference {
+                        Text(selection.displaySummary ?? "Unavailable Format")
+                            .tag(MediaDownloadFormatPreference.specific(selection))
                             .disabled(true)
                     }
 
@@ -148,11 +148,20 @@ private struct MediaFormatRecoverySection: View {
 
                     ForEach(formatOptions) { format in
                         Text(formatTitle(format))
-                            .tag(MediaDownloadFormatPreference.specific(format.id))
+                            .tag(
+                                MediaDownloadFormatPreference.specific(
+                                    MediaDownloadFormatSelection(format: format)
+                                )
+                            )
                     }
                 }
                 .pickerStyle(.menu)
                 .frame(maxWidth: 320, alignment: .leading)
+            }
+        }
+        .task {
+            if shouldRefreshFormats {
+                await center.refreshMediaFormats(for: item.id)
             }
         }
     }
@@ -169,16 +178,20 @@ private struct MediaFormatRecoverySection: View {
     }
 
     private var unavailablePreference: MediaDownloadFormatPreference? {
-        guard case let .specific(optionID)? = item.mediaFormatPreference,
-              formatOptions.contains(where: { $0.id == optionID }) == false else {
+        guard case let .specific(selection)? = item.mediaFormatPreference,
+              formatOptions.contains(where: { $0.id == selection.selector }) == false else {
             return nil
         }
 
-        return .specific(optionID)
+        return .specific(selection)
     }
 
     private var selectedFormatIsUnavailable: Bool {
         unavailablePreference != nil
+    }
+
+    private var shouldRefreshFormats: Bool {
+        formatOptions.isEmpty
     }
 
     private func formatTitle(_ format: MediaDownloadFormatOption) -> String {

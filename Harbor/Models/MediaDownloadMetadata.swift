@@ -9,11 +9,12 @@ enum MediaDownloadType: String, Codable, Sendable {
 
 enum MediaDownloadFormatPreference: Codable, Equatable, Hashable, Sendable {
     case bestAvailable
-    case specific(String)
+    case specific(MediaDownloadFormatSelection)
 
     private enum CodingKeys: String, CodingKey {
         case kind
         case optionID
+        case selection
     }
 
     private enum Kind: String, Codable {
@@ -43,7 +44,18 @@ enum MediaDownloadFormatPreference: Codable, Equatable, Hashable, Sendable {
         case .bestAvailable, .original:
             self = .bestAvailable
         case .specific:
-            self = .specific(try container.decode(String.self, forKey: .optionID))
+            if let selection = try container.decodeIfPresent(
+                MediaDownloadFormatSelection.self,
+                forKey: .selection
+            ) {
+                self = .specific(selection)
+            } else {
+                self = .specific(
+                    MediaDownloadFormatSelection(
+                        legacySelector: try container.decode(String.self, forKey: .optionID)
+                    )
+                )
+            }
         }
     }
 
@@ -52,10 +64,10 @@ enum MediaDownloadFormatPreference: Codable, Equatable, Hashable, Sendable {
         case .bestAvailable:
             var container = encoder.singleValueContainer()
             try container.encode("bestAvailable")
-        case let .specific(optionID):
+        case let .specific(selection):
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(Kind.specific, forKey: .kind)
-            try container.encode(optionID, forKey: .optionID)
+            try container.encode(selection, forKey: .selection)
         }
     }
 }
@@ -74,7 +86,7 @@ struct MediaDownloadFormatOption: Codable, Equatable, Identifiable, Sendable {
     let estimatedBytes: Int64
     let mergeOutputFormat: String?
 
-    // Keep the existing coding keys because format options are persisted.
+    // Retain the existing keys so records written before catalogs became transient still decode.
     private enum CodingKeys: String, CodingKey {
         case formatID = "videoFormatID"
         case audioFormatID
@@ -100,6 +112,58 @@ struct MediaDownloadFormatOption: Codable, Equatable, Identifiable, Sendable {
         }
 
         return "\(formatID)+\(audioFormatID)"
+    }
+}
+
+struct MediaDownloadFormatSelection: Codable, Equatable, Hashable, Sendable {
+    let selector: String
+    let mergeOutputFormat: String?
+    let displaySummary: String?
+    let estimatedBytes: Int64
+
+    nonisolated init(format: MediaDownloadFormatOption) {
+        selector = format.selector
+        mergeOutputFormat = format.mergeOutputFormat
+        displaySummary = Self.displaySummary(for: format)
+        estimatedBytes = format.estimatedBytes
+    }
+
+    nonisolated init(legacySelector: String) {
+        selector = legacySelector
+        mergeOutputFormat = nil
+        displaySummary = nil
+        estimatedBytes = 0
+    }
+
+    nonisolated var requiresFormatProbe: Bool {
+        displaySummary == nil
+    }
+
+    private nonisolated static func displaySummary(
+        for format: MediaDownloadFormatOption
+    ) -> String {
+        var components: [String] = []
+
+        if let height = format.height {
+            components.append("\(height)p")
+        } else if let width = format.width {
+            components.append("\(width) px")
+        } else if format.videoCodec != nil {
+            components.append("Video")
+        } else if format.audioCodec != nil {
+            components.append("Audio")
+        } else {
+            components.append("Media")
+        }
+
+        components.append(format.container.uppercased())
+
+        if let codec = format.videoCodec ?? format.audioCodec,
+           let codecFamily = codec.split(separator: ".").first {
+            components.append(codecFamily.uppercased())
+        }
+
+        return components.joined(separator: " • ")
     }
 }
 
@@ -207,7 +271,9 @@ struct MediaDownloadMetadata: Codable, Equatable, Sendable {
         try container.encode(expectedBytes, forKey: .expectedBytes)
         try container.encode(mediaType, forKey: .mediaType)
         try container.encode(entryCount, forKey: .entryCount)
-        try container.encode(capabilities, forKey: .capabilities)
+        if capabilities.supportsMediaFormatSelection {
+            try container.encode(capabilities, forKey: .capabilities)
+        }
     }
 
     nonisolated var isCollection: Bool {
@@ -231,6 +297,25 @@ struct MediaDownloadMetadata: Codable, Equatable, Sendable {
 
     nonisolated var defaultFormatPreference: MediaDownloadFormatPreference {
         .bestAvailable
+    }
+
+    /// A compact copy suitable for durable download-record storage.
+    nonisolated var persistenceSnapshot: MediaDownloadMetadata {
+        guard capabilities.supportsMediaFormatSelection else {
+            return self
+        }
+
+        return MediaDownloadMetadata(
+            title: title,
+            platform: platform,
+            extractorKey: extractorKey,
+            thumbnailURL: thumbnailURL,
+            webpageURL: webpageURL,
+            expectedBytes: expectedBytes,
+            mediaType: mediaType,
+            entryCount: entryCount,
+            capabilities: .unavailable
+        )
     }
 }
 
