@@ -80,11 +80,12 @@ private struct DownloadInspectorContent: View {
             return true
         }
 
-        guard case .specific? = item.mediaFormatPreference else {
-            return false
+        if case .specific? = item.mediaFormatPreference {
+            return true
         }
 
-        return true
+        return item.lastError
+            == MediaDownloadErrorClassifier.selectedFormatUnavailableMessage
     }
 
     private func continueInBrowser() {
