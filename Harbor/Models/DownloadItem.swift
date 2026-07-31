@@ -674,7 +674,7 @@ final class DownloadItem: Identifiable {
             resumeData: resumeData,
             backendIdentifier: backendIdentifier,
             metadataName: metadataName,
-            mediaMetadata: mediaMetadata,
+            mediaMetadata: mediaMetadata?.persistenceSnapshot,
             mediaFormatPreference: mediaFormatPreference,
             downloadLimitOverride: downloadLimitOverride,
             uploadLimitOverride: uploadLimitOverride,

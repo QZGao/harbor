@@ -31,6 +31,10 @@ private struct DownloadInspectorContent: View {
                     copySourceURL: copySourceURL
                 )
 
+                if shouldShowMediaFormatRecovery {
+                    MediaFormatRecoverySection(item: item, center: center)
+                }
+
                 DownloadTransferSection(item: item, center: center)
                 DownloadStorageSection(item: item)
                 DownloadActivitySection(item: item)
@@ -65,6 +69,25 @@ private struct DownloadInspectorContent: View {
         .navigationTitle(item.displayName)
     }
 
+    private var shouldShowMediaFormatRecovery: Bool {
+        guard item.backend == .ytDlp,
+              item.status == .failed,
+              let metadata = item.mediaMetadata else {
+            return false
+        }
+
+        if metadata.capabilities.supportsMediaFormatSelection {
+            return true
+        }
+
+        if case .specific? = item.mediaFormatPreference {
+            return true
+        }
+
+        return item.lastError
+            == MediaDownloadErrorClassifier.selectedFormatUnavailableMessage
+    }
+
     private func continueInBrowser() {
         center.continueInBrowser(id: item.id)
     }
@@ -95,6 +118,298 @@ private struct DownloadInspectorContent: View {
 
     private func copySourceURL() {
         center.copySourceURL(id: item.id)
+    }
+}
+
+private struct MediaFormatRecoverySection: View {
+    let item: DownloadItem
+    let center: DownloadCenter
+
+    var body: some View {
+        DownloadDetailSection(title: "Media Format") {
+            VStack(alignment: .leading, spacing: 12) {
+                if selectedFormatIsUnavailable {
+                    DownloadCallout(
+                        title: "Format No Longer Available",
+                        message: "Choose another format, then retry the download.",
+                        systemImage: "exclamationmark.triangle",
+                        tint: .orange
+                    )
+                }
+
+                Picker("Format", selection: primaryFormatSelection) {
+                    if selectedPrimaryFormatIsUnavailable,
+                       let selection = selectedFormatSelection,
+                       let primaryFormatID {
+                        Text(selection.displaySummary ?? "Unavailable Format")
+                            .tag(Optional(primaryFormatID))
+                            .disabled(true)
+                    }
+
+                    Text("Best available")
+                        .tag(String?.none)
+
+                    ForEach(formatOptions) { format in
+                        Text(formatTitle(format))
+                            .tag(Optional(format.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(maxWidth: 320, alignment: .leading)
+
+                if let selectedFormat {
+                    if selectedFormat.isVideoOnly {
+                        if audioFormatOptions.isEmpty,
+                           unavailableAudioFormatID == nil {
+                            LabeledContent("Audio") {
+                                Text("No audio available")
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else {
+                            Picker("Audio", selection: audioFormatSelection) {
+                                if let unavailableAudioFormatID {
+                                    Text("Unavailable Audio")
+                                        .tag(Optional(unavailableAudioFormatID))
+                                        .disabled(true)
+                                }
+
+                                Text("No audio")
+                                    .tag(String?.none)
+
+                                ForEach(audioFormatOptions) { audioFormat in
+                                    Text(audioFormatTitle(audioFormat))
+                                        .tag(Optional(audioFormat.id))
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .frame(maxWidth: 320, alignment: .leading)
+                        }
+                    } else if selectedFormat.hasVideo, selectedFormat.hasAudio {
+                        LabeledContent("Audio") {
+                            Text("Included in selected format")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if let mergeOutputFormat = selectedFormatSelection?.mergeOutputFormat {
+                        LabeledContent("Output") {
+                            Text(mergeOutputFormat.uppercased())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+        .task {
+            if shouldRefreshFormats {
+                await center.refreshMediaFormats(for: item.id)
+            }
+        }
+    }
+
+    private var formatOptions: [MediaDownloadFormatOption] {
+        item.mediaMetadata?.capabilities.formatOptions ?? []
+    }
+
+    private var audioFormatOptions: [MediaDownloadFormatOption] {
+        item.mediaMetadata?.capabilities.audioFormatOptions ?? []
+    }
+
+    private var selectedFormatSelection: MediaDownloadFormatSelection? {
+        guard case let .specific(selection)? = item.mediaFormatPreference else {
+            return nil
+        }
+
+        return selection
+    }
+
+    private var primaryFormatID: String? {
+        selectedFormatSelection?.formatID ?? selectedFormatSelection?.selector
+    }
+
+    private var selectedFormat: MediaDownloadFormatOption? {
+        guard let formatID = selectedFormatSelection?.formatID else {
+            return nil
+        }
+
+        return item.mediaMetadata?.capabilities.formatOption(id: formatID)
+    }
+
+    private var primaryFormatSelection: Binding<String?> {
+        Binding(
+            get: {
+                primaryFormatID
+            },
+            set: { formatID in
+                guard let formatID else {
+                    center.setMediaFormatPreference(.bestAvailable, for: item.id)
+                    return
+                }
+
+                guard let capabilities = item.mediaMetadata?.capabilities,
+                      let format = capabilities.formatOption(id: formatID) else {
+                    return
+                }
+
+                center.setMediaFormatPreference(
+                    .specific(capabilities.defaultSelection(for: format)),
+                    for: item.id
+                )
+            }
+        )
+    }
+
+    private var audioFormatSelection: Binding<String?> {
+        Binding(
+            get: {
+                selectedFormatSelection?.audioFormatID
+            },
+            set: { audioFormatID in
+                guard let capabilities = item.mediaMetadata?.capabilities,
+                      let selectedFormat,
+                      let selection = capabilities.selection(
+                          for: selectedFormat,
+                          audioFormatID: audioFormatID
+                      ) else {
+                    return
+                }
+
+                center.setMediaFormatPreference(
+                    .specific(selection),
+                    for: item.id
+                )
+            }
+        )
+    }
+
+    private var unavailablePreference: MediaDownloadFormatPreference? {
+        guard case let .specific(selection)? = item.mediaFormatPreference else {
+            return nil
+        }
+
+        if item.mediaMetadata?.capabilities.resolvedSelection(
+            matching: selection
+        ) != nil {
+            return nil
+        }
+
+        return .specific(selection)
+    }
+
+    private var selectedFormatIsUnavailable: Bool {
+        unavailablePreference != nil
+    }
+
+    private var selectedPrimaryFormatIsUnavailable: Bool {
+        guard let primaryFormatID else {
+            return false
+        }
+
+        return formatOptions.contains(where: { $0.id == primaryFormatID }) == false
+    }
+
+    private var unavailableAudioFormatID: String? {
+        guard let audioFormatID = selectedFormatSelection?.audioFormatID,
+              audioFormatOptions.contains(where: { $0.id == audioFormatID }) == false else {
+            return nil
+        }
+
+        return audioFormatID
+    }
+
+    private var shouldRefreshFormats: Bool {
+        formatOptions.isEmpty
+    }
+
+    private func formatTitle(_ format: MediaDownloadFormatOption) -> String {
+        var components: [String] = []
+
+        if let height = format.height {
+            components.append("\(height)p")
+        } else if let width = format.width {
+            components.append("\(width) px")
+        } else if format.videoCodec != nil {
+            components.append("Video")
+        } else if format.audioCodec != nil {
+            components.append("Audio")
+        } else {
+            components.append("Media")
+        }
+
+        components.append(format.container.uppercased())
+
+        if format.hasAudio,
+           let language = format.language?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           language.isEmpty == false {
+            components.append(language.uppercased())
+        }
+
+        if format.hasAudio,
+           let formatNote = format.formatNote?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           formatNote.isEmpty == false {
+            components.append(formatNote)
+        }
+
+        if let codec = format.videoCodec ?? format.audioCodec,
+           let codecFamily = codec.split(separator: ".").first {
+            components.append(codecFamily.uppercased())
+        }
+
+        if let bitrateKbps = format.bitrateKbps,
+           bitrateKbps.isFinite,
+           bitrateKbps > 0 {
+            components.append(
+                "\(bitrateKbps.formatted(.number.precision(.fractionLength(0)))) kbps"
+            )
+        }
+
+        return components.joined(separator: " • ")
+    }
+
+    private func audioFormatTitle(_ format: MediaDownloadFormatOption) -> String {
+        var components: [String] = []
+
+        if let language = format.language?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           language.isEmpty == false {
+            components.append(language.uppercased())
+        }
+
+        if let formatNote = format.formatNote?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           formatNote.isEmpty == false {
+            components.append(formatNote)
+        }
+
+        components.append(format.container.uppercased())
+
+        if let codec = format.audioCodec,
+           let codecFamily = codec.split(separator: ".").first {
+            components.append(codecFamily.uppercased())
+        }
+
+        if let bitrateKbps = format.bitrateKbps,
+           bitrateKbps.isFinite,
+           bitrateKbps > 0 {
+            components.append(
+                "\(bitrateKbps.formatted(.number.precision(.fractionLength(0)))) kbps"
+            )
+        }
+
+        if let audioChannels = format.audioChannels, audioChannels > 0 {
+            switch audioChannels {
+            case 1:
+                components.append("Mono")
+            case 2:
+                components.append("Stereo")
+            default:
+                components.append("\(audioChannels) channels")
+            }
+        }
+
+        return components.joined(separator: " • ")
     }
 }
 

@@ -79,7 +79,15 @@ actor MediaDownloadService {
     func metadata(for url: URL) async throws -> MediaDownloadMetadata {
         let runtime = try resolvedRuntime()
         let output = try await runMetadataCommand(runtime: runtime, url: url)
-        return try MediaDownloadMetadataParser.metadata(from: output, sourceURL: url)
+        let metadata = try MediaDownloadMetadataParser.metadata(from: output, sourceURL: url)
+
+        guard metadata.supportsMediaDownload else {
+            throw MediaDownloadError.unsupported(
+                "yt-dlp couldn’t verify downloadable media for this link."
+            )
+        }
+
+        return metadata
     }
 
     func startDownload(
@@ -94,6 +102,12 @@ actor MediaDownloadService {
             return existing.process.processIdentifier
         }
 
+        guard metadata?.supportsMediaDownload == true else {
+            throw MediaDownloadError.unsupported(
+                "yt-dlp couldn’t verify downloadable media for this download."
+            )
+        }
+
         let runtime = try resolvedRuntime()
         cleanupOrphanedMediaProcessesIfNeeded(runtime: runtime)
 
@@ -101,7 +115,7 @@ actor MediaDownloadService {
         try fileManager.createDirectory(at: temporaryFolder, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: destinationFolder, withIntermediateDirectories: true)
 
-        let arguments = Self.downloadArguments(
+        let arguments = try Self.downloadArguments(
             runtime: runtime,
             sourceURL: sourceURL,
             destinationFolder: destinationFolder,
@@ -127,7 +141,9 @@ actor MediaDownloadService {
             }
         )
 
-        let expectedBytes = metadata?.expectedBytes ?? 0
+        let expectedBytes = formatPreference.initialExpectedBytes(
+            metadataEstimate: metadata?.expectedBytes ?? 0
+        )
         runningDownloads[id] = RunningDownload(
             id: id,
             process: process,
@@ -349,7 +365,10 @@ actor MediaDownloadService {
             "15",
             "--dump-single-json",
             "--flat-playlist",
-            "--skip-download",
+            "--simulate",
+            "--check-all-formats",
+            "--ffmpeg-location",
+            runtime.ffmpegURL.deletingLastPathComponent().path,
             url.absoluteString
         ]
 
@@ -385,7 +404,7 @@ actor MediaDownloadService {
                     state.process = process
 
                     Task {
-                        try? await Task.sleep(for: .seconds(45))
+                        try? await Task.sleep(for: .seconds(120))
                         guard state.markTimedOut() else {
                             return
                         }
@@ -414,7 +433,7 @@ actor MediaDownloadService {
         metadata: MediaDownloadMetadata?,
         formatPreference: MediaDownloadFormatPreference,
         speedLimitBytesPerSecond: Int64?
-    ) -> [String] {
+    ) throws -> [String] {
         var arguments = [
             "--ignore-config",
             "--no-cache-dir",
@@ -448,16 +467,18 @@ actor MediaDownloadService {
             ])
         }
 
-        switch formatPreference {
-        case .bestMP4:
+        if case let .specific(selection) = formatPreference {
             arguments.append(contentsOf: [
                 "--format",
-                "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bestvideo+bestaudio/best",
-                "--merge-output-format",
-                "mp4"
+                selection.selector
             ])
-        case .original:
-            break
+
+            if let mergeOutputFormat = selection.mergeOutputFormat {
+                arguments.append(contentsOf: [
+                    "--merge-output-format",
+                    mergeOutputFormat
+                ])
+            }
         }
 
         arguments.append(sourceURL.absoluteString)
@@ -717,6 +738,9 @@ enum MediaDownloadFinalPathParser {
 }
 
 enum MediaDownloadErrorClassifier {
+    nonisolated static let selectedFormatUnavailableMessage =
+        "The selected media format is no longer available."
+
     nonisolated static func message(from stderr: String) -> String {
         let normalized = stderr.lowercased()
 
@@ -735,8 +759,11 @@ enum MediaDownloadErrorClassifier {
             return "yt-dlp couldn’t access a downloadable media stream for this link."
         }
 
-        if normalized.contains("requested format is not available")
-            || normalized.contains("no video formats found")
+        if normalized.contains("requested format is not available") {
+            return selectedFormatUnavailableMessage
+        }
+
+        if normalized.contains("no video formats found")
             || normalized.contains("no formats found") {
             return "No downloadable media format was available for this link."
         }
