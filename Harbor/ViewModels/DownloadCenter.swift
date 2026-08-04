@@ -473,6 +473,33 @@ final class DownloadCenter {
         schedulePersist()
     }
 
+    func setMediaFormatPreference(
+        _ preference: MediaDownloadFormatPreference,
+        for id: UUID
+    ) {
+        guard let item = item(for: id),
+              item.backend == .ytDlp,
+              item.status == .failed else {
+            return
+        }
+
+        switch preference {
+        case .bestAvailable:
+            item.mediaFormatPreference = .bestAvailable
+        case let .specific(selection):
+            guard let resolvedSelection = item.mediaMetadata?.capabilities.resolvedSelection(
+                matching: selection
+            ) else {
+                return
+            }
+
+            item.mediaFormatPreference = .specific(resolvedSelection)
+        }
+
+        item.updatedAt = .now
+        schedulePersist()
+    }
+
     func installExternalOpenHandlerIfNeeded() {
         guard hasInstalledExternalOpenHandler == false else {
             return
@@ -634,6 +661,31 @@ final class DownloadCenter {
         }
 
         return try await mediaService.metadata(for: url)
+    }
+
+    func refreshMediaFormats(for id: UUID) async {
+        guard let currentItem = item(for: id),
+              currentItem.backend == .ytDlp,
+              currentItem.status == .failed else {
+            return
+        }
+
+        guard let metadata = try? await mediaService.metadata(for: currentItem.sourceURL),
+              let refreshedItem = item(for: id),
+              refreshedItem.status == .failed else {
+            return
+        }
+
+        refreshedItem.mediaMetadata = metadata
+        refreshedItem.metadataName = metadata.title
+        if case let .specific(selection)? = refreshedItem.mediaFormatPreference,
+           let resolvedSelection = metadata.capabilities.resolvedSelection(
+               matching: selection
+           ) {
+            refreshedItem.mediaFormatPreference = .specific(resolvedSelection)
+        }
+        refreshedItem.updatedAt = .now
+        schedulePersist()
     }
 
     func queueDownload(_ request: AddDownloadRequest) {
@@ -857,7 +909,10 @@ final class DownloadCenter {
             item.backendIdentifier = nil
             item.fileLocationPath = nil
             item.bytesWritten = 0
-            item.expectedBytes = item.mediaMetadata?.expectedBytes ?? 0
+            item.expectedBytes = (item.mediaFormatPreference ?? .bestAvailable)
+                .initialExpectedBytes(
+                    metadataEstimate: item.mediaMetadata?.expectedBytes ?? 0
+                )
             item.progress = 0
         }
 
@@ -1589,15 +1644,75 @@ final class DownloadCenter {
         }
 
         do {
+            var validatedMetadata: MediaDownloadMetadata
+            let metadataWasProbed: Bool
+            if let metadata = currentItem.mediaMetadata,
+               metadata.supportsMediaDownload {
+                validatedMetadata = metadata
+                metadataWasProbed = false
+            } else {
+                validatedMetadata = try await mediaService.metadata(for: currentItem.sourceURL)
+                metadataWasProbed = true
+
+                guard let refreshedItem = item(for: id),
+                      refreshedItem.status == .preparing else {
+                    return
+                }
+
+                refreshedItem.mediaMetadata = validatedMetadata
+                refreshedItem.metadataName = validatedMetadata.title
+                schedulePersist()
+            }
+
+            var requestedFormat = currentItem.mediaFormatPreference
+                ?? validatedMetadata.defaultFormatPreference
+
+            if case let .specific(selection) = requestedFormat,
+               selection.requiresFormatProbe {
+                if metadataWasProbed == false {
+                    validatedMetadata = try await mediaService.metadata(for: currentItem.sourceURL)
+
+                    guard let refreshedItem = item(for: id),
+                          refreshedItem.status == .preparing else {
+                        return
+                    }
+
+                    refreshedItem.mediaMetadata = validatedMetadata
+                    refreshedItem.metadataName = validatedMetadata.title
+                    schedulePersist()
+                }
+
+                guard let resolvedSelection = validatedMetadata.capabilities.resolvedSelection(
+                    matching: selection
+                ) else {
+                    throw MediaDownloadError.unsupported(
+                        MediaDownloadErrorClassifier.selectedFormatUnavailableMessage
+                    )
+                }
+
+                requestedFormat = .specific(resolvedSelection)
+
+                guard let refreshedItem = item(for: id),
+                      refreshedItem.status == .preparing else {
+                    return
+                }
+
+                refreshedItem.mediaFormatPreference = requestedFormat
+                schedulePersist()
+            }
+
+            guard let readyItem = item(for: id),
+                  readyItem.status == .preparing else {
+                return
+            }
+
             let processIdentifier = try await mediaService.startDownload(
-                id: currentItem.id,
-                sourceURL: currentItem.sourceURL,
-                destinationFolder: currentItem.destinationFolderURL,
-                metadata: currentItem.mediaMetadata,
-                formatPreference: currentItem.mediaFormatPreference
-                    ?? currentItem.mediaMetadata?.defaultFormatPreference
-                    ?? .bestMP4,
-                speedLimitBytesPerSecond: effectiveMediaDownloadLimit(for: currentItem)
+                id: readyItem.id,
+                sourceURL: readyItem.sourceURL,
+                destinationFolder: readyItem.destinationFolderURL,
+                metadata: validatedMetadata,
+                formatPreference: requestedFormat,
+                speedLimitBytesPerSecond: effectiveMediaDownloadLimit(for: readyItem)
             )
 
             guard let refreshedItem = item(for: id) else {
@@ -2505,6 +2620,11 @@ final class DownloadCenter {
             item.speedBytesPerSecond = 0
             item.uploadBytesPerSecond = 0
             item.updatedAt = .now
+
+            if message == MediaDownloadErrorClassifier.selectedFormatUnavailableMessage {
+                item.mediaMetadata = item.mediaMetadata?.persistenceSnapshot
+            }
+
             transitionStatus(for: item, to: .failed)
             startNextQueuedDownloadsIfNeeded()
         }

@@ -14,6 +14,7 @@ mkdir -p "$build_dir" "$module_cache"
 swiftc \
   -module-cache-path "$module_cache" \
   "${project_dir}/Harbor/Models/MediaDownloadMetadata.swift" \
+  "${project_dir}/Harbor/Services/HarborApplicationSupport.swift" \
   "${project_dir}/Harbor/Services/ManagedChildProcess.swift" \
   "${project_dir}/Harbor/Services/MediaRuntimeResolver.swift" \
   "${project_dir}/Harbor/Services/MediaDownloadService.swift" \

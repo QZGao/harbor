@@ -4,14 +4,21 @@ import Foundation
 @main
 struct MediaRuntimeSmokeTests {
     static func main() async throws {
-        try testMetadataParserVideo()
+        try testMetadataParserBuildsFormatOptions()
+        try testMetadataParserKeepsMeaningfulVariants()
+        try testMetadataParserCombinedMP4Video()
+        try testMetadataParserVideoWithoutAudio()
+        try testMetadataParserRejectsExtensionOnlyFile()
+        try testMetadataParserExposesAudioWithoutUnverifiedVideo()
         try testMetadataParserCollection()
+        try testFormatPreferenceCoding()
+        try testLegacyMetadataDecoding()
         try testProgressAndFinalPathParsers()
         try testManagedChildProcessTerminatesProcessGroup()
         print("Media runtime smoke tests passed")
     }
 
-    private static func testMetadataParserVideo() throws {
+    private static func testMetadataParserBuildsFormatOptions() throws {
         let json = """
         {
           "id": "abc123",
@@ -19,10 +26,82 @@ struct MediaRuntimeSmokeTests {
           "extractor_key": "Youtube",
           "thumbnail": "https://img.example.test/thumb.jpg",
           "webpage_url": "https://www.youtube.com/shorts/abc123",
-          "ext": "mp4",
-          "filesize": 4096,
           "formats": [
-            { "ext": "mp4", "vcodec": "h264", "filesize": 4096 }
+            {
+              "format_id": "137",
+              "ext": "mp4",
+              "vcodec": "avc1.640028",
+              "acodec": "none",
+              "has_drm": false,
+              "width": 1920,
+              "height": 1080,
+              "fps": 30,
+              "vbr": 4500,
+              "filesize": 4000000
+            },
+            {
+              "format_id": "140",
+              "ext": "m4a",
+              "vcodec": "none",
+              "acodec": "mp4a.40.2",
+              "has_drm": false,
+              "abr": 128,
+              "filesize": 100000,
+              "language": "en",
+              "format_note": "English (Original)",
+              "audio_channels": 2,
+              "language_preference": 10
+            },
+            {
+              "format_id": "140-fr",
+              "ext": "m4a",
+              "vcodec": "none",
+              "acodec": "mp4a.40.2",
+              "has_drm": false,
+              "abr": 192,
+              "filesize": 150000,
+              "language": "fr",
+              "format_note": "French Dub",
+              "audio_channels": 2,
+              "language_preference": 0
+            },
+            {
+              "format_id": "248",
+              "ext": "webm",
+              "vcodec": "vp9",
+              "acodec": "none",
+              "has_drm": false,
+              "width": 1920,
+              "height": 1080,
+              "fps": 30,
+              "vbr": 3200,
+              "filesize": 3000000
+            },
+            {
+              "format_id": "251",
+              "ext": "webm",
+              "vcodec": "none",
+              "acodec": "opus",
+              "has_drm": false,
+              "abr": 160,
+              "filesize": 120000,
+              "language": "en",
+              "format_note": "English (Original)",
+              "audio_channels": 2,
+              "language_preference": 20
+            },
+            {
+              "format_id": "18",
+              "ext": "mp4",
+              "vcodec": "avc1.42001E",
+              "acodec": "mp4a.40.2",
+              "has_drm": false,
+              "width": 640,
+              "height": 360,
+              "fps": 30,
+              "tbr": 600,
+              "filesize_approx": 600000
+            }
           ]
         }
         """.data(using: .utf8)!
@@ -34,9 +113,269 @@ struct MediaRuntimeSmokeTests {
 
         try assert(metadata.title == "Sample Short", "Video title should parse")
         try assert(metadata.platform == "Youtube", "Extractor key should become platform")
-        try assert(metadata.mediaType == .video, "MP4 with video codec should be video")
-        try assert(metadata.expectedBytes == 4096, "File size should parse")
-        try assert(metadata.defaultFormatPreference == .bestMP4, "Video default format should be MP4")
+        try assert(metadata.mediaType == .video, "Checked video formats should classify the source as video")
+        try assert(metadata.capabilities.supportsMediaFormatSelection, "Checked media formats should enable the format picker")
+        try assert(metadata.supportsMediaDownload, "Checked video formats should enable yt-dlp")
+        try assert(metadata.capabilities.formatOptions.count == 6, "Each checked media stream should be listed independently")
+        try assert(metadata.defaultFormatPreference == .bestAvailable, "Best available should be the default format")
+
+        guard let mp4Video = metadata.capabilities.formatOption(id: "137"),
+              let webMVideo = metadata.capabilities.formatOption(id: "248") else {
+            throw TestFailure("Checked video streams should remain available by their own IDs")
+        }
+        let defaultMP4Selection = metadata.capabilities.defaultSelection(for: mp4Video)
+        try assert(
+            defaultMP4Selection.selector == "137+251",
+            "The visible default should prefer yt-dlp's language/default ranking over container compatibility"
+        )
+        try assert(defaultMP4Selection.mergeOutputFormat == "mkv", "Incompatible preferred streams should merge as MKV")
+        try assert(defaultMP4Selection.estimatedBytes == 4_120_000, "Selected stream sizes should be combined")
+
+        let frenchSelection = metadata.capabilities.selection(
+            for: mp4Video,
+            audioFormatID: "140-fr"
+        )
+        try assert(
+            frenchSelection?.selector == "137+140-fr",
+            "Users should be able to explicitly select a different audio language"
+        )
+        try assert(
+            frenchSelection?.mergeOutputFormat == "mp4",
+            "An explicitly selected compatible M4A track should merge as MP4"
+        )
+        try assert(
+            metadata.capabilities.selection(
+                for: mp4Video,
+                audioFormatID: nil
+            )?.selector == "137",
+            "Users should be able to explicitly download a video-only stream without audio"
+        )
+
+        let webMSelection = metadata.capabilities.defaultSelection(for: webMVideo)
+        try assert(webMSelection.selector == "248+251", "WebM video should visibly default to compatible WebM audio")
+        try assert(webMSelection.mergeOutputFormat == "webm", "WebM streams should merge as WebM")
+
+        let combined = metadata.capabilities.formatOptions.first { $0.id == "18" }
+        let combinedSelection = combined.map {
+            MediaDownloadFormatSelection(format: $0)
+        }
+        try assert(combinedSelection?.audioFormatID == nil, "A combined format should use one exact format ID")
+        try assert(combinedSelection?.mergeOutputFormat == nil, "A combined format should not request a merge")
+
+        let audioFormatIDs = Set(metadata.capabilities.audioFormatOptions.map(\.formatID))
+        try assert(
+            audioFormatIDs == ["140", "140-fr", "251"],
+            "Every checked audio language should remain independently selectable"
+        )
+
+        let roundTrip = try JSONDecoder().decode(
+            MediaDownloadMetadata.self,
+            from: JSONEncoder().encode(metadata)
+        )
+        try assert(roundTrip == metadata, "An in-memory media catalog should survive Codable round-trip")
+    }
+
+    private static func testMetadataParserKeepsMeaningfulVariants() throws {
+        let json = """
+        {
+          "id": "variants",
+          "title": "Meaningful Variants",
+          "extractor_key": "Example",
+          "formats": [
+            {
+              "format_id": "133",
+              "ext": "mp4",
+              "vcodec": "avc1.4d400c",
+              "acodec": "none",
+              "has_drm": false,
+              "width": 320,
+              "height": 240,
+              "fps": 15,
+              "vbr": 300,
+              "filesize": 430000
+            },
+            {
+              "format_id": "134",
+              "ext": "mp4",
+              "vcodec": "avc1.4d400c",
+              "acodec": "none",
+              "has_drm": false,
+              "width": 320,
+              "height": 240,
+              "fps": 15,
+              "vbr": 200,
+              "filesize": 320000
+            },
+            {
+              "format_id": "140",
+              "ext": "m4a",
+              "vcodec": "none",
+              "acodec": "mp4a.40.2",
+              "has_drm": false,
+              "abr": 128,
+              "filesize": 100000
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let metadata = try MediaDownloadMetadataParser.metadata(
+            from: json,
+            sourceURL: URL(string: "https://video.example.test/variants")!
+        )
+
+        let selectors = Set(
+            metadata.capabilities.formatOptions
+                .filter { $0.videoCodec != nil }
+                .map(\.formatID)
+        )
+        try assert(
+            selectors == ["133", "134"],
+            "Formats with meaningfully different bitrates and sizes should both remain available"
+        )
+
+        guard let firstVideo = metadata.capabilities.formatOption(id: "133") else {
+            throw TestFailure("The first video stream should be available")
+        }
+        try assert(
+            metadata.capabilities.defaultSelection(for: firstVideo).selector == "133+140",
+            "A video-only stream should offer its compatible audio stream as the visible default"
+        )
+    }
+
+    private static func testMetadataParserCombinedMP4Video() throws {
+        let json = """
+        {
+          "id": "combined",
+          "title": "Combined MP4",
+          "extractor_key": "Example",
+          "format_id": "18",
+          "ext": "mp4",
+          "vcodec": "h264",
+          "acodec": "aac",
+          "has_drm": false
+        }
+        """.data(using: .utf8)!
+
+        let metadata = try MediaDownloadMetadataParser.metadata(
+            from: json,
+            sourceURL: URL(string: "https://video.example.test/combined")!
+        )
+
+        try assert(metadata.capabilities.supportsMediaFormatSelection, "Combined MP4 should enable the format picker")
+        try assert(metadata.capabilities.formatOptions.map(\.formatID) == ["18"], "Combined MP4 should be selectable directly")
+    }
+
+    private static func testMetadataParserVideoWithoutAudio() throws {
+        let json = """
+        {
+          "id": "silent",
+          "title": "Silent Video",
+          "extractor_key": "Example",
+          "formats": [
+            {
+              "format_id": "silent-video",
+              "ext": "mp4",
+              "vcodec": "h264",
+              "acodec": "none",
+              "has_drm": false,
+              "width": 1280,
+              "height": 720
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let metadata = try MediaDownloadMetadataParser.metadata(
+            from: json,
+            sourceURL: URL(string: "https://video.example.test/silent")!
+        )
+
+        let option = metadata.capabilities.formatOptions.first
+        try assert(option?.formatID == "silent-video", "A checked silent video should remain selectable")
+        try assert(option?.audioCodec == nil, "A silent video option should not invent an audio stream")
+        try assert(
+            option.map { MediaDownloadFormatSelection(format: $0) }?.mergeOutputFormat == nil,
+            "A silent video should not request a merge"
+        )
+    }
+
+    private static func testMetadataParserRejectsExtensionOnlyFile() throws {
+        let json = """
+        {
+          "id": "book",
+          "title": "Book",
+          "extractor_key": "Generic",
+          "ext": "mobi"
+        }
+        """.data(using: .utf8)!
+
+        let metadata = try MediaDownloadMetadataParser.metadata(
+            from: json,
+            sourceURL: URL(string: "https://files.example.test/book.mobi")!
+        )
+
+        try assert(metadata.mediaType == .unknown, "An extension alone must not classify a file as video")
+        try assert(
+            metadata.capabilities == .unavailable,
+            "An extension-only result must remain a direct download"
+        )
+        try assert(metadata.supportsMediaDownload == false, "A Generic MOBI file must remain a direct download")
+
+        let imageMetadata = try MediaDownloadMetadataParser.metadata(
+            from: Data(#"{"id":"image","extractor_key":"Generic","ext":"jpg"}"#.utf8),
+            sourceURL: URL(string: "https://files.example.test/image.jpg")!
+        )
+        try assert(imageMetadata.mediaType == .image, "A recognized image should remain media")
+        try assert(imageMetadata.supportsMediaDownload, "Image media should remain on the automatic yt-dlp path")
+    }
+
+    private static func testMetadataParserExposesAudioWithoutUnverifiedVideo() throws {
+        let json = """
+        {
+          "id": "unverified",
+          "title": "Unverified Video",
+          "extractor_key": "Example",
+          "formats": [
+            {
+              "format_id": "unknown",
+              "ext": "mp4",
+              "vcodec": "unknown",
+              "acodec": "aac",
+              "has_drm": false
+            },
+            {
+              "format_id": "drm",
+              "ext": "mp4",
+              "vcodec": "h264",
+              "acodec": "none",
+              "has_drm": "maybe"
+            },
+            {
+              "format_id": "audio-only",
+              "ext": "m4a",
+              "vcodec": "none",
+              "acodec": "aac",
+              "has_drm": false
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let metadata = try MediaDownloadMetadataParser.metadata(
+            from: json,
+            sourceURL: URL(string: "https://video.example.test/unverified")!
+        )
+
+        try assert(
+            metadata.capabilities.formatOptions.map(\.formatID) == ["audio-only"],
+            "The checked audio format should remain while unverified video formats are excluded"
+        )
+        try assert(metadata.capabilities.supportsMediaFormatSelection, "Checked audio should enable the media format picker")
+        try assert(
+            metadata.supportsMediaDownload,
+            "A successful non-Generic extractor should remain on the automatic yt-dlp path"
+        )
     }
 
     private static func testMetadataParserCollection() throws {
@@ -59,7 +398,149 @@ struct MediaRuntimeSmokeTests {
         try assert(metadata.isCollection, "Multiple entries should be collection")
         try assert(metadata.entryCount == 2, "Entry count should parse")
         try assert(metadata.expectedBytes == 2000, "Collection expected bytes should use largest known entry")
-        try assert(metadata.defaultFormatPreference == .original, "Collection default format should preserve originals")
+        try assert(
+            metadata.capabilities == .unavailable,
+            "Flat collection metadata should not invent video format options"
+        )
+        try assert(metadata.supportsMediaDownload, "Collections should remain on the automatic yt-dlp path")
+        try assert(metadata.defaultFormatPreference == .bestAvailable, "Collection default format should be best available")
+    }
+
+    private static func testFormatPreferenceCoding() throws {
+        let videoFormat = MediaDownloadFormatOption(
+            formatID: "137",
+            container: "mp4",
+            videoCodec: "avc1.640028",
+            audioCodec: nil,
+            width: 1920,
+            height: 1080,
+            framesPerSecond: 30,
+            dynamicRange: "SDR",
+            bitrateKbps: 4500,
+            estimatedBytes: 4_000_000
+        )
+        let audioFormat = MediaDownloadFormatOption(
+            formatID: "140",
+            container: "m4a",
+            videoCodec: nil,
+            audioCodec: "mp4a.40.2",
+            width: nil,
+            height: nil,
+            framesPerSecond: nil,
+            dynamicRange: nil,
+            bitrateKbps: 128,
+            estimatedBytes: 100_000,
+            language: "en",
+            formatNote: "English (Original)"
+        )
+        let preference = MediaDownloadFormatPreference.specific(
+            MediaDownloadFormatSelection(
+                format: videoFormat,
+                audioFormat: audioFormat
+            )
+        )
+        let decoded = try JSONDecoder().decode(
+            MediaDownloadFormatPreference.self,
+            from: JSONEncoder().encode(preference)
+        )
+        try assert(decoded == preference, "An exact format selection should survive persistence")
+        guard case let .specific(decodedSelection) = decoded else {
+            throw TestFailure("The exact selection should remain specific after persistence")
+        }
+        try assert(
+            decodedSelection.formatID == "137"
+                && decodedSelection.audioFormatID == "140"
+                && decodedSelection.selector == "137+140",
+            "The selected video and audio IDs should survive persistence separately"
+        )
+
+        let bestAvailable = MediaDownloadFormatPreference.bestAvailable
+        let encodedBestAvailable = try JSONEncoder().encode(bestAvailable)
+        try assert(
+            String(decoding: encodedBestAvailable, as: UTF8.self) == #""bestAvailable""#,
+            "Best available should use the current persistence value"
+        )
+
+        let legacyOriginal = try JSONDecoder().decode(
+            MediaDownloadFormatPreference.self,
+            from: Data(#""original""#.utf8)
+        )
+        let legacyBestMP4 = try JSONDecoder().decode(
+            MediaDownloadFormatPreference.self,
+            from: Data(#""bestMP4""#.utf8)
+        )
+        try assert(
+            legacyOriginal == .bestAvailable && legacyBestMP4 == .bestAvailable,
+            "Legacy automatic format preferences should migrate to Best available"
+        )
+
+        let legacySpecific = try JSONDecoder().decode(
+            MediaDownloadFormatPreference.self,
+            from: Data(#"{"kind":"specific","optionID":"137+140"}"#.utf8)
+        )
+        guard case let .specific(legacySelection) = legacySpecific else {
+            throw TestFailure("Legacy exact format preference should remain exact")
+        }
+        try assert(
+            legacySelection.selector == "137+140" && legacySelection.requiresFormatProbe,
+            "Legacy exact format preferences should request one fresh format probe"
+        )
+
+        let compactSelection = try JSONDecoder().decode(
+            MediaDownloadFormatPreference.self,
+            from: Data(
+                #"""
+                {
+                  "kind": "specific",
+                  "selection": {
+                    "selector": "137+140",
+                    "mergeOutputFormat": "mp4",
+                    "displaySummary": "1080p • MP4 • AVC1",
+                    "estimatedBytes": 4100000
+                  }
+                }
+                """#.utf8
+            )
+        )
+        guard case let .specific(upgradeSelection) = compactSelection else {
+            throw TestFailure("A compact exact format preference should remain exact")
+        }
+        try assert(
+            upgradeSelection.requiresFormatProbe,
+            "Selections saved before separate stream IDs should request one fresh format probe"
+        )
+        let capabilities = MediaDownloadCapabilities(
+            formatOptions: [videoFormat, audioFormat]
+        )
+        let upgradedSelection = capabilities.resolvedSelection(
+            matching: upgradeSelection
+        )
+        try assert(
+            upgradedSelection?.formatID == "137"
+                && upgradedSelection?.audioFormatID == "140",
+            "A compact selector should upgrade to separate video and audio IDs after probing"
+        )
+    }
+
+    private static func testLegacyMetadataDecoding() throws {
+        let json = """
+        {
+          "title": "Legacy Video",
+          "platform": "Youtube",
+          "extractorKey": "Youtube",
+          "thumbnailURL": null,
+          "webpageURL": "https://www.youtube.com/watch?v=legacy",
+          "expectedBytes": 4096,
+          "mediaType": "video",
+          "entryCount": 1
+        }
+        """.data(using: .utf8)!
+
+        let metadata = try JSONDecoder().decode(MediaDownloadMetadata.self, from: json)
+        try assert(
+            metadata.capabilities == .unavailable,
+            "Missing legacy capabilities should decode as unavailable"
+        )
     }
 
     private static func testProgressAndFinalPathParsers() throws {
