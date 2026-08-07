@@ -688,6 +688,12 @@ final class DownloadCenter {
         schedulePersist()
     }
 
+    func queueDownloads(_ requests: [AddDownloadRequest]) {
+        for request in requests {
+            queueDownload(request)
+        }
+    }
+
     func queueDownload(_ request: AddDownloadRequest) {
         if request.sourceKind == .torrentFile {
             Task { @MainActor [weak self] in

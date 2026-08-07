@@ -56,8 +56,8 @@ struct RootView: View {
                 mediaPreviewProvider: { url in
                     try await center.previewMediaDownload(for: url)
                 }
-            ) { request in
-                center.queueDownload(request)
+            ) { requests in
+                center.queueDownloads(requests)
             }
         }
         .sheet(

@@ -13,6 +13,13 @@ enum DownloadSourceImportService {
         deduplicatedSupportedURLs(urls)
     }
 
+    /// Parses free-form text (for example a pasted list with one link per line)
+    /// into the supported download URLs it contains, preserving order and
+    /// removing duplicates.
+    static func supportedURLs(fromText text: String) -> [URL] {
+        urls(from: text)
+    }
+
     @MainActor
     static func supportedURLs(from pasteboard: NSPasteboard = .general) -> [URL] {
         var collectedURLs: [URL] = []
@@ -158,7 +165,11 @@ enum DownloadSourceImportService {
         }
 
         var urls: [URL] = []
-        if let url = supportedURL(from: trimmedString) {
+        // Only treat the whole string as a single URL when it is one token.
+        // Otherwise a multi-line or space-separated list gets percent-encoded
+        // by URL(string:) into one bogus URL instead of being tokenized.
+        if trimmedString.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+           let url = supportedURL(from: trimmedString) {
             urls.append(url)
         }
 

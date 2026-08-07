@@ -47,6 +47,7 @@ If you want a downloader that respects the platform, respects your machine, and 
 - Local-first and privacy-friendly by design
 - Direct HTTP and HTTPS downloads
 - Magnet link and local `.torrent` support
+- Batch add: paste many links, pick one folder, queue them all at once
 - Queue persistence across launches
 - Pause, resume, retry, cancel, and history flows
 - Finder reveal and open-file actions
