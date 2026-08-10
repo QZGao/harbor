@@ -134,6 +134,7 @@ struct DownloadRecord: Codable, Sendable {
     let metadataName: String?
     let mediaMetadata: MediaDownloadMetadata?
     let mediaFormatPreference: MediaDownloadFormatPreference?
+    let requiresMediaRecoveryReset: Bool
     let downloadLimitOverride: TransferLimitOverride
     let uploadLimitOverride: TransferLimitOverride
     let torrentFingerprint: String?
@@ -167,6 +168,7 @@ struct DownloadRecord: Codable, Sendable {
         case metadataName
         case mediaMetadata
         case mediaFormatPreference
+        case requiresMediaRecoveryReset
         case downloadLimitOverride
         case uploadLimitOverride
         case torrentFingerprint
@@ -201,6 +203,7 @@ struct DownloadRecord: Codable, Sendable {
         metadataName: String?,
         mediaMetadata: MediaDownloadMetadata? = nil,
         mediaFormatPreference: MediaDownloadFormatPreference? = nil,
+        requiresMediaRecoveryReset: Bool = false,
         downloadLimitOverride: TransferLimitOverride = .inherit,
         uploadLimitOverride: TransferLimitOverride = .inherit,
         torrentFingerprint: String? = nil,
@@ -233,6 +236,7 @@ struct DownloadRecord: Codable, Sendable {
         self.metadataName = metadataName
         self.mediaMetadata = mediaMetadata
         self.mediaFormatPreference = mediaFormatPreference
+        self.requiresMediaRecoveryReset = requiresMediaRecoveryReset
         self.downloadLimitOverride = downloadLimitOverride
         self.uploadLimitOverride = uploadLimitOverride
         self.torrentFingerprint = torrentFingerprint
@@ -269,6 +273,10 @@ struct DownloadRecord: Codable, Sendable {
         self.metadataName = try container.decodeIfPresent(String.self, forKey: .metadataName)
         self.mediaMetadata = try container.decodeIfPresent(MediaDownloadMetadata.self, forKey: .mediaMetadata)
         self.mediaFormatPreference = try container.decodeIfPresent(MediaDownloadFormatPreference.self, forKey: .mediaFormatPreference)
+        self.requiresMediaRecoveryReset = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .requiresMediaRecoveryReset
+        ) ?? false
         self.downloadLimitOverride = try container.decodeIfPresent(
             TransferLimitOverride.self,
             forKey: .downloadLimitOverride
@@ -323,6 +331,7 @@ struct DownloadRecord: Codable, Sendable {
         try container.encode(metadataName, forKey: .metadataName)
         try container.encode(mediaMetadata, forKey: .mediaMetadata)
         try container.encode(mediaFormatPreference, forKey: .mediaFormatPreference)
+        try container.encode(requiresMediaRecoveryReset, forKey: .requiresMediaRecoveryReset)
         try container.encode(downloadLimitOverride, forKey: .downloadLimitOverride)
         try container.encode(uploadLimitOverride, forKey: .uploadLimitOverride)
         try container.encode(torrentFingerprint, forKey: .torrentFingerprint)
@@ -372,6 +381,7 @@ final class DownloadItem: Identifiable {
     var metadataName: String?
     var mediaMetadata: MediaDownloadMetadata?
     var mediaFormatPreference: MediaDownloadFormatPreference?
+    var requiresMediaRecoveryReset: Bool
     var downloadLimitOverride: TransferLimitOverride
     var uploadLimitOverride: TransferLimitOverride
     var torrentFingerprint: String?
@@ -408,6 +418,7 @@ final class DownloadItem: Identifiable {
         metadataName: String? = nil,
         mediaMetadata: MediaDownloadMetadata? = nil,
         mediaFormatPreference: MediaDownloadFormatPreference? = nil,
+        requiresMediaRecoveryReset: Bool = false,
         downloadLimitOverride: TransferLimitOverride = .inherit,
         uploadLimitOverride: TransferLimitOverride = .inherit,
         torrentFingerprint: String? = nil,
@@ -443,6 +454,7 @@ final class DownloadItem: Identifiable {
         self.metadataName = metadataName
         self.mediaMetadata = mediaMetadata
         self.mediaFormatPreference = mediaFormatPreference
+        self.requiresMediaRecoveryReset = requiresMediaRecoveryReset
         self.downloadLimitOverride = downloadLimitOverride
         self.uploadLimitOverride = uploadLimitOverride
         self.torrentFingerprint = torrentFingerprint
@@ -489,6 +501,7 @@ final class DownloadItem: Identifiable {
             metadataName: record.metadataName,
             mediaMetadata: record.mediaMetadata,
             mediaFormatPreference: record.mediaFormatPreference,
+            requiresMediaRecoveryReset: record.requiresMediaRecoveryReset,
             downloadLimitOverride: record.downloadLimitOverride,
             uploadLimitOverride: record.uploadLimitOverride,
             torrentFingerprint: record.torrentFingerprint,
@@ -499,6 +512,43 @@ final class DownloadItem: Identifiable {
             completionNotificationDelivered: record.completionNotificationDelivered,
             activityEvents: record.activityEvents
         )
+    }
+
+    func restorePersistedState(from record: DownloadRecord) {
+        precondition(record.id == id && record.createdAt == createdAt)
+        sourceURL = record.sourceURL
+        sourceKind = record.sourceKind
+        backend = record.backend
+        preferredFilename = record.preferredFilename
+        destinationFolderPath = record.destinationFolderPath
+        fileLocationPath = record.fileLocationPath
+        status = record.status
+        progress = record.progress
+        bytesWritten = record.bytesWritten
+        expectedBytes = record.expectedBytes
+        speedBytesPerSecond = 0
+        uploadBytesPerSecond = 0
+        startedAt = record.startedAt
+        finishedAt = record.finishedAt
+        updatedAt = record.updatedAt
+        lastError = record.lastError
+        resumeData = record.resumeData
+        browserResumeData = record.browserResumeData
+        taskIdentifier = nil
+        backendIdentifier = record.backendIdentifier
+        metadataName = record.metadataName
+        mediaMetadata = record.mediaMetadata
+        mediaFormatPreference = record.mediaFormatPreference
+        requiresMediaRecoveryReset = record.requiresMediaRecoveryReset
+        downloadLimitOverride = record.downloadLimitOverride
+        uploadLimitOverride = record.uploadLimitOverride
+        torrentFingerprint = record.torrentFingerprint
+        managedTorrentSourcePath = record.managedTorrentSourcePath
+        torrentPayloadPaths = record.torrentPayloadPaths
+        shouldSeedAfterDownload = record.shouldSeedAfterDownload
+        removeOriginalTorrentAfterImport = record.removeOriginalTorrentAfterImport
+        completionNotificationDelivered = record.completionNotificationDelivered
+        activityEvents = record.activityEvents
     }
 
     var displayName: String {
@@ -696,6 +746,7 @@ final class DownloadItem: Identifiable {
             metadataName: metadataName,
             mediaMetadata: mediaMetadata?.persistenceSnapshot,
             mediaFormatPreference: mediaFormatPreference,
+            requiresMediaRecoveryReset: requiresMediaRecoveryReset,
             downloadLimitOverride: downloadLimitOverride,
             uploadLimitOverride: uploadLimitOverride,
             torrentFingerprint: torrentFingerprint,

@@ -20,8 +20,11 @@ final class HarborAppDelegate: NSObject, NSApplicationDelegate {
 
         isTerminating = true
         Task { @MainActor in
-            await center.shutdownForTermination()
-            sender.reply(toApplicationShouldTerminate: true)
+            let didSave = await center.shutdownForTermination()
+            if didSave == false {
+                isTerminating = false
+            }
+            sender.reply(toApplicationShouldTerminate: didSave)
         }
         return .terminateLater
     }

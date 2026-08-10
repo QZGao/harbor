@@ -29,9 +29,16 @@ struct DirectDownloadRecoverySnapshot: Equatable, Sendable {
     let metadata: DirectDownloadRecoveryMetadata
 }
 
+enum DirectDownloadRecoveryLookup: Sendable {
+    case available(DirectDownloadRecoverySnapshot)
+    case absent
+    case unavailable(String)
+}
+
 enum DirectDownloadRecoveryResetReason: Equatable, Sendable {
     case missingValidator
     case sourceChanged
+    case invalidLength
     case serverRejectedRange
 }
 
@@ -41,6 +48,20 @@ struct DirectDownloadRecoveryPreparation: Sendable {
 }
 
 final class DirectDownloadRecoveryStore: @unchecked Sendable {
+    private enum IntegrityError: Error {
+        case invalidMetadata
+        case invalidPartial
+
+        var resetReason: DirectDownloadRecoveryResetReason {
+            switch self {
+            case .invalidMetadata:
+                .missingValidator
+            case .invalidPartial:
+                .invalidLength
+            }
+        }
+    }
+
     private let fileManager: FileManager
     private let directoryURL: URL
     private let lock = NSLock()
@@ -60,21 +81,29 @@ final class DirectDownloadRecoveryStore: @unchecked Sendable {
         sourceURL: URL
     ) throws -> DirectDownloadRecoveryPreparation {
         try withLock {
-            let partialURL = partialURL(for: id)
-            let bytesWritten = try fileSizeIfPresent(at: partialURL) ?? 0
+            let bytesWritten: Int64
+            do {
+                bytesWritten = try fileSizeIfPresent(at: partialURL(for: id)) ?? 0
+            } catch let error as IntegrityError {
+                try discardLocked(id: id)
+                return DirectDownloadRecoveryPreparation(
+                    snapshot: nil,
+                    resetReason: error.resetReason
+                )
+            }
             guard bytesWritten > 0 else {
-                try removeItemIfPresent(at: metadataURL(for: id))
+                try discardLocked(id: id)
                 return DirectDownloadRecoveryPreparation(snapshot: nil, resetReason: nil)
             }
 
             let metadata: DirectDownloadRecoveryMetadata?
             do {
                 metadata = try loadMetadata(id: id)
-            } catch {
+            } catch let error as IntegrityError {
                 try discardLocked(id: id)
                 return DirectDownloadRecoveryPreparation(
                     snapshot: nil,
-                    resetReason: .missingValidator
+                    resetReason: error.resetReason
                 )
             }
 
@@ -102,6 +131,14 @@ final class DirectDownloadRecoveryStore: @unchecked Sendable {
                 )
             }
 
+            guard metadata.expectedBytes <= 0 || bytesWritten <= metadata.expectedBytes else {
+                try discardLocked(id: id)
+                return DirectDownloadRecoveryPreparation(
+                    snapshot: nil,
+                    resetReason: .invalidLength
+                )
+            }
+
             return DirectDownloadRecoveryPreparation(
                 snapshot: DirectDownloadRecoverySnapshot(
                     bytesWritten: bytesWritten,
@@ -116,24 +153,52 @@ final class DirectDownloadRecoveryStore: @unchecked Sendable {
         id: UUID,
         sourceURL: URL
     ) -> DirectDownloadRecoverySnapshot? {
-        withLock { () -> DirectDownloadRecoverySnapshot? in
-            guard let bytesWritten = try? fileSizeIfPresent(at: partialURL(for: id)),
-                  bytesWritten > 0 else {
-                try? discardLocked(id: id)
-                return nil
-            }
+        guard case let .available(snapshot) = lookup(id: id, sourceURL: sourceURL) else {
+            return nil
+        }
+        return snapshot
+    }
 
-            guard let metadata = try? loadMetadata(id: id),
-                  metadata.sourceURL == sourceURL,
-                  metadata.ifRangeValidator != nil else {
-                try? discardLocked(id: id)
-                return nil
-            }
+    func lookup(
+        id: UUID,
+        sourceURL: URL
+    ) -> DirectDownloadRecoveryLookup {
+        withLock { () -> DirectDownloadRecoveryLookup in
+            do {
+                guard let bytesWritten = try fileSizeIfPresent(at: partialURL(for: id)),
+                      bytesWritten > 0 else {
+                    try discardLocked(id: id)
+                    return .absent
+                }
 
-            return DirectDownloadRecoverySnapshot(
-                bytesWritten: bytesWritten,
-                metadata: metadata
-            )
+                guard let metadata = try loadMetadata(id: id),
+                      metadata.sourceURL == sourceURL,
+                      metadata.ifRangeValidator != nil,
+                      metadata.expectedBytes <= 0 || bytesWritten <= metadata.expectedBytes else {
+                    try discardLocked(id: id)
+                    return .absent
+                }
+
+                return .available(
+                    DirectDownloadRecoverySnapshot(
+                        bytesWritten: bytesWritten,
+                        metadata: metadata
+                    )
+                )
+            } catch is IntegrityError {
+                do {
+                    try discardLocked(id: id)
+                    return .absent
+                } catch {
+                    return .unavailable(error.localizedDescription)
+                }
+            } catch {
+                // Operational failures (for example, a temporarily
+                // inaccessible volume) are not evidence that the recovery
+                // data is invalid. Leave both files untouched so a later
+                // lookup can recover them.
+                return .unavailable(error.localizedDescription)
+            }
         }
     }
 
@@ -178,7 +243,10 @@ final class DirectDownloadRecoveryStore: @unchecked Sendable {
         try withLock {
             try createDirectoryIfNeeded()
             let data = try JSONEncoder().encode(metadata)
-            try data.write(to: metadataURL(for: id), options: .atomic)
+            let destinationURL = metadataURL(for: id)
+            try data.write(to: destinationURL, options: .atomic)
+            try DurableFileSystem.synchronizeFile(at: destinationURL)
+            try DurableFileSystem.synchronizeParentDirectory(of: destinationURL)
         }
     }
 
@@ -188,24 +256,36 @@ final class DirectDownloadRecoveryStore: @unchecked Sendable {
         } ?? nil
     }
 
-    func takeCompletedFile(
+    func publishCompletedPayload<T>(
         id: UUID,
-        destinationURL: URL
-    ) throws {
+        expectedBytes: Int64,
+        _ publish: (URL) throws -> T
+    ) throws -> T {
         try withLock {
-            try fileManager.createDirectory(
-                at: destinationURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try removeItemIfPresent(at: destinationURL)
-            try fileManager.moveItem(at: partialURL(for: id), to: destinationURL)
-            try? removeItemIfPresent(at: metadataURL(for: id))
+            let url = partialURL(for: id)
+            let actualBytes = try fileSizeIfPresent(at: url)
+            guard let actualBytes,
+                  actualBytes >= 0,
+                  expectedBytes <= 0 || actualBytes == expectedBytes else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+
+            // Keep the recovery lease while the immutable completion store
+            // claims the file. Otherwise cancellation or a same-ID restart can
+            // replace/delete the path after validation but before publication.
+            let result = try publish(url)
+            try? discardLocked(id: id)
+            return result
         }
     }
 
     func discard(id: UUID) {
-        withLock {
-            try? discardLocked(id: id)
+        try? discardThrowing(id: id)
+    }
+
+    func discardThrowing(id: UUID) throws {
+        try withLock {
+            try discardLocked(id: id)
         }
     }
 
@@ -241,30 +321,47 @@ final class DirectDownloadRecoveryStore: @unchecked Sendable {
 
     private func loadMetadata(id: UUID) throws -> DirectDownloadRecoveryMetadata? {
         let url = metadataURL(for: id)
-        guard fileManager.fileExists(atPath: url.path) else {
+        guard try itemExists(at: url) else {
             return nil
         }
 
-        return try JSONDecoder().decode(
-            DirectDownloadRecoveryMetadata.self,
-            from: Data(contentsOf: url)
-        )
+        let data = try Data(contentsOf: url)
+        do {
+            return try JSONDecoder().decode(
+                DirectDownloadRecoveryMetadata.self,
+                from: data
+            )
+        } catch {
+            throw IntegrityError.invalidMetadata
+        }
     }
 
     private func fileSizeIfPresent(at url: URL) throws -> Int64? {
-        guard fileManager.fileExists(atPath: url.path) else {
+        guard try itemExists(at: url) else {
             return nil
         }
 
-        let attributes = try fileManager.attributesOfItem(atPath: url.path)
-        return (attributes[.size] as? NSNumber)?.int64Value
+        let values = try url.resourceValues(
+            forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey]
+        )
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let fileSize = values.fileSize,
+              fileSize >= 0 else {
+            throw IntegrityError.invalidPartial
+        }
+        return Int64(fileSize)
     }
 
     private func createDirectoryIfNeeded() throws {
+        let alreadyExists = fileManager.fileExists(atPath: directoryURL.path)
         try fileManager.createDirectory(
             at: directoryURL,
             withIntermediateDirectories: true
         )
+        if alreadyExists == false {
+            try DurableFileSystem.synchronizeParentDirectory(of: directoryURL)
+        }
     }
 
     private func discardLocked(id: UUID) throws {
@@ -273,10 +370,24 @@ final class DirectDownloadRecoveryStore: @unchecked Sendable {
     }
 
     private func removeItemIfPresent(at url: URL) throws {
-        guard fileManager.fileExists(atPath: url.path) else {
+        guard try itemExists(at: url) else {
             return
         }
         try fileManager.removeItem(at: url)
+        try DurableFileSystem.synchronizeParentDirectory(of: url)
+    }
+
+    private func itemExists(at url: URL) throws -> Bool {
+        do {
+            _ = try url.resourceValues(
+                forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+            )
+            return true
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return false
+        } catch let error as POSIXError where error.code == .ENOENT {
+            return false
+        }
     }
 
     private func withLock<T>(_ work: () throws -> T) rethrows -> T {

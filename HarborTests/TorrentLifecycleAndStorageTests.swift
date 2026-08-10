@@ -141,6 +141,13 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
 
         center.removeDownload(id: item.id)
 
+        for _ in 0 ..< 100 {
+            if center.downloads.isEmpty {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
         XCTAssertTrue(center.downloads.isEmpty)
         XCTAssertFalse(fileManager.fileExists(atPath: torrentURL.path))
         XCTAssertTrue(fileManager.fileExists(atPath: payloadURL.path))
