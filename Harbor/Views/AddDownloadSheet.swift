@@ -391,8 +391,9 @@ struct AddDownloadSheet: View {
         case .torrentFile:
             return settings.torrentDestinationPath
         case .linkOrMagnet:
-            guard let parsedLinkURL,
-                  let sourceKind = DownloadSourceKind.detect(from: parsedLinkURL) else {
+            let sourceURL = isBatchEntry ? parsedBatchURLs.first : parsedLinkURL
+            guard let sourceURL,
+                  let sourceKind = DownloadSourceKind.detect(from: sourceURL) else {
                 return settings.defaultDestinationPath
             }
 
@@ -417,7 +418,7 @@ struct AddDownloadSheet: View {
         switch entryMode {
         case .linkOrMagnet:
             if isBatchEntry {
-                return true
+                return parsedBatchURLs.isEmpty == false
             }
 
             let trimmedURL = sourceURLText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -455,32 +456,28 @@ struct AddDownloadSheet: View {
         return URL(string: trimmedURL)
     }
 
-    // The supported links found in the source field. When more than one is
-    // present the sheet switches to batch mode: every link is queued to the
-    // shared destination and the single-link extras (file name override, media
-    // preview) are hidden.
+    private var batchEntries: [DownloadSourceImportService.TextEntry] {
+        DownloadSourceImportService.textEntries(from: sourceURLText)
+    }
+
+    // Multiple entered lines switch the sheet to batch mode even when some
+    // lines are invalid or duplicates. This keeps those lines from being
+    // percent-encoded into one bogus URL by Foundation's lenient parser.
     private var parsedBatchURLs: [URL] {
-        DownloadSourceImportService.supportedURLs(fromText: sourceURLText)
+        batchEntries.compactMap(\.url)
     }
 
     private var isBatchEntry: Bool {
-        entryMode == .linkOrMagnet && parsedBatchURLs.count > 1
+        entryMode == .linkOrMagnet && batchEntries.count > 1
     }
 
     private var skippedBatchLineCount: Int {
-        sourceURLText
-            .split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { line in
-                line.isEmpty == false
-                    && DownloadSourceImportService.supportedURLs(fromText: line).isEmpty
-            }
-            .count
+        batchEntries.filter { $0.status != .ready }.count
     }
 
     @ViewBuilder
     private var batchSummaryRow: some View {
-        LabeledContent("Links") {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 Label(batchReadyDescription, systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
@@ -493,6 +490,56 @@ struct AddDownloadSheet: View {
                 }
             }
             .font(.callout)
+
+            ScrollView {
+                LazyVStack(spacing: 6) {
+                    ForEach(batchEntries) { entry in
+                        HStack(spacing: 8) {
+                            Image(systemName: batchEntrySystemImage(for: entry.status))
+                                .foregroundStyle(batchEntryColor(for: entry.status))
+                            Text(entry.text)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 8)
+                            Text(batchEntryStatusTitle(for: entry.status))
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.caption)
+                    }
+                }
+            }
+            .frame(maxHeight: 140)
+        }
+    }
+
+    private func batchEntrySystemImage(for status: DownloadSourceImportService.TextEntry.Status) -> String {
+        switch status {
+        case .ready:
+            "checkmark.circle.fill"
+        case .duplicate:
+            "doc.on.doc.fill"
+        case .unsupported:
+            "exclamationmark.triangle.fill"
+        }
+    }
+
+    private func batchEntryColor(for status: DownloadSourceImportService.TextEntry.Status) -> Color {
+        switch status {
+        case .ready:
+            .green
+        case .duplicate, .unsupported:
+            .orange
+        }
+    }
+
+    private func batchEntryStatusTitle(for status: DownloadSourceImportService.TextEntry.Status) -> LocalizedStringKey {
+        switch status {
+        case .ready:
+            "Ready"
+        case .duplicate:
+            "Duplicate"
+        case .unsupported:
+            "Skipped"
         }
     }
 

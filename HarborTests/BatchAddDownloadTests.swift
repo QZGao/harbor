@@ -42,6 +42,31 @@ final class BatchAddDownloadTests: XCTestCase {
         )
     }
 
+    func testTextEntriesKeepOneValidURLWhenOtherLinesAreSkipped() {
+        let text = """
+        https://example.com/a.zip
+        not a url at all
+        https://example.com/a.zip
+        """
+
+        let entries = DownloadSourceImportService.textEntries(from: text)
+
+        XCTAssertEqual(entries.map(\.status), [.ready, .unsupported, .duplicate])
+        XCTAssertEqual(
+            entries.compactMap(\.url).map(\.absoluteString),
+            ["https://example.com/a.zip"]
+        )
+    }
+
+    func testSupportedURLsFromTextPreservesTorrentPathWithSpaces() {
+        let path = "/tmp/Harbor Batch/My File.torrent"
+
+        let urls = DownloadSourceImportService.supportedURLs(fromText: path)
+
+        XCTAssertEqual(urls.count, 1)
+        XCTAssertEqual(urls.first?.standardizedFileURL.path, path)
+    }
+
     func testBatchRequestsShareDestinationAndStartBehavior() {
         let destination = URL(fileURLWithPath: "/tmp/harbor-batch", isDirectory: true)
         let urls = [

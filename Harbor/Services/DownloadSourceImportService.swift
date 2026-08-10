@@ -3,6 +3,19 @@ import Foundation
 import UniformTypeIdentifiers
 
 enum DownloadSourceImportService {
+    struct TextEntry: Identifiable, Equatable {
+        enum Status: Equatable {
+            case ready
+            case duplicate
+            case unsupported
+        }
+
+        let id: Int
+        let text: String
+        let url: URL?
+        let status: Status
+    }
+
     static let supportedContentTypes: [UTType] = [
         .fileURL,
         .url,
@@ -18,6 +31,27 @@ enum DownloadSourceImportService {
     /// removing duplicates.
     static func supportedURLs(fromText text: String) -> [URL] {
         urls(from: text)
+    }
+
+    static func textEntries(from text: String) -> [TextEntry] {
+        let lines = text
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.isEmpty == false }
+
+        var seenKeys = Set<String>()
+        return lines.enumerated().map { index, line in
+            let lineURLs = urls(from: line)
+            guard lineURLs.count == 1, let url = lineURLs.first else {
+                return TextEntry(id: index, text: line, url: nil, status: .unsupported)
+            }
+
+            guard seenKeys.insert(deduplicationKey(for: url)).inserted else {
+                return TextEntry(id: index, text: line, url: nil, status: .duplicate)
+            }
+
+            return TextEntry(id: index, text: line, url: url, status: .ready)
+        }
     }
 
     @MainActor
@@ -164,22 +198,29 @@ enum DownloadSourceImportService {
             return []
         }
 
-        var urls: [URL] = []
-        // Only treat the whole string as a single URL when it is one token.
-        // Otherwise a multi-line or space-separated list gets percent-encoded
-        // by URL(string:) into one bogus URL instead of being tokenized.
-        if trimmedString.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
-           let url = supportedURL(from: trimmedString) {
-            urls.append(url)
+        let containsWhitespace = trimmedString.rangeOfCharacter(from: .whitespacesAndNewlines) != nil
+        if containsWhitespace == false, let url = supportedURL(from: trimmedString) {
+            return [url]
+        }
+
+        // Keep text representations of local torrent files intact. Splitting a
+        // path such as `/Downloads/My File.torrent` would otherwise resolve only
+        // its final token against Harbor's working directory.
+        if let fileURL = URL(string: trimmedString),
+           fileURL.isFileURL,
+           DownloadSourceKind.detect(from: fileURL) == .torrentFile {
+            return [fileURL]
+        }
+
+        if let localTorrentURL = localTorrentURL(from: trimmedString) {
+            return [localTorrentURL]
         }
 
         let tokenSeparators = CharacterSet.whitespacesAndNewlines
         let tokenURLs = trimmedString
             .components(separatedBy: tokenSeparators)
             .compactMap { supportedURL(from: $0) }
-
-        urls.append(contentsOf: tokenURLs)
-        return deduplicatedSupportedURLs(urls)
+        return deduplicatedSupportedURLs(tokenURLs)
     }
 
     private static func supportedURL(from candidate: String) -> URL? {
@@ -193,11 +234,20 @@ enum DownloadSourceImportService {
             return url
         }
 
+        return localTorrentURL(from: trimmedCandidate)
+    }
+
+    private static func localTorrentURL(from candidate: String) -> URL? {
+        guard candidate.contains("://") == false,
+              candidate.lowercased().hasPrefix("magnet:") == false else {
+            return nil
+        }
+
         let expandedPath: String
-        if trimmedCandidate.hasPrefix("~/") {
-            expandedPath = NSString(string: trimmedCandidate).expandingTildeInPath
+        if candidate.hasPrefix("~/") {
+            expandedPath = NSString(string: candidate).expandingTildeInPath
         } else {
-            expandedPath = trimmedCandidate
+            expandedPath = candidate
         }
 
         let fileURL = URL(fileURLWithPath: expandedPath)
@@ -217,7 +267,7 @@ enum DownloadSourceImportService {
                 continue
             }
 
-            let key = url.isFileURL ? url.standardizedFileURL.path : url.absoluteString
+            let key = deduplicationKey(for: url)
             guard seenKeys.insert(key).inserted else {
                 continue
             }
@@ -226,5 +276,9 @@ enum DownloadSourceImportService {
         }
 
         return supportedURLs
+    }
+
+    private static func deduplicationKey(for url: URL) -> String {
+        url.isFileURL ? url.standardizedFileURL.path : url.absoluteString
     }
 }
