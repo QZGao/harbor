@@ -28,7 +28,7 @@ enum MediaDownloadError: LocalizedError {
 }
 
 actor MediaDownloadService {
-    typealias EventHandler = @Sendable (MediaDownloadEvent) -> Void
+    typealias EventHandler = @Sendable (UUID, MediaDownloadEvent) -> Void
 
     private enum TerminationReason {
         case pause
@@ -37,6 +37,7 @@ actor MediaDownloadService {
 
     private struct RunningDownload {
         let id: UUID
+        let attemptIdentifier: UUID
         let process: ManagedChildProcess
         let destinationFolder: URL
         let temporaryFolder: URL
@@ -69,11 +70,12 @@ actor MediaDownloadService {
 
     init(
         eventHandler: @escaping EventHandler,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        temporaryRoot: URL? = nil
     ) {
         self.eventHandler = eventHandler
         self.fileManager = fileManager
-        self.temporaryRoot = Self.defaultTemporaryRoot(fileManager: fileManager)
+        self.temporaryRoot = temporaryRoot ?? Self.defaultTemporaryRoot(fileManager: fileManager)
     }
 
     func metadata(for url: URL) async throws -> MediaDownloadMetadata {
@@ -92,6 +94,7 @@ actor MediaDownloadService {
 
     func startDownload(
         id: UUID,
+        attemptIdentifier: UUID,
         sourceURL: URL,
         destinationFolder: URL,
         metadata: MediaDownloadMetadata?,
@@ -146,6 +149,7 @@ actor MediaDownloadService {
         )
         runningDownloads[id] = RunningDownload(
             id: id,
+            attemptIdentifier: attemptIdentifier,
             process: process,
             destinationFolder: destinationFolder,
             temporaryFolder: temporaryFolder,
@@ -155,6 +159,7 @@ actor MediaDownloadService {
 
         logger.info("Started media download \(id.uuidString, privacy: .public) with pid \(process.processIdentifier, privacy: .public)")
         eventHandler(
+            attemptIdentifier,
             .started(
                 id: id,
                 processIdentifier: process.processIdentifier,
@@ -191,9 +196,53 @@ actor MediaDownloadService {
         return true
     }
 
-    @discardableResult
-    func remove(id: UUID) -> Bool {
-        cancel(id: id)
+    func pauseAndWait(id: UUID) async {
+        guard pause(id: id) else {
+            return
+        }
+
+        await waitForTermination(id: id)
+    }
+
+    func discardRecoveryData(id: UUID) throws {
+        guard runningDownloads[id] == nil else {
+            throw MediaDownloadError.unavailable(
+                "Harbor couldn’t clear the previous media download while it was still running."
+            )
+        }
+
+        let folder = temporaryFolder(for: id)
+        guard fileManager.fileExists(atPath: folder.path) else {
+            return
+        }
+        try fileManager.removeItem(at: folder)
+    }
+
+    func discardOrphanedRecoveryData(retaining retainedIDs: Set<UUID>) {
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: temporaryRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+
+        let runningProcessCommands = runningProcesses().map(\.command)
+        for entry in entries {
+            guard let id = UUID(uuidString: entry.lastPathComponent),
+                  (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
+                  retainedIDs.contains(id) == false,
+                  runningProcessCommands.contains(where: { $0.contains(entry.path) }) == false,
+                  runningDownloads[id] == nil else {
+                continue
+            }
+
+            do {
+                try fileManager.removeItem(at: entry)
+            } catch {
+                logger.error("Could not remove orphaned media recovery data at \(entry.path, privacy: .private): \(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 
     func cancelAndWait(id: UUID) async {
@@ -201,6 +250,15 @@ actor MediaDownloadService {
             return
         }
 
+        await waitForTermination(id: id)
+    }
+
+    func cancelAndDiscardRecoveryData(id: UUID) async {
+        await cancelAndWait(id: id)
+        try? discardRecoveryData(id: id)
+    }
+
+    private func waitForTermination(id: UUID) async {
         await withCheckedContinuation { continuation in
             guard runningDownloads[id] != nil else {
                 continuation.resume()
@@ -215,7 +273,9 @@ actor MediaDownloadService {
         let downloads = Array(runningDownloads.values)
         for download in downloads {
             var updatedDownload = download
-            updatedDownload.terminationReason = .pause
+            if updatedDownload.terminationReason == nil {
+                updatedDownload.terminationReason = .pause
+            }
             runningDownloads[download.id] = updatedDownload
             download.process.terminate(grace: 0.6)
         }
@@ -283,6 +343,7 @@ actor MediaDownloadService {
         runningDownloads[id] = download
 
         eventHandler(
+            download.attemptIdentifier,
             .progress(
                 id: id,
                 bytesWritten: progress.bytesWritten,
@@ -309,19 +370,24 @@ actor MediaDownloadService {
 
         switch download.terminationReason {
         case .pause:
-            eventHandler(.paused(id: id))
+            eventHandler(download.attemptIdentifier, .paused(id: id))
             return
         case .cancel:
             cleanupTemporaryFolder(download.temporaryFolder)
-            eventHandler(.cancelled(id: id))
+            eventHandler(download.attemptIdentifier, .cancelled(id: id))
             return
         case nil:
             break
         }
 
         guard termination.isSuccess else {
-            cleanupTemporaryFolder(download.temporaryFolder)
-            eventHandler(.failed(id: id, message: MediaDownloadErrorClassifier.message(from: download.stderrBuffer)))
+            eventHandler(
+                download.attemptIdentifier,
+                .failed(
+                    id: id,
+                    message: MediaDownloadErrorClassifier.message(from: download.stderrBuffer)
+                )
+            )
             return
         }
 
@@ -332,6 +398,7 @@ actor MediaDownloadService {
             : (download.lastFileURL ?? newestFile(in: download.destinationFolder) ?? download.destinationFolder)
 
         eventHandler(
+            download.attemptIdentifier,
             .finished(
                 id: id,
                 fileURL: fileURL,
@@ -363,6 +430,14 @@ actor MediaDownloadService {
             "--no-warnings",
             "--socket-timeout",
             "15",
+            "--retries",
+            "3",
+            "--extractor-retries",
+            "3",
+            "--retry-sleep",
+            "http:linear=2:10:4",
+            "--retry-sleep",
+            "extractor:linear=2:10:4",
             "--dump-single-json",
             "--flat-playlist",
             "--simulate",
@@ -402,6 +477,9 @@ actor MediaDownloadService {
                     )
 
                     state.process = process
+                    if Task.isCancelled {
+                        process.terminate(grace: 0.2)
+                    }
 
                     Task {
                         try? await Task.sleep(for: .seconds(120))
@@ -442,6 +520,22 @@ actor MediaDownloadService {
             "--no-overwrites",
             "--socket-timeout",
             "15",
+            "--retries",
+            "10",
+            "--fragment-retries",
+            "10",
+            "--file-access-retries",
+            "3",
+            "--extractor-retries",
+            "3",
+            "--retry-sleep",
+            "http:exp=2:60",
+            "--retry-sleep",
+            "fragment:exp=2:60",
+            "--retry-sleep",
+            "file_access:exp=2:60",
+            "--retry-sleep",
+            "extractor:exp=2:60",
             "--paths",
             "home:\(destinationFolder.path)",
             "--paths",

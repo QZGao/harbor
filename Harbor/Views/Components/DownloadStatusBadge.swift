@@ -7,7 +7,7 @@ struct DownloadStatusBadge: View {
         switch status {
         case .queued:
             .secondary
-        case .preparing:
+        case .preparing, .waitingToRetry:
             .orange
         case .downloading:
             .blue

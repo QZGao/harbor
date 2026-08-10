@@ -5,6 +5,12 @@ import Observation
 @Observable
 @MainActor
 final class DownloadCenter {
+    typealias MediaCleanupOperation = @Sendable (MediaDownloadService, UUID) async -> Void
+    typealias MediaPauseOperation = @Sendable (MediaDownloadService, UUID) async -> Void
+    typealias BrowserCancellationCheck = @MainActor (BrowserDownloadCoordinator, UUID) -> Bool
+    typealias BrowserCancelOperation = @MainActor @Sendable (BrowserDownloadCoordinator, UUID) async -> Void
+    typealias RecordSaveOperation = @Sendable (DownloadPersistence, [DownloadRecord]) async throws -> Void
+
     @ObservationIgnored private let settings: AppSettingsStore
     @ObservationIgnored private let persistence: DownloadPersistence
     @ObservationIgnored private let destinationResolver: DownloadDestinationResolver
@@ -12,6 +18,11 @@ final class DownloadCenter {
     @ObservationIgnored private let dataRemovalService: DownloadDataRemovalService
     @ObservationIgnored private let managedTorrentSourceStore: ManagedTorrentSourceStore
     @ObservationIgnored private let torrentWatchFolderService: TorrentWatchFolderService
+    @ObservationIgnored private let mediaCleanupOperation: MediaCleanupOperation
+    @ObservationIgnored private let mediaPauseOperation: MediaPauseOperation
+    @ObservationIgnored private let browserCancellationCheck: BrowserCancellationCheck
+    @ObservationIgnored private let browserCancelOperation: BrowserCancelOperation
+    @ObservationIgnored private let recordSaveOperation: RecordSaveOperation
     @ObservationIgnored private var coordinator: DownloadCoordinator! = nil
     @ObservationIgnored private var browserCoordinator: BrowserDownloadCoordinator! = nil
     @ObservationIgnored private let torrentService: Aria2TorrentService
@@ -26,8 +37,19 @@ final class DownloadCenter {
     @ObservationIgnored private var isShuttingDown = false
     @ObservationIgnored private var isReconcilingSelection = false
     @ObservationIgnored private var mediaStartTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var pendingMediaRecoveryResets: Set<UUID> = []
     @ObservationIgnored private var torrentStartTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var directRetryTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var directRetryAttempts: [UUID: Int] = [:]
+    @ObservationIgnored private var readyDirectRetries: [UUID: Bool] = [:]
+    @ObservationIgnored private var directPauseTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var browserCancellationTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var mediaPauseTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var pendingMediaResumeIDs: Set<UUID> = []
+    @ObservationIgnored private var mediaCleanupTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var activeMediaAttemptIdentifiers: [UUID: UUID] = [:]
     @ObservationIgnored private var pendingExternalAddSheetDrafts: [AddDownloadSheetDraft] = []
+    @ObservationIgnored private var isDrainingDownloadQueue = false
 
     var downloads: [DownloadItem] = []
     var selectedFilter: DownloadFilter = .all {
@@ -58,13 +80,29 @@ final class DownloadCenter {
     init(
         settings: AppSettingsStore,
         persistence: DownloadPersistence = DownloadPersistence(),
+        directRecoveryDirectoryURL: URL? = nil,
         destinationResolver: DownloadDestinationResolver = DownloadDestinationResolver(),
         notificationService: DownloadNotificationService = DownloadNotificationService(),
         dataRemovalService: DownloadDataRemovalService = DownloadDataRemovalService(),
         managedTorrentSourceStore: ManagedTorrentSourceStore = ManagedTorrentSourceStore(),
         torrentWatchFolderService: TorrentWatchFolderService? = nil,
         torrentService: Aria2TorrentService? = nil,
-        mediaService: MediaDownloadService? = nil
+        mediaService: MediaDownloadService? = nil,
+        mediaCleanupOperation: @escaping MediaCleanupOperation = { service, id in
+            await service.cancelAndDiscardRecoveryData(id: id)
+        },
+        mediaPauseOperation: @escaping MediaPauseOperation = { service, id in
+            await service.pauseAndWait(id: id)
+        },
+        browserCancellationCheck: @escaping BrowserCancellationCheck = { coordinator, id in
+            coordinator.hasActiveDownload(id: id)
+        },
+        browserCancelOperation: @escaping BrowserCancelOperation = { coordinator, id in
+            await coordinator.cancelDownloadAndWait(id: id)
+        },
+        recordSaveOperation: @escaping RecordSaveOperation = { persistence, records in
+            try persistence.save(records)
+        }
     ) {
         self.settings = settings
         self.persistence = persistence
@@ -74,20 +112,27 @@ final class DownloadCenter {
         self.managedTorrentSourceStore = managedTorrentSourceStore
         self.torrentWatchFolderService = torrentWatchFolderService ?? TorrentWatchFolderService()
         self.torrentService = torrentService ?? Aria2TorrentService(transferSettings: settings.transferSettings)
-        self.mediaService = mediaService ?? MediaDownloadService { [weak self] event in
+        self.mediaCleanupOperation = mediaCleanupOperation
+        self.mediaPauseOperation = mediaPauseOperation
+        self.browserCancellationCheck = browserCancellationCheck
+        self.browserCancelOperation = browserCancelOperation
+        self.recordSaveOperation = recordSaveOperation
+        self.mediaService = mediaService ?? MediaDownloadService { [weak self] attemptIdentifier, event in
             Task { @MainActor [weak self] in
-                self?.handle(event)
+                self?.handle(event, attemptIdentifier: attemptIdentifier)
             }
         }
-        self.coordinator = DownloadCoordinator(transferSettings: settings.transferSettings) { [weak self] event in
-            Task { @MainActor [weak self] in
-                self?.handle(event)
-            }
-        }
+        self.coordinator = DownloadCoordinator(
+            transferSettings: settings.transferSettings,
+            eventHandler: { [weak self] event in
+                Task { @MainActor [weak self] in
+                    self?.handle(event)
+                }
+            },
+            recoveryDirectoryURL: directRecoveryDirectoryURL
+        )
         self.browserCoordinator = BrowserDownloadCoordinator { [weak self] event in
-            Task { @MainActor [weak self] in
-                self?.handle(event)
-            }
+            self?.handleBrowserDownloadEvent(event)
         }
         settings.transferSettingsDidChange = { [weak self] transferSettings in
             self?.applyTransferSettings(transferSettings)
@@ -103,6 +148,7 @@ final class DownloadCenter {
     deinit {
         persistTask?.cancel()
         torrentRefreshTask?.cancel()
+        directRetryTasks.values.forEach { $0.cancel() }
         Task { @MainActor [torrentWatchFolderService] in
             torrentWatchFolderService.stop()
         }
@@ -117,6 +163,8 @@ final class DownloadCenter {
         }
 
         hasLoaded = true
+        coordinator.discardOrphanedTemporaryFiles()
+        browserCoordinator.discardOrphanedTemporaryFiles()
 
         do {
             let records = try await persistence.load()
@@ -161,7 +209,10 @@ final class DownloadCenter {
                         item.backendIdentifier = nil
                     }
 
-                    if record.status == .queued || record.status == .preparing || record.status == .downloading {
+                    if record.status == .queued
+                        || record.status == .preparing
+                        || record.status == .waitingToRetry
+                        || record.status == .downloading {
                         item.status = settings.startDownloadsAutomatically ? .queued : .paused
                         if settings.startDownloadsAutomatically == false {
                             item.lastError = String(
@@ -176,6 +227,37 @@ final class DownloadCenter {
                 }
 
             downloads = restoredItems
+            let directDownloadIDs = Set(
+                restoredItems
+                    .filter {
+                        $0.backend == .urlSession
+                            && $0.status != .completed
+                            && $0.status != .cancelled
+                    }
+                    .map(\.id)
+            )
+            coordinator.discardOrphanedRecoveryData(retaining: directDownloadIDs)
+            for item in restoredItems where item.backend == .urlSession {
+                guard let recovery = coordinator.recoverySnapshot(
+                    id: item.id,
+                    sourceURL: item.sourceURL
+                ) else {
+                    continue
+                }
+
+                item.resumeData = nil
+                item.bytesWritten = recovery.bytesWritten
+                item.expectedBytes = max(item.expectedBytes, recovery.metadata.expectedBytes)
+                if item.expectedBytes > 0 {
+                    item.progress = min(
+                        Double(item.bytesWritten) / Double(item.expectedBytes),
+                        1
+                    )
+                }
+            }
+            await mediaService.discardOrphanedRecoveryData(
+                retaining: Self.retainedMediaRecoveryIDs(in: restoredItems)
+            )
             selectDownload(downloads.first?.id)
             await reconcileRestoredTorrentSession()
             configureTorrentWatchFolder()
@@ -257,6 +339,18 @@ final class DownloadCenter {
         } catch {
             // Existing stale-GID recovery remains the per-item fallback when the engine cannot reconcile at launch.
         }
+    }
+
+    static func retainedMediaRecoveryIDs(in items: [DownloadItem]) -> Set<UUID> {
+        Set(
+            items.lazy
+                .filter {
+                    $0.backend == .ytDlp
+                        && $0.status != .completed
+                        && $0.status != .cancelled
+                }
+                .map(\.id)
+        )
     }
 
     var filteredDownloads: [DownloadItem] {
@@ -483,6 +577,7 @@ final class DownloadCenter {
             return
         }
 
+        let previousPreference = item.mediaFormatPreference
         switch preference {
         case .bestAvailable:
             item.mediaFormatPreference = .bestAvailable
@@ -494,6 +589,25 @@ final class DownloadCenter {
             }
 
             item.mediaFormatPreference = .specific(resolvedSelection)
+        }
+
+        if item.mediaFormatPreference != previousPreference {
+            item.bytesWritten = 0
+            item.progress = 0
+            pendingMediaRecoveryResets.insert(id)
+            Task { @MainActor [weak self, mediaService] in
+                do {
+                    try await mediaService?.discardRecoveryData(id: id)
+                    self?.pendingMediaRecoveryResets.remove(id)
+                } catch {
+                    guard let self, let item = self.item(for: id) else {
+                        return
+                    }
+                    item.lastError = error.localizedDescription
+                    item.updatedAt = .now
+                    self.schedulePersist()
+                }
+            }
         }
 
         item.updatedAt = .now
@@ -600,8 +714,11 @@ final class DownloadCenter {
 
     func shutdownForTermination() async {
         isShuttingDown = true
-        persistTask?.cancel()
+        await cancelPendingPersistenceAndWait()
         torrentRefreshTask?.cancel()
+        directRetryTasks.values.forEach { $0.cancel() }
+        directRetryTasks.removeAll()
+        readyDirectRetries.removeAll()
         torrentWatchFolderService.stop()
 
         let restoredStatus: DownloadStatus = settings.startDownloadsAutomatically ? .queued : .paused
@@ -612,14 +729,20 @@ final class DownloadCenter {
         )
 
         let activeItems = downloads.filter { item in
-            item.status == .queued || item.status == .preparing || item.isRunning
+            item.status == .queued || item.status == .preparing || item.status == .waitingToRetry || item.isRunning
         }
 
         for item in activeItems {
             switch item.backend {
             case .urlSession:
-                if item.taskIdentifier != nil {
-                    coordinator.pauseDownload(id: item.id)
+                if let pauseTask = directPauseTasks[item.id] {
+                    await pauseTask.value
+                } else if browserCoordinator.hasActiveDownload(id: item.id) {
+                    let resumeData = await browserCoordinator.pauseDownloadAndWait(id: item.id)
+                    storeBrowserPauseResult(resumeData, for: item)
+                } else if item.taskIdentifier != nil {
+                    let pauseResult = await coordinator.pauseDownloadAndWait(id: item.id)
+                    storeURLSessionPauseResult(pauseResult, for: item)
                 }
                 item.backendIdentifier = nil
             case .aria2:
@@ -627,7 +750,11 @@ final class DownloadCenter {
                     try? await torrentService.pause(gid: backendIdentifier)
                 }
             case .ytDlp:
-                await mediaService.pause(id: item.id)
+                if let pauseTask = mediaPauseTasks[item.id] {
+                    await pauseTask.value
+                } else {
+                    await mediaService.pauseAndWait(id: item.id)
+                }
                 item.backendIdentifier = nil
             }
 
@@ -636,7 +763,7 @@ final class DownloadCenter {
             item.speedBytesPerSecond = 0
             item.uploadBytesPerSecond = 0
             item.updatedAt = .now
-            if restoredStatus == .paused {
+            if restoredStatus == .paused, item.lastError == nil {
                 item.lastError = pausedMessage
             }
         }
@@ -646,8 +773,30 @@ final class DownloadCenter {
             await task.value
         }
 
+        for task in Array(directPauseTasks.values) {
+            await task.value
+        }
+
+        for task in Array(browserCancellationTasks.values) {
+            await task.value
+        }
+
+        for task in Array(mediaPauseTasks.values) {
+            await task.value
+        }
+
+        for task in Array(mediaCleanupTasks.values) {
+            await task.value
+        }
+
+        for id in pendingMediaRecoveryResets {
+            try? await mediaService.discardRecoveryData(id: id)
+        }
+        pendingMediaRecoveryResets.removeAll()
+
         await mediaService.shutdown()
         await torrentService.shutdown()
+        await cancelPendingPersistenceAndWait()
         try? await persistence.save(downloads.map { $0.makeRecord() })
     }
 
@@ -845,7 +994,16 @@ final class DownloadCenter {
             return
         }
 
+        guard directPauseTasks[id] == nil else {
+            return
+        }
+
         if item.status == .browserSessionRequired {
+            continueInBrowser(id: id)
+            return
+        }
+
+        if item.canResume, item.browserResumeData != nil {
             continueInBrowser(id: id)
             return
         }
@@ -853,7 +1011,7 @@ final class DownloadCenter {
         if item.canPause {
             pauseDownload(id: id)
         } else if item.canResume {
-            startOrQueueDownload(id: id)
+            resumeDownload(item)
         }
     }
 
@@ -868,10 +1026,55 @@ final class DownloadCenter {
     }
 
     func retryDownload(id: UUID) {
-        guard let item = item(for: id) else {
+        guard let item = item(for: id),
+              item.status == .failed || item.status == .cancelled else {
             return
         }
 
+        guard directPauseTasks[id] == nil else {
+            return
+        }
+
+        if item.backend == .urlSession,
+           let cancellationTask = browserCancellationTasks[id] {
+            let requestedStatus = item.status
+            Task { @MainActor [weak self, weak item] in
+                await cancellationTask.value
+
+                guard let self,
+                      let item,
+                      self.isShuttingDown == false,
+                      self.item(for: id) === item,
+                      item.status == requestedStatus else {
+                    return
+                }
+
+                self.retryDownload(id: id)
+            }
+            return
+        }
+
+        if item.backend == .ytDlp,
+           let cleanupTask = mediaCleanupTasks[id] {
+            let requestedStatus = item.status
+            Task { @MainActor [weak self, weak item] in
+                await cleanupTask.value
+
+                guard let self,
+                      let item,
+                      self.isShuttingDown == false,
+                      self.item(for: id) === item,
+                      item.status == requestedStatus else {
+                    return
+                }
+
+                self.retryDownload(id: id)
+            }
+            return
+        }
+
+        let statusBeforeRetry = item.status
+        resetDirectRetryState(for: id)
         item.lastError = nil
         item.finishedAt = nil
         item.completionNotificationDelivered = false
@@ -883,6 +1086,7 @@ final class DownloadCenter {
         case .urlSession:
             item.fileLocationPath = nil
             if item.status == .completed || item.status == .cancelled {
+                coordinator.discardRecoveryData(id: item.id)
                 item.bytesWritten = 0
                 item.expectedBytes = 0
                 item.progress = 0
@@ -901,20 +1105,29 @@ final class DownloadCenter {
             item.expectedBytes = 0
             item.progress = 0
         case .ytDlp:
-            Task {
-                await mediaService.remove(id: id)
-            }
             item.backendIdentifier = nil
             item.fileLocationPath = nil
-            item.bytesWritten = 0
+            if statusBeforeRetry == .cancelled {
+                item.bytesWritten = 0
+                item.progress = 0
+            }
             item.expectedBytes = (item.mediaFormatPreference ?? .bestAvailable)
                 .initialExpectedBytes(
                     metadataEstimate: item.mediaMetadata?.expectedBytes ?? 0
                 )
-            item.progress = 0
+            if item.expectedBytes > 0 {
+                item.progress = min(
+                    Double(item.bytesWritten) / Double(item.expectedBytes),
+                    1
+                )
+            }
         }
 
-        startOrQueueDownload(id: id)
+        if item.backend == .urlSession, item.browserResumeData != nil {
+            continueInBrowser(id: id)
+        } else {
+            startOrQueueDownload(id: id)
+        }
     }
 
     func pauseAll() {
@@ -933,7 +1146,7 @@ final class DownloadCenter {
     func resumeAll() {
         downloads
             .filter(\.canResume)
-            .forEach { startOrQueueDownload(id: $0.id) }
+            .forEach { resumeDownload($0) }
     }
 
     func cancelSelectedDownload() {
@@ -962,6 +1175,12 @@ final class DownloadCenter {
 
         let shouldWaitForMediaProcess = item.backend == .ytDlp
             && (item.backendIdentifier != nil || mediaStartTasks[id] != nil)
+        let shouldWaitForBrowserCancellation = item.backend == .urlSession
+            && directPauseTasks[id] == nil
+            && (
+                browserCancellationTasks[id] != nil
+                    || browserCancellationCheck(browserCoordinator, id)
+            )
 
         if activeBrowserSession?.downloadID == id {
             dismissBrowserSession()
@@ -969,9 +1188,20 @@ final class DownloadCenter {
 
         switch item.backend {
         case .urlSession:
-            if item.taskIdentifier != nil {
+            resetDirectRetryState(for: id)
+            if directPauseTasks[id] != nil {
+                break
+            } else if shouldWaitForBrowserCancellation {
+                scheduleBrowserCancellation(id: id)
+            } else if item.taskIdentifier != nil {
                 coordinator.cancelDownload(id: id)
             }
+            if shouldWaitForBrowserCancellation == false {
+                browserCoordinator.discardRecoveryData(id: id)
+            }
+            coordinator.discardRecoveryData(id: id)
+            item.resumeData = nil
+            item.browserResumeData = nil
         case .aria2:
             if let backendIdentifier = item.backendIdentifier {
                 Task {
@@ -979,9 +1209,7 @@ final class DownloadCenter {
                 }
             }
         case .ytDlp:
-            Task {
-                await mediaService.cancel(id: id)
-            }
+            scheduleMediaCleanup(id: id)
         }
 
         item.taskIdentifier = nil
@@ -991,7 +1219,8 @@ final class DownloadCenter {
         item.updatedAt = .now
         transitionStatus(for: item, to: .cancelled)
         schedulePersist()
-        if shouldWaitForMediaProcess == false {
+        if shouldWaitForMediaProcess == false,
+           shouldWaitForBrowserCancellation == false {
             startNextQueuedDownloadsIfNeeded()
         }
     }
@@ -1102,9 +1331,18 @@ final class DownloadCenter {
     private func stopBackendForDataRemoval(_ item: DownloadItem) async throws {
         switch item.backend {
         case .urlSession:
-            if item.taskIdentifier != nil {
+            resetDirectRetryState(for: item.id)
+            if let pauseTask = directPauseTasks[item.id] {
+                await pauseTask.value
+            } else if let cancellationTask = browserCancellationTasks[item.id] {
+                await cancellationTask.value
+            } else if browserCancellationCheck(browserCoordinator, item.id) {
+                await browserCancelOperation(browserCoordinator, item.id)
+            } else if item.taskIdentifier != nil {
                 coordinator.cancelDownload(id: item.id)
             }
+            browserCoordinator.discardRecoveryData(id: item.id)
+            coordinator.discardRecoveryData(id: item.id)
         case .aria2:
             if let startTask = torrentStartTasks[item.id] {
                 item.status = .cancelled
@@ -1138,6 +1376,12 @@ final class DownloadCenter {
 
         let shouldWaitForMediaProcess = item.backend == .ytDlp
             && (item.backendIdentifier != nil || mediaStartTasks[id] != nil)
+        let shouldWaitForBrowserCancellation = item.backend == .urlSession
+            && directPauseTasks[id] == nil
+            && (
+                browserCancellationTasks[id] != nil
+                    || browserCancellationCheck(browserCoordinator, id)
+            )
 
         if activeBrowserSession?.downloadID == id {
             dismissBrowserSession()
@@ -1145,9 +1389,18 @@ final class DownloadCenter {
 
         switch item.backend {
         case .urlSession:
-            if item.taskIdentifier != nil {
+            resetDirectRetryState(for: id)
+            if directPauseTasks[id] != nil {
+                break
+            } else if shouldWaitForBrowserCancellation {
+                scheduleBrowserCancellation(id: id)
+            } else if item.taskIdentifier != nil {
                 coordinator.cancelDownload(id: id)
             }
+            if shouldWaitForBrowserCancellation == false {
+                browserCoordinator.discardRecoveryData(id: id)
+            }
+            coordinator.discardRecoveryData(id: id)
         case .aria2:
             if let backendIdentifier = item.backendIdentifier {
                 Task {
@@ -1155,9 +1408,7 @@ final class DownloadCenter {
                 }
             }
         case .ytDlp:
-            Task {
-                await mediaService.remove(id: id)
-            }
+            scheduleMediaCleanup(id: id)
         }
 
         let removedPrimarySelection = selectedDownloadID == id
@@ -1171,7 +1422,8 @@ final class DownloadCenter {
         }
 
         schedulePersist()
-        if shouldWaitForMediaProcess == false {
+        if shouldWaitForMediaProcess == false,
+           shouldWaitForBrowserCancellation == false {
             startNextQueuedDownloadsIfNeeded()
         }
     }
@@ -1233,19 +1485,63 @@ final class DownloadCenter {
         schedulePersist()
     }
 
-    func clearFailed() {
-        let failedItems = downloads.filter { $0.status == .failed }
-        cleanupBackendIdentifiers(for: failedItems)
-        failedItems.forEach { moveOriginalTorrentFileToTrashIfNeeded(for: $0) }
-        failedItems.forEach { removeManagedTorrentSourceIfNeeded(for: $0) }
-        downloads.removeAll { $0.status == .failed }
+    func clearFailed() async {
+        let indexedFailedItems = downloads.enumerated().compactMap { index, item in
+            item.status == .failed ? (index: index, item: item) : nil
+        }
+        guard indexedFailedItems.isEmpty == false else {
+            return
+        }
+
+        let failedItems = indexedFailedItems.map(\.item)
+        let failedIDs = Set(failedItems.map(\.id))
+        let previousSelectedIDs = selectedDownloadIDs
+        let previousSelectedID = selectedDownloadID
+
+        await cancelPendingPersistenceAndWait()
+        downloads.removeAll { failedIDs.contains($0.id) }
         selectedDownloadIDs = selectedDownloadIDs.filter { id in
             downloads.contains { $0.id == id }
         }
         if selectedDownloadIDs.isEmpty {
             selectDownload(filteredDownloads.first?.id ?? downloads.first?.id)
         }
-        schedulePersist()
+
+        do {
+            try await recordSaveOperation(
+                persistence,
+                downloads.map { $0.makeRecord() }
+            )
+        } catch {
+            for entry in indexedFailedItems where item(for: entry.item.id) == nil {
+                downloads.insert(entry.item, at: min(entry.index, downloads.count))
+            }
+
+            let availableIDs = Set(downloads.map(\.id))
+            isReconcilingSelection = true
+            selectedDownloadIDs = previousSelectedIDs.intersection(availableIDs)
+            if let previousSelectedID, availableIDs.contains(previousSelectedID) {
+                selectedDownloadID = previousSelectedID
+            } else {
+                selectedDownloadID = orderedDownloads(for: selectedDownloadIDs).first?.id
+            }
+            isReconcilingSelection = false
+
+            activeAlert = UserAlert(
+                title: String(
+                    localized: "alert.clearFailed.saveFailed.title",
+                    defaultValue: "Couldn’t Clear Failed Downloads",
+                    comment: "Alert title shown when Harbor cannot durably remove failed download records."
+                ),
+                message: error.localizedDescription
+            )
+            schedulePersist()
+            return
+        }
+
+        cleanupBackendIdentifiers(for: failedItems)
+        failedItems.forEach { moveOriginalTorrentFileToTrashIfNeeded(for: $0) }
+        failedItems.forEach { removeManagedTorrentSourceIfNeeded(for: $0) }
     }
 
     func revealSelectedInFinder() {
@@ -1368,6 +1664,23 @@ final class DownloadCenter {
 
     func resumeDownloads(ids: Set<UUID>) {
         for item in orderedDownloads(for: ids) where item.canResume {
+            resumeDownload(item)
+        }
+    }
+
+    private func resumeDownload(_ item: DownloadItem) {
+        guard directPauseTasks[item.id] == nil else {
+            return
+        }
+
+        if item.backend == .ytDlp, mediaPauseTasks[item.id] != nil {
+            pendingMediaResumeIDs.insert(item.id)
+            return
+        }
+
+        if item.backend == .urlSession, item.browserResumeData != nil {
+            continueInBrowser(id: item.id)
+        } else {
             startOrQueueDownload(id: item.id)
         }
     }
@@ -1506,8 +1819,13 @@ final class DownloadCenter {
 
     func continueInBrowser(id: UUID) {
         guard let item = item(for: id),
-              item.sourceKind == .directURL
+              item.sourceKind == .directURL,
+              browserCancellationTasks[id] == nil
         else {
+            return
+        }
+
+        guard directPauseTasks[id] == nil else {
             return
         }
 
@@ -1530,7 +1848,8 @@ final class DownloadCenter {
         let session = browserCoordinator.startSession(
             downloadID: item.id,
             sourceURL: item.sourceURL,
-            displayName: item.displayName
+            displayName: item.displayName,
+            resumeData: item.browserResumeData
         )
 
         activeBrowserSession = session
@@ -1552,6 +1871,28 @@ final class DownloadCenter {
             return
         }
 
+        if item.backend == .urlSession, directPauseTasks[id] != nil {
+            return
+        }
+
+        if item.backend == .urlSession, browserCancellationTasks[id] != nil {
+            return
+        }
+
+        if item.backend == .urlSession, item.browserResumeData != nil {
+            markBrowserSessionRequired(
+                item,
+                message: String(
+                    localized: "download.browser.resumeAfterRelaunch",
+                    defaultValue: "Browser download progress is available. Continue in the browser to resume it.",
+                    comment: "Status message shown when a browser-backed download can be resumed after relaunch."
+                ),
+                preservingProgress: true
+            )
+            schedulePersist()
+            return
+        }
+
         if item.backend == .urlSession, item.taskIdentifier != nil {
             return
         }
@@ -1560,7 +1901,10 @@ final class DownloadCenter {
             return
         }
 
-        if item.backend == .ytDlp, mediaStartTasks[id] != nil {
+        if item.backend == .ytDlp,
+           mediaStartTasks[id] != nil
+            || mediaPauseTasks[id] != nil
+            || mediaCleanupTasks[id] != nil {
             return
         }
 
@@ -1585,16 +1929,8 @@ final class DownloadCenter {
 
         switch item.backend {
         case .urlSession:
-            setStatus(for: item, to: .preparing)
-            item.taskIdentifier = coordinator.startDownload(
-                id: item.id,
-                sourceURL: item.sourceURL,
-                resumeData: item.resumeData,
-                speedLimitOverride: item.downloadLimitOverride
-            )
-            item.resumeData = nil
-            item.startedAt = item.startedAt ?? .now
-            schedulePersist()
+            resetDirectRetryState(for: item.id)
+            startDirectDownload(item)
 
         case .aria2:
             if isSeedingContinuation == false || item.status != .seeding {
@@ -1610,17 +1946,281 @@ final class DownloadCenter {
             setStatus(for: item, to: .preparing)
             item.startedAt = item.startedAt ?? .now
             schedulePersist()
+            let attemptIdentifier = UUID()
+            activeMediaAttemptIdentifiers[id] = attemptIdentifier
             mediaStartTasks[id] = Task { @MainActor [weak self] in
-                await self?.startMediaDownload(id: id)
+                await self?.startMediaDownload(
+                    id: id,
+                    attemptIdentifier: attemptIdentifier
+                )
             }
         }
     }
 
-    private func startMediaDownload(id: UUID) async {
+    private func startDirectDownload(
+        _ item: DownloadItem,
+        restartingFromBeginning: Bool = false
+    ) {
+        if restartingFromBeginning {
+            coordinator.discardRecoveryData(id: item.id)
+            item.resumeData = nil
+            item.bytesWritten = 0
+            item.progress = 0
+        }
+
+        item.lastError = nil
+        setStatus(for: item, to: .preparing)
+        do {
+            item.taskIdentifier = try coordinator.startDownload(
+                id: item.id,
+                sourceURL: item.sourceURL,
+                resumeData: item.resumeData,
+                speedLimitOverride: item.downloadLimitOverride
+            )
+            item.resumeData = nil
+        } catch {
+            item.taskIdentifier = nil
+            handleDirectDownloadFailure(
+                DirectDownloadFailure(
+                    error: error,
+                    resumeData: item.resumeData,
+                    recoverableBytes: coordinator.recoverySnapshot(
+                        id: item.id,
+                        sourceURL: item.sourceURL
+                    )?.bytesWritten
+                ),
+                for: item
+            )
+            return
+        }
+        item.startedAt = item.startedAt ?? .now
+        item.updatedAt = .now
+        schedulePersist()
+    }
+
+    private func scheduleMediaCleanup(id: UUID) {
+        // Retire the process attempt before cancellation can enqueue any more
+        // events. A later retry receives a different identifier.
+        activeMediaAttemptIdentifiers.removeValue(forKey: id)
+
+        guard mediaCleanupTasks[id] == nil else {
+            return
+        }
+
+        pendingMediaResumeIDs.remove(id)
+        let pendingStart = mediaStartTasks[id]
+        let pendingPause = mediaPauseTasks[id]
+        pendingStart?.cancel()
+        mediaCleanupTasks[id] = Task {
+            @MainActor [weak self, mediaService, mediaCleanupOperation, pendingStart, pendingPause] in
+            await pendingStart?.value
+            await pendingPause?.value
+            if let mediaService {
+                await mediaCleanupOperation(mediaService, id)
+            }
+            self?.mediaCleanupTasks.removeValue(forKey: id)
+            self?.startNextQueuedDownloadsIfNeeded()
+        }
+    }
+
+    private func handleDirectDownloadFailure(
+        _ failure: DirectDownloadFailure,
+        for item: DownloadItem
+    ) {
+        let hadReportedProgress = item.bytesWritten > 0
+        item.taskIdentifier = nil
+        item.speedBytesPerSecond = 0
+        item.uploadBytesPerSecond = 0
+        item.updatedAt = .now
+
+        if let recoverableBytes = failure.recoverableBytes {
+            item.resumeData = nil
+            item.bytesWritten = recoverableBytes
+            if item.expectedBytes > 0 {
+                item.progress = min(
+                    Double(recoverableBytes) / Double(item.expectedBytes),
+                    1
+                )
+            } else if recoverableBytes == 0 {
+                item.progress = 0
+            }
+        }
+
+        let nextAttempt = (directRetryAttempts[item.id] ?? 0) + 1
+        if failure.isRetryable,
+           let delay = DirectDownloadRetryPolicy.delay(forAttempt: nextAttempt),
+           isShuttingDown == false {
+            directRetryAttempts[item.id] = nextAttempt
+            if failure.recoverableBytes != nil {
+                item.resumeData = nil
+            } else if failure.wasResuming, failure.resumeData == nil {
+                item.resumeData = nil
+            } else {
+                item.resumeData = failure.resumeData
+            }
+            item.lastError = directRetryMessage(
+                for: failure,
+                delay: delay,
+                attempt: nextAttempt,
+                hadProgress: hadReportedProgress
+            )
+            setStatus(for: item, to: .waitingToRetry)
+
+            directRetryTasks[item.id]?.cancel()
+            directRetryTasks[item.id] = Task { @MainActor [weak self] in
+                do {
+                    try await Task.sleep(for: delay)
+                } catch {
+                    return
+                }
+
+                guard let self,
+                      self.isShuttingDown == false,
+                      let retryItem = self.item(for: item.id),
+                      retryItem.status == .waitingToRetry,
+                      retryItem.taskIdentifier == nil else {
+                    return
+                }
+
+                self.directRetryTasks.removeValue(forKey: item.id)
+                self.readyDirectRetries[item.id] = failure.requiresFreshStart
+                self.startNextQueuedDownloadsIfNeeded()
+            }
+            startNextQueuedDownloadsIfNeeded()
+            return
+        }
+
+        let attempts = directRetryAttempts[item.id] ?? 0
+        resetDirectRetryState(for: item.id)
+        item.resumeData = failure.recoverableBytes == nil ? failure.resumeData : nil
+        let finalError: String
+        if failure.isRetryable, attempts == DirectDownloadRetryPolicy.delays.count {
+            finalError = String(
+                format: String(
+                    localized: "download.direct.retryExhausted",
+                    defaultValue: "%@ Harbor retried this download %lld times.",
+                    comment: "Direct-download error after all automatic retries. Parameters are the backend error and retry count."
+                ),
+                failure.message,
+                Int64(attempts)
+            )
+        } else {
+            finalError = failure.message
+        }
+
+        if failure.resumeData == nil,
+           (failure.recoverableBytes ?? 0) == 0,
+           hadReportedProgress {
+            item.lastError = String(
+                format: String(
+                    localized: "download.direct.failureWithoutResumeData",
+                    defaultValue: "%@ Downloaded progress could not be preserved; Retry will start from the beginning.",
+                    comment: "Final direct-download error when URLSession produced no resumable state. Parameter is the backend error."
+                ),
+                finalError
+            )
+        } else {
+            item.lastError = finalError
+        }
+        transitionStatus(for: item, to: .failed)
+        startNextQueuedDownloadsIfNeeded()
+    }
+
+    private func directRetryMessage(
+        for failure: DirectDownloadFailure,
+        delay: Duration,
+        attempt: Int,
+        hadProgress: Bool
+    ) -> String {
+        let delaySeconds = delay.components.seconds
+        let maximumAttempts = DirectDownloadRetryPolicy.delays.count
+
+        if failure.wasResuming,
+           failure.resumeData == nil,
+           failure.recoverableBytes == nil {
+            return String(
+                format: String(
+                    localized: "download.direct.retryCannotResume",
+                    defaultValue: "The server rejected the saved resume state. Retrying from the beginning in %lld seconds (%lld of %lld).",
+                    comment: "Direct-download retry message. Parameters are wait seconds, current retry number, and maximum retries."
+                ),
+                delaySeconds,
+                Int64(attempt),
+                Int64(maximumAttempts)
+            )
+        }
+
+        if failure.resumeData == nil,
+           (failure.recoverableBytes ?? 0) == 0,
+           hadProgress {
+            return String(
+                format: String(
+                    localized: "download.direct.retryWithoutResumeData",
+                    defaultValue: "The connection was interrupted and URLSession did not provide resumable state. Retrying from the beginning in %lld seconds (%lld of %lld).",
+                    comment: "Direct-download retry message. Parameters are wait seconds, current retry number, and maximum retries."
+                ),
+                delaySeconds,
+                Int64(attempt),
+                Int64(maximumAttempts)
+            )
+        }
+
+        return String(
+            format: String(
+                localized: "download.direct.retryScheduled",
+                defaultValue: "The connection was interrupted. Retrying in %lld seconds (%lld of %lld).",
+                comment: "Direct-download retry message. Parameters are wait seconds, current retry number, and maximum retries."
+            ),
+            delaySeconds,
+            Int64(attempt),
+            Int64(maximumAttempts)
+        )
+    }
+
+    private func directRecoveryResetMessage(
+        for reason: DirectDownloadRecoveryResetReason
+    ) -> String {
+        switch reason {
+        case .missingValidator:
+            String(
+                localized: "download.direct.recoveryReset.missingValidator",
+                defaultValue: "The server did not provide a validator for the partial file, so Harbor restarted the download to avoid combining different content.",
+                comment: "Direct-download status shown when a partial file cannot be safely resumed without an HTTP validator."
+            )
+        case .sourceChanged:
+            String(
+                localized: "download.direct.recoveryReset.sourceChanged",
+                defaultValue: "The download source changed, so Harbor restarted the partial download.",
+                comment: "Direct-download status shown when persisted partial data belongs to another source URL."
+            )
+        case .serverRejectedRange:
+            String(
+                localized: "download.direct.recoveryReset.serverRejectedRange",
+                defaultValue: "The server could not continue the saved partial file, so Harbor restarted the download.",
+                comment: "Direct-download status shown when the server responds to a validated range request with the full resource."
+            )
+        }
+    }
+
+    private func resetDirectRetryState(for id: UUID) {
+        directRetryTasks.removeValue(forKey: id)?.cancel()
+        directRetryAttempts.removeValue(forKey: id)
+        readyDirectRetries.removeValue(forKey: id)
+    }
+
+    private func startMediaDownload(
+        id: UUID,
+        attemptIdentifier: UUID
+    ) async {
         var waitsForMediaStopEvent = false
+        var keepsAttemptActive = false
 
         defer {
             mediaStartTasks.removeValue(forKey: id)
+            if keepsAttemptActive == false,
+               activeMediaAttemptIdentifiers[id] == attemptIdentifier {
+                activeMediaAttemptIdentifiers.removeValue(forKey: id)
+            }
 
             if waitsForMediaStopEvent == false {
                 if let item = item(for: id),
@@ -1700,8 +2300,19 @@ final class DownloadCenter {
                 return
             }
 
+            if pendingMediaRecoveryResets.contains(id) {
+                try await mediaService.discardRecoveryData(id: id)
+                pendingMediaRecoveryResets.remove(id)
+
+                guard let refreshedItem = item(for: id),
+                      refreshedItem.status == .preparing else {
+                    return
+                }
+            }
+
             let processIdentifier = try await mediaService.startDownload(
                 id: readyItem.id,
+                attemptIdentifier: attemptIdentifier,
                 sourceURL: readyItem.sourceURL,
                 destinationFolder: readyItem.destinationFolderURL,
                 metadata: validatedMetadata,
@@ -1711,6 +2322,7 @@ final class DownloadCenter {
 
             guard let refreshedItem = item(for: id) else {
                 waitsForMediaStopEvent = await mediaService.pause(id: id)
+                keepsAttemptActive = waitsForMediaStopEvent
                 return
             }
 
@@ -1720,9 +2332,11 @@ final class DownloadCenter {
                 } else {
                     waitsForMediaStopEvent = await mediaService.pause(id: id)
                 }
+                keepsAttemptActive = waitsForMediaStopEvent
                 return
             }
 
+            keepsAttemptActive = true
             refreshedItem.backendIdentifier = String(processIdentifier)
             refreshedItem.updatedAt = .now
             schedulePersist()
@@ -1894,7 +2508,7 @@ final class DownloadCenter {
             }
             schedulePersist()
 
-        case .queued, .preparing, .downloading, .seeding:
+        case .queued, .preparing, .waitingToRetry, .downloading, .seeding:
             do {
                 try await torrentService.removeAndConfirmStopped(gid: backendIdentifier)
                 if item.backendIdentifier == backendIdentifier {
@@ -1929,6 +2543,26 @@ final class DownloadCenter {
         let shouldWaitForMediaProcess = item.backend == .ytDlp
             && (item.backendIdentifier != nil || mediaStartTasks[id] != nil)
 
+        if item.backend == .ytDlp, mediaPauseTasks[id] != nil {
+            return
+        }
+
+        if item.backend == .urlSession {
+            guard directPauseTasks[id] == nil else {
+                return
+            }
+
+            resetDirectRetryState(for: id)
+            if browserCoordinator.hasActiveDownload(id: id) {
+                beginDirectPause(id: id, usesBrowser: true)
+                return
+            }
+            if item.taskIdentifier != nil {
+                beginDirectPause(id: id, usesBrowser: false)
+                return
+            }
+        }
+
         setStatus(for: item, to: .paused)
         item.taskIdentifier = nil
         item.speedBytesPerSecond = 0
@@ -1937,7 +2571,7 @@ final class DownloadCenter {
 
         switch item.backend {
         case .urlSession:
-            coordinator.pauseDownload(id: id)
+            break
         case .aria2:
             if let backendIdentifier = item.backendIdentifier {
                 Task {
@@ -1945,8 +2579,31 @@ final class DownloadCenter {
                 }
             }
         case .ytDlp:
-            Task {
-                await mediaService.pause(id: id)
+            if shouldWaitForMediaProcess {
+                let pendingStart = mediaStartTasks[id]
+                pendingStart?.cancel()
+                let pauseTask = Task {
+                    @MainActor [weak self, mediaService, mediaPauseOperation, pendingStart] in
+                    await pendingStart?.value
+                    if let mediaService {
+                        await mediaPauseOperation(mediaService, id)
+                    }
+
+                    guard let self else {
+                        return
+                    }
+                    self.mediaPauseTasks.removeValue(forKey: id)
+                    let shouldResume = self.pendingMediaResumeIDs.remove(id) != nil
+                    if shouldResume,
+                       self.isShuttingDown == false,
+                       let pausedItem = self.item(for: id),
+                       pausedItem.status == .paused {
+                        self.startOrQueueDownload(id: id)
+                    } else {
+                        self.startNextQueuedDownloadsIfNeeded()
+                    }
+                }
+                mediaPauseTasks[id] = pauseTask
             }
         }
 
@@ -1956,8 +2613,139 @@ final class DownloadCenter {
         }
     }
 
+    private func beginDirectPause(id: UUID, usesBrowser: Bool) {
+        let directCoordinator = coordinator!
+        let secureBrowserCoordinator = browserCoordinator!
+        let pauseTask = Task { @MainActor [weak self, directCoordinator, secureBrowserCoordinator] in
+            if usesBrowser {
+                let resumeData = await secureBrowserCoordinator.pauseDownloadAndWait(id: id)
+                guard let self else {
+                    return
+                }
+                self.directPauseTasks.removeValue(forKey: id)
+
+                guard let item = self.item(for: id),
+                      item.status == .preparing || item.status == .downloading else {
+                    secureBrowserCoordinator.discardRecoveryData(id: id)
+                    return
+                }
+                self.storeBrowserPauseResult(resumeData, for: item)
+            } else {
+                let pauseResult = await directCoordinator.pauseDownloadAndWait(id: id)
+                guard let self else {
+                    return
+                }
+                self.directPauseTasks.removeValue(forKey: id)
+
+                guard let item = self.item(for: id),
+                      item.status == .preparing || item.status == .downloading else {
+                    directCoordinator.discardRecoveryData(id: id)
+                    return
+                }
+                self.storeURLSessionPauseResult(pauseResult, for: item)
+            }
+
+            guard let self, let item = self.item(for: id) else {
+                return
+            }
+            self.setStatus(for: item, to: .paused)
+            item.taskIdentifier = nil
+            item.speedBytesPerSecond = 0
+            item.uploadBytesPerSecond = 0
+            item.updatedAt = .now
+            self.schedulePersist()
+            self.startNextQueuedDownloadsIfNeeded()
+        }
+        directPauseTasks[id] = pauseTask
+    }
+
+    private func scheduleBrowserCancellation(id: UUID) {
+        guard browserCancellationTasks[id] == nil else {
+            return
+        }
+
+        let secureBrowserCoordinator = browserCoordinator!
+        let cancelOperation = browserCancelOperation
+        let cancellationTask = Task {
+            @MainActor [weak self, secureBrowserCoordinator, cancelOperation] in
+            await cancelOperation(secureBrowserCoordinator, id)
+            secureBrowserCoordinator.discardRecoveryData(id: id)
+
+            guard let self else {
+                return
+            }
+
+            self.browserCancellationTasks.removeValue(forKey: id)
+            self.startNextQueuedDownloadsIfNeeded()
+        }
+        browserCancellationTasks[id] = cancellationTask
+    }
+
+    private func storeBrowserPauseResult(
+        _ resumeData: Data?,
+        for item: DownloadItem
+    ) {
+        item.browserResumeData = resumeData
+
+        guard resumeData == nil else {
+            return
+        }
+
+        let discardedProgress = item.bytesWritten > 0
+        item.bytesWritten = 0
+        item.expectedBytes = 0
+        item.progress = 0
+        guard discardedProgress else {
+            return
+        }
+
+        item.lastError = String(
+            localized: "download.direct.pauseWithoutResumeData",
+            defaultValue: "This download could not preserve resumable progress. Resuming will restart it from the beginning.",
+            comment: "Paused direct-download message shown when the backend produced no resumable state."
+        )
+    }
+
+    private func storeURLSessionPauseResult(
+        _ result: DirectDownloadPauseResult,
+        for item: DownloadItem
+    ) {
+        item.resumeData = result.resumeData
+
+        if let recovery = result.ownedRecovery {
+            item.resumeData = nil
+            item.bytesWritten = recovery.bytesWritten
+            item.expectedBytes = max(item.expectedBytes, recovery.metadata.expectedBytes)
+            if item.expectedBytes > 0 {
+                item.progress = min(
+                    Double(item.bytesWritten) / Double(item.expectedBytes),
+                    1
+                )
+            }
+            return
+        }
+
+        guard result.resumeData == nil else {
+            return
+        }
+
+        let discardedProgress = item.bytesWritten > 0
+        item.bytesWritten = 0
+        item.expectedBytes = 0
+        item.progress = 0
+        guard discardedProgress else {
+            return
+        }
+
+        item.lastError = String(
+            localized: "download.direct.pauseWithoutResumeData",
+            defaultValue: "This download could not preserve resumable progress. Resuming will restart it from the beginning.",
+            comment: "Paused direct-download message shown when the backend produced no resumable state."
+        )
+    }
+
     private var currentRunningDownloadsCount: Int {
-        downloads.filter(\.isRunning).count
+        downloads.filter { $0.status.consumesDownloadSlot }.count
     }
 
     private func startNextQueuedDownloadsIfNeeded() {
@@ -1965,17 +2753,43 @@ final class DownloadCenter {
             return
         }
 
-        let availableSlots = max(settings.transferSettings.maxConcurrentDownloads - currentRunningDownloadsCount, 0)
-        guard availableSlots > 0 else {
+        guard isDrainingDownloadQueue == false else {
+            return
+        }
+        isDrainingDownloadQueue = true
+        defer { isDrainingDownloadQueue = false }
+
+        let concurrencyLimit = settings.transferSettings.maxConcurrentDownloads
+        guard currentRunningDownloadsCount < concurrencyLimit else {
             return
         }
 
-        let queuedItems = downloads
-            .filter { $0.status == .queued }
+        let schedulableItems = downloads
+            .filter {
+                $0.status == .queued
+                    || ($0.status == .waitingToRetry && readyDirectRetries[$0.id] != nil)
+            }
             .sorted { $0.createdAt < $1.createdAt }
 
-        for item in queuedItems.prefix(availableSlots) {
-            startOrQueueDownload(id: item.id)
+        for item in schedulableItems {
+            guard currentRunningDownloadsCount < concurrencyLimit else {
+                break
+            }
+
+            // A synchronous start failure can re-enter this scheduler and
+            // process later items from the same snapshot. Only start entries
+            // that are still schedulable when the outer pass resumes.
+            if item.status == .waitingToRetry,
+               let restartingFromBeginning = readyDirectRetries.removeValue(forKey: item.id) {
+                startDirectDownload(
+                    item,
+                    restartingFromBeginning: restartingFromBeginning
+                )
+            } else if item.status == .queued {
+                startOrQueueDownload(id: item.id)
+            } else {
+                continue
+            }
         }
     }
 
@@ -2329,8 +3143,7 @@ final class DownloadCenter {
         }
 
         item.completionNotificationDelivered = true
-        persistTask?.cancel()
-        persistTask = nil
+        await cancelPendingPersistenceAndWait()
 
         do {
             try await persistence.save(downloads.map { $0.makeRecord() })
@@ -2351,76 +3164,88 @@ final class DownloadCenter {
         }
     }
 
-    private func handle(_ event: DownloadEvent) {
+    func handle(_ event: DownloadEvent) {
         switch event {
-        case let .started(id, taskIdentifier):
-            guard let item = item(for: id) else {
+        case let .started(id, taskIdentifier, usesOwnedPartial, ownedRecovery, resetReason):
+            guard let item = nonterminalItem(for: id) else {
+                return
+            }
+
+            guard directPauseTasks[id] == nil else {
                 return
             }
 
             item.taskIdentifier = taskIdentifier
             setStatus(for: item, to: .downloading)
+            if usesOwnedPartial {
+                item.bytesWritten = ownedRecovery?.bytesWritten ?? 0
+                if let recoveryExpectedBytes = ownedRecovery?.metadata.expectedBytes,
+                   recoveryExpectedBytes > 0 {
+                    item.expectedBytes = max(item.expectedBytes, recoveryExpectedBytes)
+                } else if ownedRecovery == nil {
+                    item.expectedBytes = 0
+                }
+                if item.expectedBytes > 0 {
+                    item.progress = min(
+                        Double(item.bytesWritten) / Double(item.expectedBytes),
+                        1
+                    )
+                } else if item.bytesWritten == 0 {
+                    item.progress = 0
+                }
+            }
+            item.lastError = resetReason.map { directRecoveryResetMessage(for: $0) }
             item.updatedAt = .now
             item.uploadBytesPerSecond = 0
 
+        case let .recoveryReset(id, reason):
+            guard let item = nonterminalItem(for: id) else {
+                return
+            }
+
+            item.bytesWritten = 0
+            item.expectedBytes = 0
+            item.progress = 0
+            item.lastError = directRecoveryResetMessage(for: reason)
+            item.updatedAt = .now
+
         case let .progress(id, bytesWritten, expectedBytes, speedBytesPerSecond):
-            guard let item = item(for: id) else {
+            guard let item = nonterminalItem(for: id) else {
+                return
+            }
+
+            guard directPauseTasks[id] == nil, item.status != .paused else {
                 return
             }
 
             item.bytesWritten = bytesWritten
             item.expectedBytes = max(expectedBytes, item.expectedBytes)
-            if expectedBytes > 0 {
-                item.progress = Double(bytesWritten) / Double(expectedBytes)
+            if item.expectedBytes > 0 {
+                item.progress = min(
+                    Double(bytesWritten) / Double(item.expectedBytes),
+                    1
+                )
             }
             item.speedBytesPerSecond = speedBytesPerSecond
             item.uploadBytesPerSecond = 0
             item.updatedAt = .now
 
-        case let .paused(id, resumeData):
-            guard let item = item(for: id) else {
+        case let .failed(id, failure):
+            guard let item = nonterminalItem(for: id) else {
                 return
             }
 
-            item.resumeData = resumeData
-            item.taskIdentifier = nil
-            setStatus(for: item, to: .paused)
-            item.speedBytesPerSecond = 0
-            item.uploadBytesPerSecond = 0
-            item.updatedAt = .now
-            startNextQueuedDownloadsIfNeeded()
-
-        case let .cancelled(id):
-            guard let item = item(for: id) else {
-                return
-            }
-
-            item.taskIdentifier = nil
-            item.speedBytesPerSecond = 0
-            item.uploadBytesPerSecond = 0
-            item.updatedAt = .now
-            transitionStatus(for: item, to: .cancelled)
-            startNextQueuedDownloadsIfNeeded()
-
-        case let .failed(id, message, resumeData):
-            guard let item = item(for: id) else {
-                return
-            }
-
-            item.taskIdentifier = nil
-            item.lastError = message
-            item.resumeData = resumeData
-            item.speedBytesPerSecond = 0
-            item.uploadBytesPerSecond = 0
-            item.updatedAt = .now
-            transitionStatus(for: item, to: .failed)
-            startNextQueuedDownloadsIfNeeded()
+            handleDirectDownloadFailure(failure, for: item)
 
         case let .finished(id, temporaryURL, suggestedFilename, responseMimeType, statusCode):
-            guard let item = item(for: id) else {
+            guard let item = claimableItem(
+                for: id,
+                removingUnclaimedFileAt: temporaryURL
+            ) else {
                 return
             }
 
+            resetDirectRetryState(for: id)
             do {
                 try finalizeFileDownload(
                     for: item,
@@ -2455,29 +3280,37 @@ final class DownloadCenter {
         schedulePersist()
     }
 
-    private func handle(_ event: BrowserDownloadEvent) {
+    func handleBrowserDownloadEvent(_ event: BrowserDownloadEvent) {
         switch event {
-        case let .started(id, _, expectedBytes, _, _):
-            guard let item = item(for: id) else {
+        case let .started(id, _, expectedBytes, _, statusCode, isResumed):
+            guard let item = nonterminalItem(for: id) else {
                 return
             }
 
-            activeBrowserSession = nil
+            clearActiveBrowserSession(matching: id)
             setStatus(for: item, to: .downloading)
-            item.progress = 0
-            item.bytesWritten = 0
+            let continuesPreviousPayload = isResumed && statusCode == 206
+            if continuesPreviousPayload == false {
+                item.progress = 0
+                item.bytesWritten = 0
+                item.expectedBytes = 0
+            }
             if expectedBytes > 0 {
                 item.expectedBytes = max(item.expectedBytes, expectedBytes)
             }
             item.lastError = nil
             item.resumeData = nil
+            item.browserResumeData = nil
             item.speedBytesPerSecond = 0
             item.uploadBytesPerSecond = 0
             item.updatedAt = .now
             item.startedAt = item.startedAt ?? .now
 
         case let .finished(id, temporaryURL, suggestedFilename, responseMimeType, statusCode, expectedBytes):
-            guard let item = item(for: id) else {
+            guard let item = claimableItem(
+                for: id,
+                removingUnclaimedFileAt: temporaryURL
+            ) else {
                 return
             }
 
@@ -2498,17 +3331,23 @@ final class DownloadCenter {
 
             item.speedBytesPerSecond = 0
             item.uploadBytesPerSecond = 0
+            item.browserResumeData = nil
             item.updatedAt = .now
             startNextQueuedDownloadsIfNeeded()
 
-        case let .failed(id, message):
-            activeBrowserSession = nil
-
-            guard let item = item(for: id) else {
+        case let .failed(id, failure):
+            guard let item = nonterminalItem(for: id) else {
                 return
             }
 
-            item.lastError = message
+            clearActiveBrowserSession(matching: id)
+            item.lastError = failure.message
+            item.browserResumeData = failure.resumeData
+            if failure.resumeData == nil {
+                item.progress = 0
+                item.bytesWritten = 0
+                item.expectedBytes = 0
+            }
             item.speedBytesPerSecond = 0
             item.uploadBytesPerSecond = 0
             item.updatedAt = .now
@@ -2519,9 +3358,46 @@ final class DownloadCenter {
         schedulePersist()
     }
 
-    private func handle(_ event: MediaDownloadEvent) {
-        if let id = mediaDownloadID(from: event),
-           item(for: id) == nil {
+    private func clearActiveBrowserSession(matching id: UUID) {
+        if activeBrowserSession?.downloadID == id {
+            activeBrowserSession = nil
+        }
+    }
+
+    private func claimableItem(
+        for id: UUID,
+        removingUnclaimedFileAt temporaryURL: URL
+    ) -> DownloadItem? {
+        guard let item = item(for: id), item.status.isTerminal == false else {
+            try? FileManager.default.removeItem(at: temporaryURL)
+            return nil
+        }
+
+        return item
+    }
+
+    private func nonterminalItem(for id: UUID) -> DownloadItem? {
+        guard let item = item(for: id), item.status.isTerminal == false else {
+            return nil
+        }
+
+        return item
+    }
+
+    func handle(
+        _ event: MediaDownloadEvent,
+        attemptIdentifier: UUID
+    ) {
+        guard let id = mediaDownloadID(from: event),
+              activeMediaAttemptIdentifiers[id] == attemptIdentifier else {
+            return
+        }
+
+        if mediaEventReleasesQueueSlot(event) {
+            activeMediaAttemptIdentifiers.removeValue(forKey: id)
+        }
+
+        if item(for: id) == nil {
             if mediaEventReleasesQueueSlot(event) {
                 startNextQueuedDownloadsIfNeeded()
             }
@@ -2560,6 +3436,10 @@ final class DownloadCenter {
             item.updatedAt = .now
 
         case let .paused(id):
+            guard isShuttingDown == false else {
+                return
+            }
+
             guard let item = item(for: id) else {
                 return
             }
@@ -2576,11 +3456,13 @@ final class DownloadCenter {
                 return
             }
 
-            item.backendIdentifier = nil
-            item.speedBytesPerSecond = 0
-            item.uploadBytesPerSecond = 0
-            item.updatedAt = .now
-            transitionStatus(for: item, to: .cancelled)
+            if item.status == .cancelled {
+                item.backendIdentifier = nil
+                item.speedBytesPerSecond = 0
+                item.uploadBytesPerSecond = 0
+                item.updatedAt = .now
+                transitionStatus(for: item, to: .cancelled)
+            }
             startNextQueuedDownloadsIfNeeded()
 
         case let .finished(id, fileURL, expectedBytes):
@@ -2622,6 +3504,10 @@ final class DownloadCenter {
         }
 
         schedulePersist()
+    }
+
+    func activeMediaAttemptIdentifier(for id: UUID) -> UUID? {
+        activeMediaAttemptIdentifiers[id]
     }
 
     private func mediaDownloadID(from event: MediaDownloadEvent) -> UUID? {
@@ -2683,15 +3569,22 @@ final class DownloadCenter {
         item.finishedAt = .now
         item.lastError = nil
         item.resumeData = nil
+        item.browserResumeData = nil
         transitionStatus(for: item, to: .completed)
     }
 
-    private func markBrowserSessionRequired(_ item: DownloadItem, message: String) {
+    private func markBrowserSessionRequired(
+        _ item: DownloadItem,
+        message: String,
+        preservingProgress: Bool = false
+    ) {
         item.taskIdentifier = nil
         setStatus(for: item, to: .browserSessionRequired)
-        item.progress = 0
-        item.bytesWritten = 0
-        item.expectedBytes = 0
+        if preservingProgress == false {
+            item.progress = 0
+            item.bytesWritten = 0
+            item.expectedBytes = 0
+        }
         item.speedBytesPerSecond = 0
         item.uploadBytesPerSecond = 0
         item.lastError = message
@@ -2892,9 +3785,15 @@ final class DownloadCenter {
         case .preparing:
             if previousStatus == .completed || previousStatus == .seeding {
                 nil
+            } else if previousStatus == .downloading
+                || previousStatus == .preparing
+                || previousStatus == .waitingToRetry {
+                nil
             } else {
                 previousStatus == .paused || previousStatus == .browserSessionRequired ? .resumed : .started
             }
+        case .waitingToRetry:
+            nil
         case .downloading:
             if previousStatus == .paused || previousStatus == .browserSessionRequired {
                 .resumed
@@ -2968,7 +3867,7 @@ final class DownloadCenter {
                 ),
                 item.displayName
             )
-        case .queued, .preparing, .downloading, .seeding, .browserSessionRequired, .paused:
+        case .queued, .preparing, .waitingToRetry, .downloading, .seeding, .browserSessionRequired, .paused:
             return nil
         }
 
@@ -2980,6 +3879,16 @@ final class DownloadCenter {
     }
 
     private func cleanupBackendIdentifiers(for items: [DownloadItem]) {
+        let directDownloadIDs = items
+            .filter { $0.backend == .urlSession }
+            .map(\.id)
+
+        for id in directDownloadIDs {
+            resetDirectRetryState(for: id)
+            browserCoordinator.discardRecoveryData(id: id)
+            coordinator.discardRecoveryData(id: id)
+        }
+
         let backendIdentifiers = items
             .filter { $0.backend == .aria2 }
             .compactMap(\.backendIdentifier)
@@ -2988,17 +3897,15 @@ final class DownloadCenter {
             .filter { $0.backend == .ytDlp }
             .map(\.id)
 
-        guard backendIdentifiers.isEmpty == false || mediaIDs.isEmpty == false else {
+        mediaIDs.forEach { scheduleMediaCleanup(id: $0) }
+
+        guard backendIdentifiers.isEmpty == false else {
             return
         }
 
         Task {
             for backendIdentifier in backendIdentifiers {
                 await torrentService.remove(gid: backendIdentifier)
-            }
-
-            for id in mediaIDs {
-                await mediaService.remove(id: id)
             }
         }
     }
@@ -3099,12 +4006,31 @@ final class DownloadCenter {
     }
 
     private func schedulePersist() {
+        guard isShuttingDown == false else {
+            return
+        }
+
         let records = downloads.map { $0.makeRecord() }
 
         persistTask?.cancel()
         persistTask = Task { [persistence] in
-            try? await Task.sleep(for: .milliseconds(250))
-            try? await persistence.save(records)
+            do {
+                try await Task.sleep(for: .milliseconds(250))
+                try Task.checkCancellation()
+                try await persistence.save(records)
+            } catch is CancellationError {
+                return
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func cancelPendingPersistenceAndWait() async {
+        while let pendingTask = persistTask {
+            persistTask = nil
+            pendingTask.cancel()
+            await pendingTask.value
         }
     }
 }

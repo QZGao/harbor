@@ -8,7 +8,8 @@ enum BrowserDownloadEvent {
         suggestedFilename: String?,
         expectedBytes: Int64,
         responseMimeType: String?,
-        statusCode: Int?
+        statusCode: Int?,
+        isResumed: Bool
     )
     case finished(
         id: UUID,
@@ -18,7 +19,7 @@ enum BrowserDownloadEvent {
         statusCode: Int?,
         expectedBytes: Int64
     )
-    case failed(id: UUID, message: String)
+    case failed(id: UUID, failure: DirectDownloadFailure)
 }
 
 @MainActor
@@ -49,55 +50,94 @@ final class BrowserDownloadSession: Identifiable {
 
 @MainActor
 final class BrowserDownloadCoordinator: NSObject {
+    typealias ResumeCompletion = @MainActor @Sendable (WKDownload) -> Void
+    typealias ResumeDownload = @MainActor (
+        WKWebView,
+        Data,
+        @escaping ResumeCompletion
+    ) -> Void
+    typealias CancelUnownedDownload = @MainActor (WKDownload) -> Void
+
+    private enum TerminationReason {
+        case pause
+        case cancel
+    }
+
     private struct DownloadContext {
         let downloadID: UUID
         let sourceURL: URL
+        let webView: WKWebView
+        let isResumeAttempt: Bool
         var suggestedFilename: String?
         var responseMimeType: String?
         var statusCode: Int?
         var expectedBytes: Int64
         var temporaryURL: URL?
+        var terminationReason: TerminationReason?
     }
 
-    private let destinationResolver: DownloadDestinationResolver
     private let fileManager: FileManager
     private let temporaryDirectory: URL
-    private let onEvent: (BrowserDownloadEvent) -> Void
+    private let onEvent: @MainActor (BrowserDownloadEvent) -> Void
+    private let resumeDownload: ResumeDownload
+    private let cancelUnownedDownload: CancelUnownedDownload
 
     private var activeSession: BrowserDownloadSession?
+    private var pendingResumeSessions: [UUID: BrowserDownloadSession] = [:]
     private var downloadContexts: [ObjectIdentifier: DownloadContext] = [:]
+    private var activeDownloadsByID: [UUID: WKDownload] = [:]
+    private var resumableWebViews: [UUID: WKWebView] = [:]
 
     init(
-        destinationResolver: DownloadDestinationResolver = DownloadDestinationResolver(),
         fileManager: FileManager = .default,
-        onEvent: @escaping (BrowserDownloadEvent) -> Void
+        temporaryDirectory: URL? = nil,
+        resumeDownload: @escaping ResumeDownload = { webView, resumeData, completion in
+            webView.resumeDownload(fromResumeData: resumeData, completionHandler: completion)
+        },
+        cancelUnownedDownload: @escaping CancelUnownedDownload = { download in
+            download.cancel { _ in }
+        },
+        onEvent: @escaping @MainActor (BrowserDownloadEvent) -> Void
     ) {
-        self.destinationResolver = destinationResolver
         self.fileManager = fileManager
-        self.temporaryDirectory = fileManager.temporaryDirectory
-            .appendingPathComponent("HarborBrowserDownloads", isDirectory: true)
+        self.temporaryDirectory = temporaryDirectory
+            ?? fileManager.temporaryDirectory
+                .appendingPathComponent("HarborBrowserDownloads", isDirectory: true)
+        self.resumeDownload = resumeDownload
+        self.cancelUnownedDownload = cancelUnownedDownload
         self.onEvent = onEvent
 
         super.init()
 
-        try? fileManager.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+        try? fileManager.createDirectory(at: self.temporaryDirectory, withIntermediateDirectories: true)
     }
 
     func startSession(
         downloadID: UUID,
         sourceURL: URL,
-        displayName: String
+        displayName: String,
+        resumeData: Data? = nil
     ) -> BrowserDownloadSession {
         if let activeSession, activeSession.downloadID == downloadID {
             return activeSession
         }
 
+        if let pendingSession = pendingResumeSessions[downloadID] {
+            cancelSession()
+            activeSession = pendingSession
+            return pendingSession
+        }
+
         cancelSession()
 
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .nonPersistent()
-
-        let webView = WKWebView(frame: .zero, configuration: configuration)
+        let webView: WKWebView
+        if resumeData != nil, let resumableWebView = resumableWebViews[downloadID] {
+            webView = resumableWebView
+        } else {
+            let configuration = WKWebViewConfiguration()
+            configuration.websiteDataStore = .nonPersistent()
+            webView = WKWebView(frame: .zero, configuration: configuration)
+        }
         webView.navigationDelegate = self
         webView.uiDelegate = self
 
@@ -109,8 +149,48 @@ final class BrowserDownloadCoordinator: NSObject {
         )
 
         activeSession = session
-        webView.load(URLRequest(url: sourceURL))
+
+        if let resumeData {
+            resumableWebViews[downloadID] = webView
+            session.statusMessage = "Resuming secure browser-backed download…"
+            session.isLoading = false
+            pendingResumeSessions[downloadID] = session
+            resumeDownload(webView, resumeData) { [weak self, weak session] download in
+                guard let self, let session else {
+                    download.cancel { _ in }
+                    return
+                }
+
+                guard self.claimPendingResume(
+                    downloadID: downloadID,
+                    session: session,
+                    webView: webView
+                ) else {
+                    self.cancelUnownedDownload(download)
+                    return
+                }
+
+                self.track(download: download, for: session, isResumeAttempt: true)
+            }
+        } else {
+            webView.load(URLRequest(url: sourceURL))
+        }
         return session
+    }
+
+    func claimPendingResume(
+        downloadID: UUID,
+        session: BrowserDownloadSession,
+        webView: WKWebView
+    ) -> Bool {
+        guard pendingResumeSessions[downloadID]?.id == session.id else {
+            return false
+        }
+
+        pendingResumeSessions.removeValue(forKey: downloadID)
+        return activeSession?.id == session.id
+            && activeSession?.webView === webView
+            && session.webView === webView
     }
 
     func cancelSession() {
@@ -118,25 +198,150 @@ final class BrowserDownloadCoordinator: NSObject {
         activeSession = nil
     }
 
-    private func track(download: WKDownload) {
-        guard let activeSession else {
+    func hasActiveDownload(id: UUID) -> Bool {
+        activeDownloadsByID[id] != nil
+    }
+
+    func hasResumableWebView(id: UUID) -> Bool {
+        resumableWebViews[id] != nil
+    }
+
+    func pauseDownloadAndWait(id: UUID) async -> Data? {
+        await withCheckedContinuation { continuation in
+            guard stopDownload(
+                id: id,
+                reason: .pause,
+                continuation: continuation
+            ) else {
+                continuation.resume(returning: nil)
+                return
+            }
+        }
+    }
+
+    func cancelDownloadAndWait(id: UUID) async {
+        _ = await withCheckedContinuation { continuation in
+            guard stopDownload(
+                id: id,
+                reason: .cancel,
+                continuation: continuation
+            ) else {
+                continuation.resume(returning: nil)
+                return
+            }
+        }
+    }
+
+    func discardRecoveryData(id: UUID) {
+        pendingResumeSessions.removeValue(forKey: id)
+        resumableWebViews.removeValue(forKey: id)
+        try? fileManager.removeItem(at: recoveryFileURL(downloadID: id))
+    }
+
+    func discardOrphanedTemporaryFiles() {
+        guard let contents = try? fileManager.contentsOfDirectory(
+            at: temporaryDirectory,
+            includingPropertiesForKeys: nil
+        ) else {
             return
         }
 
-        activeSession.hasStartedDownload = true
-        activeSession.statusMessage = "Starting secure browser-backed download…"
+        for url in contents {
+            guard url.pathExtension == "download",
+                  UUID(uuidString: url.deletingPathExtension().lastPathComponent) != nil else {
+                continue
+            }
+            try? fileManager.removeItem(at: url)
+        }
+    }
+
+    private func track(
+        download: WKDownload,
+        for session: BrowserDownloadSession,
+        isResumeAttempt: Bool = false
+    ) {
+        guard activeSession?.id == session.id,
+              activeDownloadsByID[session.downloadID] == nil
+        else {
+            cancelUnownedDownload(download)
+            return
+        }
+
+        session.hasStartedDownload = true
+        session.statusMessage = "Starting secure browser-backed download…"
 
         downloadContexts[ObjectIdentifier(download)] = DownloadContext(
-            downloadID: activeSession.downloadID,
-            sourceURL: activeSession.sourceURL,
+            downloadID: session.downloadID,
+            sourceURL: session.sourceURL,
+            webView: session.webView,
+            isResumeAttempt: isResumeAttempt,
             suggestedFilename: nil,
             responseMimeType: nil,
             statusCode: nil,
             expectedBytes: 0,
-            temporaryURL: nil
+            temporaryURL: nil,
+            terminationReason: nil
         )
 
+        activeDownloadsByID[session.downloadID] = download
         download.delegate = self
+    }
+
+    private func clearActiveSession(matching context: DownloadContext) {
+        guard activeSession?.downloadID == context.downloadID,
+              activeSession?.webView === context.webView else {
+            return
+        }
+
+        activeSession = nil
+    }
+
+    @discardableResult
+    private func stopDownload(
+        id: UUID,
+        reason: TerminationReason,
+        continuation: CheckedContinuation<Data?, Never>?
+    ) -> Bool {
+        guard let download = activeDownloadsByID[id] else {
+            return false
+        }
+
+        let key = ObjectIdentifier(download)
+        guard var context = downloadContexts[key] else {
+            return false
+        }
+
+        context.terminationReason = reason
+        downloadContexts[key] = context
+        download.cancel { [weak self] resumeData in
+            guard let self else {
+                continuation?.resume(returning: resumeData)
+                return
+            }
+
+            self.activeDownloadsByID.removeValue(forKey: id)
+            let stoppedContext = self.downloadContexts.removeValue(forKey: key) ?? context
+
+            switch reason {
+            case .pause:
+                if let temporaryURL = stoppedContext.temporaryURL {
+                    try? self.fileManager.removeItem(at: temporaryURL)
+                }
+                if resumeData != nil {
+                    self.resumableWebViews[id] = stoppedContext.webView
+                } else {
+                    self.resumableWebViews.removeValue(forKey: id)
+                }
+            case .cancel:
+                self.resumableWebViews.removeValue(forKey: id)
+                if let temporaryURL = stoppedContext.temporaryURL {
+                    try? self.fileManager.removeItem(at: temporaryURL)
+                }
+            }
+
+            continuation?.resume(returning: resumeData)
+        }
+        return true
     }
 
     private func shouldDownloadInBrowser(response: URLResponse, isForMainFrame: Bool) -> Bool {
@@ -172,30 +377,36 @@ final class BrowserDownloadCoordinator: NSObject {
         return false
     }
 
-    private func temporaryDownloadURL(
-        suggestedFilename: String?,
-        sourceURL: URL
-    ) throws -> URL {
+    private func temporaryDownloadURL(downloadID: UUID) throws -> URL {
         try fileManager.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
 
-        let filename = destinationResolver.resolvedFilename(
-            custom: nil,
-            responseSuggestedFilename: suggestedFilename,
-            sourceURL: sourceURL
-        )
+        return recoveryFileURL(downloadID: downloadID)
+    }
 
-        return temporaryDirectory
-            .appendingPathComponent("\(UUID().uuidString)-\(filename)")
+    private func recoveryFileURL(downloadID: UUID) -> URL {
+        temporaryDirectory
+            .appendingPathComponent(downloadID.uuidString)
+            .appendingPathExtension("download")
+    }
+
+    private func session(for webView: WKWebView) -> BrowserDownloadSession? {
+        guard let activeSession, activeSession.webView === webView else {
+            return nil
+        }
+
+        return activeSession
     }
 
     private func refreshSessionURL(from webView: WKWebView) {
-        if let url = webView.url {
-            activeSession?.currentURL = url
+        guard let session = session(for: webView), let url = webView.url else {
+            return
         }
+
+        session.currentURL = url
     }
 
-    private func completeNavigationFailure(_ error: Error) {
-        guard let activeSession else {
+    private func completeNavigationFailure(_ error: Error, from webView: WKWebView) {
+        guard let activeSession = session(for: webView) else {
             return
         }
 
@@ -205,7 +416,12 @@ final class BrowserDownloadCoordinator: NSObject {
 
         let downloadID = activeSession.downloadID
         self.activeSession = nil
-        onEvent(.failed(id: downloadID, message: error.localizedDescription))
+        onEvent(
+            .failed(
+                id: downloadID,
+                failure: DirectDownloadFailure(error: error, resumeData: nil)
+            )
+        )
     }
 }
 
@@ -223,7 +439,7 @@ extension BrowserDownloadCoordinator: WKNavigationDelegate {
         decidePolicyFor navigationResponse: WKNavigationResponse,
         decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
     ) {
-        guard let activeSession else {
+        guard let activeSession = session(for: webView) else {
             decisionHandler(.cancel)
             return
         }
@@ -242,7 +458,11 @@ extension BrowserDownloadCoordinator: WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-        activeSession?.isLoading = true
+        guard let activeSession = session(for: webView) else {
+            return
+        }
+
+        activeSession.isLoading = true
         refreshSessionURL(from: webView)
     }
 
@@ -255,17 +475,21 @@ extension BrowserDownloadCoordinator: WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        activeSession?.isLoading = false
-        activeSession?.pageTitle = webView.title
+        guard let activeSession = session(for: webView) else {
+            return
+        }
+
+        activeSession.isLoading = false
+        activeSession.pageTitle = webView.title
         refreshSessionURL(from: webView)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        completeNavigationFailure(error)
+        completeNavigationFailure(error, from: webView)
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        completeNavigationFailure(error)
+        completeNavigationFailure(error, from: webView)
     }
 
     func webView(
@@ -277,11 +501,19 @@ extension BrowserDownloadCoordinator: WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
-        track(download: download)
+        guard let activeSession, activeSession.webView === webView else {
+            cancelUnownedDownload(download)
+            return
+        }
+        track(download: download, for: activeSession)
     }
 
     func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
-        track(download: download)
+        guard let activeSession, activeSession.webView === webView else {
+            cancelUnownedDownload(download)
+            return
+        }
+        track(download: download, for: activeSession)
     }
 }
 
@@ -300,10 +532,13 @@ extension BrowserDownloadCoordinator: WKDownloadDelegate {
         }
 
         do {
-            let temporaryURL = try temporaryDownloadURL(
-                suggestedFilename: suggestedFilename,
-                sourceURL: context.sourceURL
-            )
+            let temporaryURL = try temporaryDownloadURL(downloadID: context.downloadID)
+
+            // WebKit requires every proposed destination, including a resumed one,
+            // to be absent when the delegate supplies it.
+            if fileManager.fileExists(atPath: temporaryURL.path) {
+                try fileManager.removeItem(at: temporaryURL)
+            }
 
             context.suggestedFilename = suggestedFilename
             context.responseMimeType = response.mimeType
@@ -314,21 +549,33 @@ extension BrowserDownloadCoordinator: WKDownloadDelegate {
 
             completionHandler(temporaryURL)
 
-            activeSession = nil
+            clearActiveSession(matching: context)
             onEvent(
                 .started(
                     id: context.downloadID,
                     suggestedFilename: suggestedFilename,
                     expectedBytes: context.expectedBytes,
                     responseMimeType: context.responseMimeType,
-                    statusCode: context.statusCode
+                    statusCode: context.statusCode,
+                    isResumed: context.isResumeAttempt
                 )
             )
         } catch {
             completionHandler(nil)
-            activeSession = nil
+            clearActiveSession(matching: context)
             downloadContexts.removeValue(forKey: key)
-            onEvent(.failed(id: context.downloadID, message: error.localizedDescription))
+            activeDownloadsByID.removeValue(forKey: context.downloadID)
+            resumableWebViews.removeValue(forKey: context.downloadID)
+            onEvent(
+                .failed(
+                    id: context.downloadID,
+                    failure: DirectDownloadFailure(
+                        error: error,
+                        resumeData: nil,
+                        wasResuming: context.isResumeAttempt
+                    )
+                )
+            )
         }
     }
 
@@ -358,6 +605,9 @@ extension BrowserDownloadCoordinator: WKDownloadDelegate {
             return
         }
 
+        activeDownloadsByID.removeValue(forKey: context.downloadID)
+        resumableWebViews.removeValue(forKey: context.downloadID)
+
         onEvent(
             .finished(
                 id: context.downloadID,
@@ -372,15 +622,37 @@ extension BrowserDownloadCoordinator: WKDownloadDelegate {
 
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
         let key = ObjectIdentifier(download)
-        let context = downloadContexts.removeValue(forKey: key)
+        guard let context = downloadContexts[key] else {
+            return
+        }
 
-        if let temporaryURL = context?.temporaryURL {
+        if context.terminationReason != nil {
+            return
+        }
+
+        downloadContexts.removeValue(forKey: key)
+        activeDownloadsByID.removeValue(forKey: context.downloadID)
+
+        if let temporaryURL = context.temporaryURL {
             try? fileManager.removeItem(at: temporaryURL)
         }
 
-        if let downloadID = context?.downloadID {
-            onEvent(.failed(id: downloadID, message: error.localizedDescription))
+        if resumeData != nil {
+            resumableWebViews[context.downloadID] = context.webView
+        } else {
+            resumableWebViews.removeValue(forKey: context.downloadID)
         }
+
+        onEvent(
+            .failed(
+                id: context.downloadID,
+                failure: DirectDownloadFailure(
+                    error: error,
+                    resumeData: resumeData,
+                    wasResuming: context.isResumeAttempt
+                )
+            )
+        )
     }
 }
 
@@ -399,6 +671,10 @@ extension BrowserDownloadCoordinator: WKUIDelegate {
     }
 
     func webViewDidClose(_ webView: WKWebView) {
+        guard session(for: webView) != nil else {
+            return
+        }
+
         cancelSession()
     }
 }

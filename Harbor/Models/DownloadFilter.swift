@@ -69,6 +69,7 @@ enum DownloadFilter: String, CaseIterable, Identifiable, Hashable {
         case .active:
             item.status == .queued
                 || item.status == .preparing
+                || item.status == .waitingToRetry
                 || item.status == .downloading
                 || item.status == .seeding
         case .paused:

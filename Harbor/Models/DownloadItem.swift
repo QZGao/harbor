@@ -11,6 +11,7 @@ enum DownloadStatus: String, Codable, CaseIterable, Sendable {
     case completed
     case failed
     case cancelled
+    case waitingToRetry
 
     var title: LocalizedStringResource {
         switch self {
@@ -18,6 +19,8 @@ enum DownloadStatus: String, Codable, CaseIterable, Sendable {
             LocalizedStringResource("status.queued", defaultValue: "Queued")
         case .preparing:
             LocalizedStringResource("status.preparing", defaultValue: "Preparing")
+        case .waitingToRetry:
+            LocalizedStringResource("status.waitingToRetry", defaultValue: "Waiting to Retry")
         case .downloading:
             LocalizedStringResource("status.downloading", defaultValue: "Downloading")
         case .seeding:
@@ -41,6 +44,8 @@ enum DownloadStatus: String, Codable, CaseIterable, Sendable {
             "clock.arrow.circlepath"
         case .preparing:
             "ellipsis.circle"
+        case .waitingToRetry:
+            "clock.arrow.circlepath"
         case .downloading:
             "arrow.down.circle.fill"
         case .seeding:
@@ -62,12 +67,16 @@ enum DownloadStatus: String, Codable, CaseIterable, Sendable {
         switch self {
         case .completed, .failed, .cancelled:
             true
-        case .queued, .preparing, .downloading, .seeding, .browserSessionRequired, .paused:
+        case .queued, .preparing, .waitingToRetry, .downloading, .seeding, .browserSessionRequired, .paused:
             false
         }
     }
 
     var isRunning: Bool {
+        self == .preparing || self == .waitingToRetry || self == .downloading
+    }
+
+    var consumesDownloadSlot: Bool {
         self == .preparing || self == .downloading
     }
 }
@@ -120,6 +129,7 @@ struct DownloadRecord: Codable, Sendable {
     let updatedAt: Date
     let lastError: String?
     let resumeData: Data?
+    let browserResumeData: Data?
     let backendIdentifier: String?
     let metadataName: String?
     let mediaMetadata: MediaDownloadMetadata?
@@ -152,6 +162,7 @@ struct DownloadRecord: Codable, Sendable {
         case updatedAt
         case lastError
         case resumeData
+        case browserResumeData
         case backendIdentifier
         case metadataName
         case mediaMetadata
@@ -185,6 +196,7 @@ struct DownloadRecord: Codable, Sendable {
         updatedAt: Date,
         lastError: String?,
         resumeData: Data?,
+        browserResumeData: Data? = nil,
         backendIdentifier: String?,
         metadataName: String?,
         mediaMetadata: MediaDownloadMetadata? = nil,
@@ -216,6 +228,7 @@ struct DownloadRecord: Codable, Sendable {
         self.updatedAt = updatedAt
         self.lastError = lastError
         self.resumeData = resumeData
+        self.browserResumeData = browserResumeData
         self.backendIdentifier = backendIdentifier
         self.metadataName = metadataName
         self.mediaMetadata = mediaMetadata
@@ -251,6 +264,7 @@ struct DownloadRecord: Codable, Sendable {
         self.updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? .now
         self.lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
         self.resumeData = try container.decodeIfPresent(Data.self, forKey: .resumeData)
+        self.browserResumeData = try container.decodeIfPresent(Data.self, forKey: .browserResumeData)
         self.backendIdentifier = try container.decodeIfPresent(String.self, forKey: .backendIdentifier)
         self.metadataName = try container.decodeIfPresent(String.self, forKey: .metadataName)
         self.mediaMetadata = try container.decodeIfPresent(MediaDownloadMetadata.self, forKey: .mediaMetadata)
@@ -304,6 +318,7 @@ struct DownloadRecord: Codable, Sendable {
         try container.encode(updatedAt, forKey: .updatedAt)
         try container.encode(lastError, forKey: .lastError)
         try container.encode(resumeData, forKey: .resumeData)
+        try container.encode(browserResumeData, forKey: .browserResumeData)
         try container.encode(backendIdentifier, forKey: .backendIdentifier)
         try container.encode(metadataName, forKey: .metadataName)
         try container.encode(mediaMetadata, forKey: .mediaMetadata)
@@ -351,6 +366,7 @@ final class DownloadItem: Identifiable {
     var updatedAt: Date
     var lastError: String?
     var resumeData: Data?
+    var browserResumeData: Data?
     var taskIdentifier: Int?
     var backendIdentifier: String?
     var metadataName: String?
@@ -386,6 +402,7 @@ final class DownloadItem: Identifiable {
         updatedAt: Date = .now,
         lastError: String? = nil,
         resumeData: Data? = nil,
+        browserResumeData: Data? = nil,
         taskIdentifier: Int? = nil,
         backendIdentifier: String? = nil,
         metadataName: String? = nil,
@@ -420,6 +437,7 @@ final class DownloadItem: Identifiable {
         self.updatedAt = updatedAt
         self.lastError = lastError
         self.resumeData = resumeData
+        self.browserResumeData = browserResumeData
         self.taskIdentifier = taskIdentifier
         self.backendIdentifier = backendIdentifier
         self.metadataName = metadataName
@@ -465,6 +483,7 @@ final class DownloadItem: Identifiable {
             updatedAt: record.updatedAt,
             lastError: record.lastError,
             resumeData: record.resumeData,
+            browserResumeData: record.browserResumeData,
             taskIdentifier: nil,
             backendIdentifier: record.backendIdentifier,
             metadataName: record.metadataName,
@@ -616,7 +635,7 @@ final class DownloadItem: Identifiable {
         }
 
         switch status {
-        case .queued, .preparing, .downloading:
+        case .queued, .preparing, .waitingToRetry, .downloading:
             return String(localized: "Waiting", comment: "Speed status fallback")
         case .seeding, .browserSessionRequired, .paused, .completed, .failed, .cancelled:
             return "-"
@@ -646,7 +665,7 @@ final class DownloadItem: Identifiable {
     }
 
     var canPause: Bool {
-        status == .preparing || status == .downloading || status == .seeding
+        status == .preparing || status == .waitingToRetry || status == .downloading || status == .seeding
     }
 
     var canResume: Bool {
@@ -672,6 +691,7 @@ final class DownloadItem: Identifiable {
             updatedAt: updatedAt,
             lastError: lastError,
             resumeData: resumeData,
+            browserResumeData: browserResumeData,
             backendIdentifier: backendIdentifier,
             metadataName: metadataName,
             mediaMetadata: mediaMetadata?.persistenceSnapshot,

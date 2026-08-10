@@ -88,7 +88,9 @@ struct DownloadCommands: Commands {
             .disabled(center.hasCompletedDownloads == false)
 
             Button("Clear Failed") {
-                center.clearFailed()
+                Task {
+                    await center.clearFailed()
+                }
             }
             .disabled(center.hasFailedDownloads == false)
         }

@@ -104,6 +104,13 @@ private final class TorrentEngineLogBuffer: @unchecked Sendable {
 }
 
 actor Aria2TorrentService {
+    nonisolated static let recoveryOptions = [
+        "continue": "true",
+        "max-tries": "10",
+        "retry-wait": "5",
+        "bt-stop-timeout": "0"
+    ]
+
     private struct RPCEnvelope<Result: Decodable>: Decodable {
         let result: Result?
         let error: RPCFailure?
@@ -554,9 +561,7 @@ actor Aria2TorrentService {
         let secret = UUID().uuidString.replacingOccurrences(of: "-", with: "")
         let sessionFileURL = try prepareSessionFile()
 
-        let process = Process()
-        process.executableURL = binaryURL
-        process.arguments = [
+        var arguments = [
             "--enable-rpc=true",
             "--rpc-listen-all=false",
             "--rpc-listen-port=\(port)",
@@ -572,7 +577,13 @@ actor Aria2TorrentService {
             "--bt-load-saved-metadata=true",
             "--follow-torrent=true",
             "--allow-overwrite=false",
-            "--auto-file-renaming=true",
+            "--auto-file-renaming=true"
+        ]
+        let recoveryArguments = Self.recoveryOptions
+            .sorted { $0.key < $1.key }
+            .map { "--\($0.key)=\($0.value)" }
+        arguments.append(contentsOf: recoveryArguments)
+        arguments.append(contentsOf: [
             "--summary-interval=0",
             "--max-concurrent-downloads=\(transferSettings.maxConcurrentDownloads)",
             "--max-overall-download-limit=\(Self.aria2LimitString(transferSettings.globalSpeedLimitBytesPerSecond))",
@@ -583,7 +594,11 @@ actor Aria2TorrentService {
             "--split=\(transferSettings.perDownloadConnectionCount)",
             "--check-certificate=true",
             "--console-log-level=notice"
-        ]
+        ])
+
+        let process = Process()
+        process.executableURL = binaryURL
+        process.arguments = arguments
         startupLogBuffer.reset()
         let stderrPipe = Pipe()
         process.standardOutput = stderrPipe
@@ -754,9 +769,12 @@ actor Aria2TorrentService {
     ) -> [String: String] {
         var options = [
             "dir": destinationFolderPath,
-            "continue": "true",
             "pause": "false"
         ]
+
+        Self.recoveryOptions.forEach { key, value in
+            options[key] = value
+        }
 
         Self.perDownloadOptions(
             transferSettings,

@@ -520,7 +520,7 @@ private struct DownloadHeader: View {
             .red
         case .cancelled:
             .secondary
-        case .queued, .preparing:
+        case .queued, .preparing, .waitingToRetry:
             .orange
         }
     }
@@ -1037,7 +1037,7 @@ private struct DownloadActivitySection: View {
         switch item.status {
         case .queued:
             appendSyntheticEvent(kind: .queued, timestamp: item.updatedAt, to: &entries)
-        case .preparing, .downloading:
+        case .preparing, .waitingToRetry, .downloading:
             if entries.contains(where: { $0.kind == .started || $0.kind == .resumed }) == false {
                 appendSyntheticEvent(kind: .started, timestamp: item.startedAt ?? item.updatedAt, to: &entries)
             }
