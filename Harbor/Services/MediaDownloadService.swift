@@ -3,13 +3,18 @@ import CryptoKit
 import Foundation
 import OSLog
 
+nonisolated enum MediaDownloadFailureDisposition: Sendable {
+    case ordinary
+    case outputConflict
+}
+
 enum MediaDownloadEvent: Sendable {
     case started(id: UUID, processIdentifier: Int32, expectedBytes: Int64, title: String?, platform: String?)
     case progress(id: UUID, bytesWritten: Int64, expectedBytes: Int64, speedBytesPerSecond: Double)
     case paused(id: UUID)
     case cancelled(id: UUID)
     case finished(id: UUID, fileURL: URL, payloadURLs: [URL], expectedBytes: Int64)
-    case failed(id: UUID, message: String)
+    case failed(id: UUID, message: String, disposition: MediaDownloadFailureDisposition)
 }
 
 struct MediaTerminalOutcome: Sendable {
@@ -64,17 +69,71 @@ nonisolated enum MediaCompletionEntry: Sendable {
     case unavailable(downloadID: UUID, message: String)
 }
 
+nonisolated struct MediaProcessOwnershipManifest: Codable, Equatable, Sendable {
+    static let currentVersion = 1
+
+    let version: Int
+    let downloadID: UUID
+    let attemptIdentifier: UUID
+    let pid: pid_t
+    let processGroupIdentifier: pid_t
+    let launchedExecutablePath: String
+    let executablePath: String
+    let temporaryFolderPath: String
+    let startSignature: String
+    let command: String
+    let createdAt: Date
+
+    init(
+        downloadID: UUID,
+        attemptIdentifier: UUID,
+        pid: pid_t,
+        processGroupIdentifier: pid_t,
+        launchedExecutablePath: String,
+        executablePath: String,
+        temporaryFolderPath: String,
+        startSignature: String,
+        command: String,
+        createdAt: Date = .now
+    ) {
+        self.version = Self.currentVersion
+        self.downloadID = downloadID
+        self.attemptIdentifier = attemptIdentifier
+        self.pid = pid
+        self.processGroupIdentifier = processGroupIdentifier
+        self.launchedExecutablePath = launchedExecutablePath
+        self.executablePath = executablePath
+        self.temporaryFolderPath = temporaryFolderPath
+        self.startSignature = startSignature
+        self.command = command
+        self.createdAt = createdAt
+    }
+}
+
+nonisolated struct MediaRunningProcess: Equatable, Sendable {
+    let pid: pid_t
+    let parentPID: pid_t
+    let processGroupIdentifier: pid_t
+    let executablePath: String?
+    let startSignature: String?
+    let command: String
+}
+
 enum MediaDownloadError: LocalizedError {
     case runtimeNotFound
     case unsupported(String)
     case unavailable(String)
     case processFailed(String)
+    case outputConflict(String)
 
     var errorDescription: String? {
         switch self {
         case .runtimeNotFound:
             MediaRuntimeResolver.installHint
-        case let .unsupported(message), let .unavailable(message), let .processFailed(message):
+        case let .unsupported(message),
+             let .unavailable(message),
+             let .processFailed(message),
+             let .outputConflict(message):
             message
         }
     }
@@ -99,7 +158,7 @@ actor MediaDownloadService {
         }
     }
 
-    private struct RegularFileIdentity: Equatable {
+    struct RegularFileIdentity: Equatable, Sendable {
         let device: dev_t
         let inode: ino_t
         let size: off_t
@@ -114,8 +173,10 @@ actor MediaDownloadService {
         let attemptIdentifier: UUID
         let sourceURL: URL
         let process: ManagedChildProcess
+        let processOwnership: MediaProcessOwnershipManifest
         let destinationFolder: URL
         let temporaryFolder: URL
+        let preexistingDestinationFiles: [String: RegularFileIdentity]
         let metadata: MediaDownloadMetadata?
         var terminationReason: TerminationReason?
         var stdoutBuffer = ""
@@ -123,12 +184,9 @@ actor MediaDownloadService {
         var expectedBytes: Int64
     }
 
-    private struct RunningProcess {
-        let pid: pid_t
-        let parentPID: pid_t
-        let processGroupIdentifier: pid_t
-        let startSignature: String
-        let command: String
+    private struct StartingDownload {
+        let attemptIdentifier: UUID
+        let destinationPath: String
     }
 
     nonisolated private let logger = Logger(
@@ -141,10 +199,11 @@ actor MediaDownloadService {
     private let temporaryRoot: URL
     private var runtime: MediaRuntimeResolution?
     private var runningDownloads: [UUID: RunningDownload] = [:]
+    private var startingDownloads: [UUID: StartingDownload] = [:]
     private var terminationWaiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
     private var terminalOutcomes: [UUID: MediaTerminalOutcome] = [:]
-    private var hasCleanedOrphans = false
     private static let completionManifestFilename = ".harbor-completion.json"
+    private static let processOwnershipManifestFilename = ".harbor-process-owner.json"
 
     init(
         eventHandler: @escaping EventHandler,
@@ -177,8 +236,10 @@ actor MediaDownloadService {
         destinationFolder: URL,
         metadata: MediaDownloadMetadata?,
         formatPreference: MediaDownloadFormatPreference,
+        outputConflictIdentifier: UUID? = nil,
         speedLimitBytesPerSecond: Int64? = nil
     ) async throws -> Int32 {
+        try Task.checkCancellation()
         if let existing = runningDownloads[id] {
             guard existing.attemptIdentifier == attemptIdentifier else {
                 throw MediaDownloadError.unavailable(
@@ -186,6 +247,11 @@ actor MediaDownloadService {
                 )
             }
             return existing.process.processIdentifier
+        }
+        guard startingDownloads[id] == nil else {
+            throw MediaDownloadError.unavailable(
+                "The previous media start is still being prepared."
+            )
         }
         if try completionManifestExists(id: id) {
             throw MediaDownloadError.unavailable(
@@ -200,12 +266,73 @@ actor MediaDownloadService {
             )
         }
 
-        let runtime = try resolvedRuntime()
-        try await cleanupOrphanedMediaProcessesIfNeeded(runtime: runtime)
+        let destinationPath = destinationFolder.standardizedFileURL
+            .resolvingSymlinksInPath().path
+        let hasCompetingDestination = runningDownloads.values.contains {
+            $0.destinationFolder.standardizedFileURL
+                .resolvingSymlinksInPath().path == destinationPath
+        } || startingDownloads.values.contains {
+            $0.destinationPath == destinationPath
+        }
+        startingDownloads[id] = StartingDownload(
+            attemptIdentifier: attemptIdentifier,
+            destinationPath: destinationPath
+        )
+        defer {
+            if startingDownloads[id]?.attemptIdentifier == attemptIdentifier {
+                startingDownloads.removeValue(forKey: id)
+            }
+        }
+        let effectiveOutputIdentifier = Self.outputIdentifier(
+            requested: outputConflictIdentifier,
+            downloadID: id,
+            hasCompetingDestination: hasCompetingDestination
+        )
 
+        let runtime = try resolvedRuntime()
         let temporaryFolder = temporaryFolder(for: id)
-        try fileManager.createDirectory(at: temporaryFolder, withIntermediateDirectories: true)
+        try await cleanupOrphanedMediaProcessesIfNeeded()
+        // A quit, pause, or removal can cancel the owning start task while
+        // orphan reconciliation is suspended. Do not cross the non-idempotent
+        // process-spawn boundary after that cancellation.
+        try Task.checkCancellation()
+        let processes = try runningProcesses()
+        let trackedProcessGroups = Set(
+            runningDownloads.values.map(\.processOwnership.processGroupIdentifier)
+        )
+        guard Self.hasUntrackedProcessReferencingRecoveryRoot(
+            temporaryRoot,
+            in: processes,
+            trackedProcessGroups: trackedProcessGroups
+        ) == false else {
+            throw MediaDownloadError.unavailable(
+                "A previous unverified media process may still be writing. Harbor left it untouched and did not start another download."
+            )
+        }
+        guard Self.hasProcessReferencingRecoveryFolder(
+            temporaryFolder,
+            in: processes
+        ) == false else {
+            // A crash can occur after spawn but before the exact ownership
+            // marker is durable. The UUID recovery path is still a reliable
+            // per-item exclusion key, but it is not authority to signal an
+            // unknown process. Preserve the existing writer and refuse to
+            // create a second one.
+            throw MediaDownloadError.unavailable(
+                "A previous media process may still be using this download’s recovery data. Harbor left it untouched."
+            )
+        }
+        guard try itemExists(at: processOwnershipManifestURL(id: id)) == false else {
+            throw MediaDownloadError.unavailable(
+                "Harbor found an unverifiable owner for this download’s recovery data and left it untouched."
+            )
+        }
+
+        try createAndValidateTemporaryFolder(temporaryFolder)
         try fileManager.createDirectory(at: destinationFolder, withIntermediateDirectories: true)
+        let preexistingDestinationFiles = try destinationFileIdentities(
+            in: destinationFolder
+        )
 
         let arguments = try Self.downloadArguments(
             runtime: runtime,
@@ -214,6 +341,7 @@ actor MediaDownloadService {
             temporaryFolder: temporaryFolder,
             metadata: metadata,
             formatPreference: formatPreference,
+            outputConflictIdentifier: effectiveOutputIdentifier,
             speedLimitBytesPerSecond: speedLimitBytesPerSecond
         )
 
@@ -259,6 +387,27 @@ actor MediaDownloadService {
             }
         )
 
+        let processOwnership: MediaProcessOwnershipManifest
+        do {
+            processOwnership = try persistProcessOwnership(
+                processIdentifier: process.processIdentifier,
+                downloadID: id,
+                attemptIdentifier: attemptIdentifier,
+                executableURL: runtime.ytDlpURL,
+                temporaryFolder: temporaryFolder
+            )
+        } catch {
+            // A child without a durable identity must never be treated as a
+            // recoverable background writer. Stop the still-owned direct child;
+            // its callback cannot publish because no RunningDownload exists.
+            process.terminate(grace: 0.2)
+            throw MediaDownloadError.outputConflict(
+                "Harbor could not durably record the media process owner after it started. "
+                    + "The process was stopped and the next attempt will use a collision-safe filename. "
+                    + error.localizedDescription
+            )
+        }
+
         let expectedBytes = formatPreference.initialExpectedBytes(
             metadataEstimate: metadata?.expectedBytes ?? 0
         )
@@ -267,8 +416,10 @@ actor MediaDownloadService {
             attemptIdentifier: attemptIdentifier,
             sourceURL: sourceURL,
             process: process,
+            processOwnership: processOwnership,
             destinationFolder: destinationFolder,
             temporaryFolder: temporaryFolder,
+            preexistingDestinationFiles: preexistingDestinationFiles,
             metadata: metadata,
             expectedBytes: expectedBytes
         )
@@ -320,9 +471,21 @@ actor MediaDownloadService {
     }
 
     func discardRecoveryData(id: UUID) throws {
-        guard runningDownloads[id] == nil else {
+        guard runningDownloads[id] == nil,
+              startingDownloads[id] == nil else {
             throw MediaDownloadError.unavailable(
                 "Harbor couldn’t clear the previous media download while it was still running."
+            )
+        }
+
+        // After relaunch, an owned child is no longer represented by
+        // `runningDownloads`. Its durable marker is the only evidence that a
+        // writer may still exist, so explicit cleanup must fail closed until
+        // orphan reconciliation verifies the process has stopped and retires
+        // that marker.
+        guard try itemExists(at: processOwnershipManifestURL(id: id)) == false else {
+            throw MediaDownloadError.unavailable(
+                "Harbor couldn’t clear this media download while a previous process may still own its recovery data."
             )
         }
 
@@ -331,6 +494,7 @@ actor MediaDownloadService {
         guard try itemExists(at: folder) else {
             return
         }
+        try validateTemporaryFolder(folder)
         try fileManager.removeItem(at: folder)
         try DurableFileSystem.synchronizeParentDirectory(of: folder)
     }
@@ -339,6 +503,7 @@ actor MediaDownloadService {
         guard try itemExists(at: temporaryRoot) else {
             return
         }
+        try validateTemporaryRoot()
         let entries = try fileManager.contentsOfDirectory(
             at: temporaryRoot,
             includingPropertiesForKeys: [.isDirectoryKey],
@@ -359,6 +524,7 @@ actor MediaDownloadService {
             guard values.isDirectory == true,
                   values.isSymbolicLink != true,
                   retainedIDs.contains(id) == false,
+                  try itemExists(at: processOwnershipManifestURL(id: id)) == false,
                   runningProcessCommands.contains(where: { $0.contains(entry.path) }) == false,
                   runningDownloads[id] == nil else {
                 continue
@@ -371,7 +537,7 @@ actor MediaDownloadService {
 
     func recoverableByteCount(id: UUID) -> Int64? {
         let folder = temporaryFolder(for: id)
-        guard fileManager.fileExists(atPath: folder.path),
+        guard (try? validateTemporaryFolder(folder)) != nil,
               let enumerator = fileManager.enumerator(
                   at: folder,
                   includingPropertiesForKeys: [
@@ -404,8 +570,7 @@ actor MediaDownloadService {
     }
 
     func terminateOrphanedMediaProcesses() async throws {
-        let resolvedRuntime = try? resolvedRuntime()
-        try await cleanupOrphanedMediaProcessesIfNeeded(runtime: resolvedRuntime)
+        try await cleanupOrphanedMediaProcessesIfNeeded()
     }
 
     func cancelAndWait(id: UUID) async {
@@ -429,6 +594,7 @@ actor MediaDownloadService {
         guard try itemExists(at: temporaryRoot) else {
             return []
         }
+        try validateTemporaryRoot()
         let folders = try fileManager.contentsOfDirectory(
             at: temporaryRoot,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
@@ -513,6 +679,7 @@ actor MediaDownloadService {
         terminalOutcomes.removeValue(forKey: id)
         let folder = temporaryFolder(for: id)
         if try itemExists(at: folder) {
+            try validateTemporaryFolder(folder)
             try fileManager.removeItem(at: folder)
             try DurableFileSystem.synchronizeParentDirectory(of: folder)
         }
@@ -523,6 +690,7 @@ actor MediaDownloadService {
         guard try itemExists(at: url) else {
             return
         }
+        try validateTemporaryFolder(temporaryFolder(for: id))
         try fileManager.removeItem(at: url)
         try DurableFileSystem.synchronizeParentDirectory(of: url)
     }
@@ -643,6 +811,15 @@ actor MediaDownloadService {
         }
         let download = current
         runningDownloads.removeValue(forKey: id)
+        do {
+            try discardProcessOwnership(for: download)
+        } catch {
+            // The child has already been reaped. A stale exact-identity marker
+            // is harmless and will be retired by the next ownership scan.
+            logger.warning(
+                "Could not retire media process ownership for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+        }
 
         let waiters = terminationWaiters.removeValue(forKey: id) ?? []
         defer {
@@ -670,7 +847,11 @@ actor MediaDownloadService {
                     // completed representation back into resumable partial
                     // state merely because journaling failed late.
                     emitTerminal(
-                        .failed(id: id, message: error.localizedDescription),
+                        .failed(
+                            id: id,
+                            message: error.localizedDescription,
+                            disposition: .outputConflict
+                        ),
                         for: download
                     )
                     return
@@ -701,18 +882,25 @@ actor MediaDownloadService {
             emitTerminal(
                 .failed(
                     id: id,
-                    message: MediaDownloadErrorClassifier.message(from: capturedStderr)
+                    message: MediaDownloadErrorClassifier.message(from: capturedStderr),
+                    disposition: .ordinary
                 ),
                 for: download
             )
             return
         }
 
+        // A clean process exit may already have placed destination bytes even
+        // when path parsing, validation, hashing, or journal publication fails.
+        // The next attempt must therefore use a collision-safe output name;
+        // retrying the original --no-overwrites path can only rediscover stale
+        // bytes and require a second user-visible retry.
         emitTerminal(
             .failed(
                 id: id,
                 message: successfulCompletionError?.localizedDescription
-                    ?? "yt-dlp finished without reporting a completed file."
+                    ?? "yt-dlp finished without reporting a completed file.",
+                disposition: .outputConflict
             ),
             for: download
         )
@@ -743,6 +931,9 @@ actor MediaDownloadService {
                     "yt-dlp finished without reporting any completed files."
                 )
             }
+            try validatedFiles.forEach {
+                try requireAttemptProduced($0.url, for: download)
+            }
             let uniqueFiles = Dictionary(
                 validatedFiles.map { ($0.url.standardizedFileURL.path, $0.byteCount) },
                 uniquingKeysWith: { _, latest in latest }
@@ -765,6 +956,7 @@ actor MediaDownloadService {
                 reportedURL,
                 destinationFolder: download.destinationFolder
             )
+            try requireAttemptProduced(validatedFile.url, for: download)
             fileURL = validatedFile.url
             payloadURLs = [validatedFile.url]
             actualBytes = validatedFile.byteCount
@@ -892,8 +1084,15 @@ actor MediaDownloadService {
         temporaryFolder: URL,
         metadata: MediaDownloadMetadata?,
         formatPreference: MediaDownloadFormatPreference,
+        outputConflictIdentifier: UUID? = nil,
         speedLimitBytesPerSecond: Int64?
     ) throws -> [String] {
+        let outputTemplate: String
+        if let outputConflictIdentifier {
+            outputTemplate = "%(title).180B [%(id)s] [Harbor \(outputConflictIdentifier.uuidString)].%(ext)s"
+        } else {
+            outputTemplate = "%(title).180B [%(id)s].%(ext)s"
+        }
         var arguments = [
             "--ignore-config",
             "--no-cache-dir",
@@ -923,7 +1122,7 @@ actor MediaDownloadService {
             "--paths",
             "temp:\(temporaryFolder.path)",
             "--output",
-            "%(title).180B [%(id)s].%(ext)s",
+            outputTemplate,
             "--print",
             "after_move:harbor-file:%(filepath)j",
             "--progress-template",
@@ -959,6 +1158,14 @@ actor MediaDownloadService {
 
         arguments.append(sourceURL.absoluteString)
         return arguments
+    }
+
+    nonisolated static func outputIdentifier(
+        requested: UUID?,
+        downloadID: UUID,
+        hasCompetingDestination: Bool
+    ) -> UUID? {
+        requested ?? (hasCompetingDestination ? downloadID : nil)
     }
 
     private func processEnvironment(runtime: MediaRuntimeResolution) -> [String: String] {
@@ -1055,18 +1262,19 @@ actor MediaDownloadService {
             payloads: payloads,
             actualBytes: totalBytes
         )
-        try fileManager.createDirectory(
-            at: download.temporaryFolder,
-            withIntermediateDirectories: true
-        )
+        try createAndValidateTemporaryFolder(download.temporaryFolder)
         let manifestURL = completionManifestURL(id: download.id)
-        try JSONEncoder().encode(manifest).write(to: manifestURL, options: .atomic)
+        try JSONEncoder().encode(manifest).write(
+            to: manifestURL,
+            options: [.atomic, .withoutOverwriting]
+        )
         try DurableFileSystem.synchronizeFile(at: manifestURL)
         try DurableFileSystem.synchronizeDirectory(at: download.temporaryFolder)
         try DurableFileSystem.synchronizeParentDirectory(of: download.temporaryFolder)
     }
 
     private func validatedCompletionManifest(id: UUID) throws -> MediaCompletionManifest {
+        try validateTemporaryFolder(temporaryFolder(for: id))
         let manifestURL = completionManifestURL(id: id)
         let manifestIdentity = try regularFileIdentity(at: manifestURL)
         let values = try manifestURL.resourceValues(
@@ -1177,7 +1385,7 @@ actor MediaDownloadService {
         return manifest
     }
 
-    private func regularFileIdentity(at url: URL) throws -> RegularFileIdentity {
+    func regularFileIdentity(at url: URL) throws -> RegularFileIdentity {
         var metadata = stat()
         let result = url.path.withCString { path in
             lstat(path, &metadata)
@@ -1205,6 +1413,54 @@ actor MediaDownloadService {
             statusChangeSeconds: metadata.st_ctimespec.tv_sec,
             statusChangeNanoseconds: Int64(metadata.st_ctimespec.tv_nsec)
         )
+    }
+
+    private func destinationFileIdentities(
+        in destinationFolder: URL
+    ) throws -> [String: RegularFileIdentity] {
+        let entries = try fileManager.contentsOfDirectory(
+            at: destinationFolder,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        var identities: [String: RegularFileIdentity] = [:]
+        for entry in entries {
+            let values = try entry.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            )
+            guard values.isRegularFile == true,
+                  values.isSymbolicLink != true else {
+                continue
+            }
+            let candidate = entry.standardizedFileURL.resolvingSymlinksInPath()
+            identities[candidate.path] = try regularFileIdentity(at: candidate)
+        }
+        return identities
+    }
+
+    private func requireAttemptProduced(
+        _ url: URL,
+        for download: RunningDownload
+    ) throws {
+        let candidate = url.standardizedFileURL.resolvingSymlinksInPath()
+        guard let previousIdentity = download.preexistingDestinationFiles[candidate.path] else {
+            return
+        }
+        let currentIdentity = try regularFileIdentity(at: candidate)
+        guard Self.isAttemptProducedOutput(
+            previousIdentity: previousIdentity,
+            currentIdentity: currentIdentity
+        ) else {
+            throw MediaDownloadError.outputConflict(
+                "yt-dlp reused a destination file that existed before this attempt. Retry to save the download under a collision-safe filename."
+            )
+        }
+    }
+
+    nonisolated static func isAttemptProducedOutput(
+        previousIdentity: RegularFileIdentity?,
+        currentIdentity: RegularFileIdentity
+    ) -> Bool {
+        previousIdentity == nil || previousIdentity != currentIdentity
     }
 
     private func verifiedSHA256(
@@ -1239,6 +1495,42 @@ actor MediaDownloadService {
         }
     }
 
+    private func createAndValidateTemporaryFolder(_ folder: URL) throws {
+        try fileManager.createDirectory(
+            at: folder,
+            withIntermediateDirectories: true
+        )
+        try validateTemporaryFolder(folder)
+    }
+
+    private func validateTemporaryFolder(_ folder: URL) throws {
+        try validateTemporaryRoot()
+        let folderValues = try folder.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        let resolvedRoot = temporaryRoot.standardizedFileURL.resolvingSymlinksInPath()
+        let resolvedFolder = folder.standardizedFileURL.resolvingSymlinksInPath()
+        guard folderValues.isDirectory == true,
+              folderValues.isSymbolicLink != true,
+              resolvedFolder.deletingLastPathComponent() == resolvedRoot else {
+            throw MediaDownloadError.unavailable(
+                "Harbor’s media recovery directory is not a safe owned directory."
+            )
+        }
+    }
+
+    private func validateTemporaryRoot() throws {
+        let values = try temporaryRoot.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        guard values.isDirectory == true,
+              values.isSymbolicLink != true else {
+            throw MediaDownloadError.unavailable(
+                "Harbor’s media recovery directory is not a safe owned directory."
+            )
+        }
+    }
+
     private func sha256(at url: URL) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
@@ -1251,7 +1543,15 @@ actor MediaDownloadService {
     }
 
     private func cleanupTemporaryFolder(_ folder: URL) {
-        try? fileManager.removeItem(at: folder)
+        do {
+            try validateTemporaryFolder(folder)
+            try fileManager.removeItem(at: folder)
+            try DurableFileSystem.synchronizeParentDirectory(of: folder)
+        } catch {
+            logger.warning(
+                "Could not safely remove media recovery data at \(folder.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+        }
     }
 
     private func validatedFinalFile(
@@ -1284,87 +1584,204 @@ actor MediaDownloadService {
         return (candidate, Int64(fileSize))
     }
 
-    private func cleanupOrphanedMediaProcessesIfNeeded(
-        runtime: MediaRuntimeResolution?
-    ) async throws {
-        guard hasCleanedOrphans == false else {
-            return
-        }
-
+    private func cleanupOrphanedMediaProcessesIfNeeded() async throws {
+        let ownershipMarkerIDs = try processOwnershipMarkerIDs()
+        let ownershipManifests = try processOwnershipManifests()
         let currentPID = ProcessInfo.processInfo.processIdentifier
         let currentProcessGroupIdentifier = getpgrp()
         let protectedPIDs = Set(runningDownloads.values.map { $0.process.processIdentifier })
-        let processes = try runningProcesses()
-        let orphanedGroupIdentifiers = Set(processes.compactMap { process -> pid_t? in
-            guard process.parentPID == 1,
-                  process.pid != currentPID,
-                  process.processGroupIdentifier > 1,
-                  process.processGroupIdentifier != currentProcessGroupIdentifier,
-                  protectedPIDs.contains(process.pid) == false,
-                  isHarborManagedMediaProcess(process.command, runtime: runtime) else {
-                return nil
+        for manifest in ownershipManifests {
+            if runningDownloads.values.contains(where: {
+                $0.processOwnership == manifest
+            }) {
+                continue
             }
-            return process.processGroupIdentifier
-        })
-        let originalMembers = processes.filter { process in
-            orphanedGroupIdentifiers.contains(process.processGroupIdentifier)
-                && protectedPIDs.contains(process.pid) == false
-                && isHarborManagedMediaProcess(process.command, runtime: runtime)
+
+            let processes = try runningProcesses()
+            guard let processAtRecordedPID = processes.first(where: {
+                $0.pid == manifest.pid
+            }) else {
+                guard Self.hasLiveProcessGroupMember(
+                    manifest.processGroupIdentifier,
+                    in: processes
+                ) == false else {
+                    // The session leader may exit before a converter or other
+                    // descendant. Without the recorded root identity Harbor
+                    // cannot safely signal those descendants, but it must keep
+                    // the marker so no replacement writer can start.
+                    throw MediaDownloadError.unavailable(
+                        "Harbor’s earlier media process exited, but members of its process group are still running. They were left untouched."
+                    )
+                }
+                try discardProcessOwnershipManifest(manifest)
+                continue
+            }
+
+            guard Self.isVerifiedOwnedRootProcess(
+                processAtRecordedPID,
+                manifest: manifest,
+                currentProcessIdentifier: currentPID,
+                currentProcessGroupIdentifier: currentProcessGroupIdentifier,
+                temporaryRoot: temporaryRoot
+            ) else {
+                if processAtRecordedPID.startSignature != manifest.startSignature
+                    || processAtRecordedPID.executablePath != manifest.executablePath {
+                    guard Self.hasLiveProcessGroupMember(
+                        manifest.processGroupIdentifier,
+                        in: processes
+                    ) == false else {
+                        // Do not retire the only ownership barrier while the
+                        // old private group may still contain a descendant.
+                        throw MediaDownloadError.unavailable(
+                            "Harbor found a reused media process identifier while members of the earlier process group are still running. They were left untouched."
+                        )
+                    }
+                    // The numeric PID was reused after Harbor's child exited.
+                    // Retire only the stale marker; never signal the new owner.
+                    try discardProcessOwnershipManifest(manifest)
+                    continue
+                }
+                throw MediaDownloadError.unavailable(
+                    "Harbor found a media process marker but could not verify its exact process owner. The process was left running."
+                )
+            }
+
+            // POSIX_SPAWN_SETSID gives each managed download a private process
+            // group. Capture every member's immutable identity while the
+            // verified session leader still anchors that group, then signal
+            // only those exact PIDs. A later PID/PGID reuse cannot become a
+            // target of either escalation pass.
+            let originalMembers = processes.filter {
+                $0.processGroupIdentifier == manifest.processGroupIdentifier
+                    && $0.pid != currentPID
+                    && protectedPIDs.contains($0.pid) == false
+            }
+            guard originalMembers.allSatisfy({
+                $0.executablePath != nil && $0.startSignature != nil
+            }) else {
+                throw MediaDownloadError.unavailable(
+                    "Harbor could not capture the exact identity of every earlier media process. The process group was left untouched."
+                )
+            }
+            for process in matchingProcesses(originalMembers, in: processes) {
+                logger.warning(
+                    "Terminating verified orphaned media process with pid \(process.pid, privacy: .public)"
+                )
+                _ = kill(process.pid, SIGTERM)
+            }
+
+            try? await Task.sleep(for: .milliseconds(600))
+            let afterTerm = try runningProcesses()
+            let killTargets = matchingProcesses(originalMembers, in: afterTerm)
+            for process in killTargets {
+                logger.warning(
+                    "Force terminating verified orphaned media process with pid \(process.pid, privacy: .public)"
+                )
+                _ = kill(process.pid, SIGKILL)
+            }
+            if killTargets.isEmpty == false {
+                try? await Task.sleep(for: .milliseconds(150))
+            }
+
+            let finalProcesses = try runningProcesses()
+            let survivingGroupMembers = finalProcesses.filter {
+                $0.processGroupIdentifier == manifest.processGroupIdentifier
+            }
+            guard survivingGroupMembers.isEmpty else {
+                let identifiers = survivingGroupMembers
+                    .map { String($0.pid) }
+                    .joined(separator: ", ")
+                throw MediaDownloadError.unavailable(
+                    "Harbor could not confirm that its earlier media processes stopped (PIDs: \(identifiers))."
+                )
+            }
+            try discardProcessOwnershipManifest(manifest)
         }
 
-        let termTargets = matchingProcesses(
-            originalMembers,
-            in: processes
+        let remainingProcesses = try runningProcesses()
+        let trackedProcessGroups = Set(
+            runningDownloads.values.map(\.processOwnership.processGroupIdentifier)
         )
-        for process in termTargets {
-            logger.warning("Terminating orphaned media process with pid \(process.pid, privacy: .public)")
-            _ = kill(process.pid, SIGTERM)
-        }
-        guard originalMembers.isEmpty == false else {
-            hasCleanedOrphans = true
-            return
-        }
-
-        try? await Task.sleep(for: .milliseconds(600))
-        let afterTerm = try runningProcesses()
-        let killTargets = matchingProcesses(originalMembers, in: afterTerm)
-        for process in killTargets {
-            logger.warning("Force terminating orphaned media process with pid \(process.pid, privacy: .public)")
-            _ = kill(process.pid, SIGKILL)
-        }
-        if killTargets.isEmpty == false {
-            try? await Task.sleep(for: .milliseconds(150))
-        }
-
-        let survivors = matchingProcesses(originalMembers, in: try runningProcesses())
-        guard survivors.isEmpty else {
-            let identifiers = survivors.map { String($0.pid) }.joined(separator: ", ")
+        guard Self.hasUntrackedProcessReferencingRecoveryRoot(
+            temporaryRoot,
+            in: remainingProcesses,
+            trackedProcessGroups: trackedProcessGroups
+        ) == false else {
+            // A crash can occur between process creation and durable marker
+            // publication. The recovery-root argument proves only that another
+            // writer may exist; it is deliberately not sufficient authority to
+            // send that process a signal.
             throw MediaDownloadError.unavailable(
-                "Harbor could not confirm that orphaned media processes stopped (PIDs: \(identifiers))."
+                "Harbor found an unverified media process using its recovery directory. The process was left untouched."
             )
         }
-        hasCleanedOrphans = true
+
+        let validatedMarkerIDs = Set(ownershipManifests.map(\.downloadID))
+        for id in ownershipMarkerIDs.subtracting(validatedMarkerIDs) {
+            guard runningDownloads[id] == nil,
+                  Self.hasProcessReferencingRecoveryFolder(
+                      temporaryFolder(for: id),
+                      in: remainingProcesses
+                  ) == false else {
+                continue
+            }
+            try discardUnverifiableProcessOwnershipMarker(id: id)
+        }
+    }
+
+    nonisolated static func hasLiveProcessGroupMember(
+        _ processGroupIdentifier: pid_t,
+        in processes: [MediaRunningProcess]
+    ) -> Bool {
+        processes.contains {
+            $0.processGroupIdentifier == processGroupIdentifier
+        }
+    }
+
+    nonisolated static func hasProcessReferencingRecoveryFolder(
+        _ recoveryFolder: URL,
+        in processes: [MediaRunningProcess]
+    ) -> Bool {
+        let path = recoveryFolder.standardizedFileURL.path
+        return processes.contains { $0.command.contains(path) }
+    }
+
+    nonisolated static func hasUntrackedProcessReferencingRecoveryRoot(
+        _ recoveryRoot: URL,
+        in processes: [MediaRunningProcess],
+        trackedProcessGroups: Set<pid_t>
+    ) -> Bool {
+        let path = recoveryRoot.standardizedFileURL.path
+        return processes.contains {
+            trackedProcessGroups.contains($0.processGroupIdentifier) == false
+                && $0.command.contains(path)
+        }
     }
 
     private func matchingProcesses(
-        _ expected: [RunningProcess],
-        in current: [RunningProcess]
-    ) -> [RunningProcess] {
+        _ expected: [MediaRunningProcess],
+        in current: [MediaRunningProcess]
+    ) -> [MediaRunningProcess] {
         current.filter { candidate in
             expected.contains { original in
-                candidate.pid == original.pid
+                guard let candidateStartSignature = candidate.startSignature,
+                      let originalStartSignature = original.startSignature else {
+                    return false
+                }
+                return candidate.pid == original.pid
                     && candidate.processGroupIdentifier == original.processGroupIdentifier
-                    && candidate.startSignature == original.startSignature
+                    && candidate.executablePath == original.executablePath
+                    && candidateStartSignature == originalStartSignature
                     && candidate.command == original.command
             }
         }
     }
 
-    private func runningProcesses() throws -> [RunningProcess] {
+    private func runningProcesses() throws -> [MediaRunningProcess] {
         let process = Process()
         let outputPipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-axo", "pid=,ppid=,pgid=,lstart=,command=", "-ww"]
+        process.arguments = ["-axo", "pid=,ppid=,pgid=,command=", "-ww"]
         process.standardOutput = outputPipe
         process.standardError = Pipe()
 
@@ -1395,46 +1812,260 @@ actor MediaDownloadService {
             .compactMap { runningProcess(from: String($0)) }
     }
 
-    private func runningProcess(from processLine: String) -> RunningProcess? {
+    private func runningProcess(from processLine: String) -> MediaRunningProcess? {
         let parts = processLine
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .split(separator: " ", maxSplits: 8, omittingEmptySubsequences: true)
+            .split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
 
-        guard parts.count == 9,
+        guard parts.count == 4,
               let pid = pid_t(parts[0]),
               let parentPID = pid_t(parts[1]),
               let processGroupIdentifier = pid_t(parts[2]) else {
             return nil
         }
 
-        return RunningProcess(
+        return MediaRunningProcess(
             pid: pid,
             parentPID: parentPID,
             processGroupIdentifier: processGroupIdentifier,
-            startSignature: parts[3 ... 7].joined(separator: " "),
-            command: String(parts[8])
+            executablePath: processExecutablePath(pid: pid),
+            startSignature: processStartSignature(pid: pid),
+            command: String(parts[3])
         )
     }
 
-    private func isHarborManagedMediaProcess(
-        _ command: String,
-        runtime: MediaRuntimeResolution?
+    private func processStartSignature(pid: pid_t) -> String? {
+        var information = proc_bsdinfo()
+        let expectedSize = MemoryLayout<proc_bsdinfo>.stride
+        let actualSize = withUnsafeMutablePointer(to: &information) { pointer in
+            proc_pidinfo(
+                pid,
+                PROC_PIDTBSDINFO,
+                0,
+                pointer,
+                Int32(expectedSize)
+            )
+        }
+        guard actualSize == Int32(expectedSize) else {
+            return nil
+        }
+        return "\(information.pbi_start_tvsec):\(information.pbi_start_tvusec)"
+    }
+
+    private func processExecutablePath(pid: pid_t) -> String? {
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        let length = buffer.withUnsafeMutableBytes { bytes in
+            proc_pidpath(pid, bytes.baseAddress, UInt32(bytes.count))
+        }
+        guard length > 0 else {
+            return nil
+        }
+        return String(cString: buffer)
+    }
+
+    nonisolated static func isVerifiedOwnedRootProcess(
+        _ process: MediaRunningProcess,
+        manifest: MediaProcessOwnershipManifest,
+        currentProcessIdentifier: pid_t,
+        currentProcessGroupIdentifier: pid_t,
+        temporaryRoot: URL
     ) -> Bool {
-        if command.contains(temporaryRoot.path) {
-            return true
+        let expectedTemporaryFolder = temporaryRoot
+            .appendingPathComponent(manifest.downloadID.uuidString, isDirectory: true)
+            .standardizedFileURL.path
+        return manifest.version == MediaProcessOwnershipManifest.currentVersion
+            && manifest.pid > 1
+            && manifest.processGroupIdentifier == manifest.pid
+            && manifest.temporaryFolderPath == expectedTemporaryFolder
+            && manifest.launchedExecutablePath.hasPrefix("/")
+            && process.pid == manifest.pid
+            && process.pid != currentProcessIdentifier
+            && (process.parentPID == 1 || process.parentPID == currentProcessIdentifier)
+            && process.processGroupIdentifier == manifest.processGroupIdentifier
+            && process.processGroupIdentifier != currentProcessGroupIdentifier
+            && process.executablePath == manifest.executablePath
+            && process.startSignature == manifest.startSignature
+            && process.command == manifest.command
+    }
+
+    private func persistProcessOwnership(
+        processIdentifier: pid_t,
+        downloadID: UUID,
+        attemptIdentifier: UUID,
+        executableURL: URL,
+        temporaryFolder: URL
+    ) throws -> MediaProcessOwnershipManifest {
+        try createAndValidateTemporaryFolder(temporaryFolder)
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        let launchedExecutablePath = executableURL.standardizedFileURL
+            .resolvingSymlinksInPath().path
+        guard let process = try runningProcesses().first(where: {
+            $0.pid == processIdentifier
+        }), process.parentPID == currentPID,
+            process.processGroupIdentifier == processIdentifier,
+            let executablePath = process.executablePath,
+            let startSignature = process.startSignature else {
+            throw MediaDownloadError.unavailable(
+                "Harbor could not verify the newly launched media process."
+            )
         }
 
-        guard command.contains("/Harbor.app/Contents/Resources/MediaRuntime/")
-            || command.contains("/MediaRuntime/") else {
-            return false
+        let manifest = MediaProcessOwnershipManifest(
+            downloadID: downloadID,
+            attemptIdentifier: attemptIdentifier,
+            pid: process.pid,
+            processGroupIdentifier: process.processGroupIdentifier,
+            launchedExecutablePath: launchedExecutablePath,
+            executablePath: executablePath,
+            temporaryFolderPath: temporaryFolder.standardizedFileURL.path,
+            startSignature: startSignature,
+            command: process.command
+        )
+        let url = processOwnershipManifestURL(id: downloadID)
+        guard try itemExists(at: url) == false else {
+            throw MediaDownloadError.unavailable(
+                "A previous media process still owns this recovery directory."
+            )
         }
+        try JSONEncoder().encode(manifest).write(
+            to: url,
+            options: [.atomic, .withoutOverwriting]
+        )
+        try DurableFileSystem.synchronizeFile(at: url)
+        try DurableFileSystem.synchronizeDirectory(at: temporaryFolder)
+        try DurableFileSystem.synchronizeParentDirectory(of: temporaryFolder)
+        return manifest
+    }
 
-        return runtime.map { resolution in
-            command.hasPrefix(resolution.ytDlpURL.path)
-                || command.hasPrefix(resolution.ffmpegURL.path)
-                || command.hasPrefix(resolution.ffprobeURL.path)
-        } == true
-            || command.contains("/Harbor.app/Contents/Resources/MediaRuntime/")
+    private func processOwnershipManifests() throws -> [MediaProcessOwnershipManifest] {
+        guard try itemExists(at: temporaryRoot) else {
+            return []
+        }
+        try validateTemporaryRoot()
+        let folders = try fileManager.contentsOfDirectory(
+            at: temporaryRoot,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
+        )
+        return folders.compactMap { folder in
+            guard let id = UUID(uuidString: folder.lastPathComponent) else {
+                return nil
+            }
+            do {
+                return try processOwnershipManifest(id: id)
+            } catch {
+                // An unreadable or malformed marker cannot authorize a signal.
+                // Preserve it and its recovery directory for diagnosis.
+                logger.warning(
+                    "Ignoring unverifiable media process ownership for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+                return nil
+            }
+        }
+    }
+
+    private func processOwnershipMarkerIDs() throws -> Set<UUID> {
+        guard try itemExists(at: temporaryRoot) else {
+            return []
+        }
+        try validateTemporaryRoot()
+        let folders = try fileManager.contentsOfDirectory(
+            at: temporaryRoot,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
+        )
+        var identifiers = Set<UUID>()
+        for folder in folders {
+            guard let id = UUID(uuidString: folder.lastPathComponent),
+                  try itemExists(at: processOwnershipManifestURL(id: id)) else {
+                continue
+            }
+            identifiers.insert(id)
+        }
+        return identifiers
+    }
+
+    private func processOwnershipManifest(
+        id: UUID
+    ) throws -> MediaProcessOwnershipManifest? {
+        let folder = temporaryFolder(for: id)
+        let url = processOwnershipManifestURL(id: id)
+        guard try itemExists(at: url) else {
+            return nil
+        }
+        try validateTemporaryFolder(folder)
+        let markerValues = try url.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        guard markerValues.isRegularFile == true,
+              markerValues.isSymbolicLink != true else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let manifest = try JSONDecoder().decode(
+            MediaProcessOwnershipManifest.self,
+            from: Data(contentsOf: url)
+        )
+        guard manifest.version == MediaProcessOwnershipManifest.currentVersion,
+              manifest.downloadID == id,
+              manifest.pid > 1,
+              manifest.processGroupIdentifier == manifest.pid,
+              manifest.temporaryFolderPath == folder.standardizedFileURL.path,
+              manifest.startSignature.isEmpty == false,
+              manifest.command.isEmpty == false,
+              manifest.launchedExecutablePath.hasPrefix("/"),
+              manifest.executablePath.isEmpty == false else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return manifest
+    }
+
+    private func discardProcessOwnership(for download: RunningDownload) throws {
+        try discardProcessOwnershipManifest(download.processOwnership)
+    }
+
+    private func discardUnverifiableProcessOwnershipMarker(id: UUID) throws {
+        let folder = temporaryFolder(for: id)
+        let url = processOwnershipManifestURL(id: id)
+        try validateTemporaryFolder(folder)
+        let folderValues = try folder.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        let markerValues = try url.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        guard folderValues.isDirectory == true,
+              folderValues.isSymbolicLink != true,
+              markerValues.isRegularFile == true,
+              markerValues.isSymbolicLink != true else {
+            throw MediaDownloadError.unavailable(
+                "Harbor found an unsafe media process marker and left it untouched."
+            )
+        }
+        try fileManager.removeItem(at: url)
+        try DurableFileSystem.synchronizeDirectory(at: folder)
+    }
+
+    private func discardProcessOwnershipManifest(
+        _ expected: MediaProcessOwnershipManifest
+    ) throws {
+        guard let current = try processOwnershipManifest(id: expected.downloadID) else {
+            return
+        }
+        guard current == expected else {
+            throw MediaDownloadError.unavailable(
+                "A newer media attempt owns this process marker."
+            )
+        }
+        let url = processOwnershipManifestURL(id: expected.downloadID)
+        try fileManager.removeItem(at: url)
+        try DurableFileSystem.synchronizeDirectory(
+            at: temporaryFolder(for: expected.downloadID)
+        )
+    }
+
+    private func processOwnershipManifestURL(id: UUID) -> URL {
+        temporaryFolder(for: id)
+            .appendingPathComponent(Self.processOwnershipManifestFilename)
     }
 
     private static func defaultTemporaryRoot(fileManager: FileManager) -> URL {

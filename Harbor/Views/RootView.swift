@@ -85,8 +85,17 @@ struct RootView: View {
                 }
             )
         ) {
-            Button("OK", role: .cancel) {
-                center.activeAlert = nil
+            if center.canRetryInitialization {
+                Button("Retry") {
+                    center.activeAlert = nil
+                    Task {
+                        await center.initializeIfNeeded()
+                    }
+                }
+            } else {
+                Button("OK", role: .cancel) {
+                    center.activeAlert = nil
+                }
             }
         } message: {
             Text(center.activeAlert?.message ?? "")

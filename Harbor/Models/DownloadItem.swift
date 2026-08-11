@@ -135,6 +135,7 @@ struct DownloadRecord: Codable, Sendable {
     let mediaMetadata: MediaDownloadMetadata?
     let mediaFormatPreference: MediaDownloadFormatPreference?
     let requiresMediaRecoveryReset: Bool
+    let mediaOutputConflictIdentifier: UUID?
     let downloadLimitOverride: TransferLimitOverride
     let uploadLimitOverride: TransferLimitOverride
     let torrentFingerprint: String?
@@ -169,6 +170,7 @@ struct DownloadRecord: Codable, Sendable {
         case mediaMetadata
         case mediaFormatPreference
         case requiresMediaRecoveryReset
+        case mediaOutputConflictIdentifier
         case downloadLimitOverride
         case uploadLimitOverride
         case torrentFingerprint
@@ -204,6 +206,7 @@ struct DownloadRecord: Codable, Sendable {
         mediaMetadata: MediaDownloadMetadata? = nil,
         mediaFormatPreference: MediaDownloadFormatPreference? = nil,
         requiresMediaRecoveryReset: Bool = false,
+        mediaOutputConflictIdentifier: UUID? = nil,
         downloadLimitOverride: TransferLimitOverride = .inherit,
         uploadLimitOverride: TransferLimitOverride = .inherit,
         torrentFingerprint: String? = nil,
@@ -237,6 +240,7 @@ struct DownloadRecord: Codable, Sendable {
         self.mediaMetadata = mediaMetadata
         self.mediaFormatPreference = mediaFormatPreference
         self.requiresMediaRecoveryReset = requiresMediaRecoveryReset
+        self.mediaOutputConflictIdentifier = mediaOutputConflictIdentifier
         self.downloadLimitOverride = downloadLimitOverride
         self.uploadLimitOverride = uploadLimitOverride
         self.torrentFingerprint = torrentFingerprint
@@ -277,6 +281,10 @@ struct DownloadRecord: Codable, Sendable {
             Bool.self,
             forKey: .requiresMediaRecoveryReset
         ) ?? false
+        self.mediaOutputConflictIdentifier = try container.decodeIfPresent(
+            UUID.self,
+            forKey: .mediaOutputConflictIdentifier
+        )
         self.downloadLimitOverride = try container.decodeIfPresent(
             TransferLimitOverride.self,
             forKey: .downloadLimitOverride
@@ -332,6 +340,7 @@ struct DownloadRecord: Codable, Sendable {
         try container.encode(mediaMetadata, forKey: .mediaMetadata)
         try container.encode(mediaFormatPreference, forKey: .mediaFormatPreference)
         try container.encode(requiresMediaRecoveryReset, forKey: .requiresMediaRecoveryReset)
+        try container.encode(mediaOutputConflictIdentifier, forKey: .mediaOutputConflictIdentifier)
         try container.encode(downloadLimitOverride, forKey: .downloadLimitOverride)
         try container.encode(uploadLimitOverride, forKey: .uploadLimitOverride)
         try container.encode(torrentFingerprint, forKey: .torrentFingerprint)
@@ -382,6 +391,7 @@ final class DownloadItem: Identifiable {
     var mediaMetadata: MediaDownloadMetadata?
     var mediaFormatPreference: MediaDownloadFormatPreference?
     var requiresMediaRecoveryReset: Bool
+    var mediaOutputConflictIdentifier: UUID?
     var downloadLimitOverride: TransferLimitOverride
     var uploadLimitOverride: TransferLimitOverride
     var torrentFingerprint: String?
@@ -419,6 +429,7 @@ final class DownloadItem: Identifiable {
         mediaMetadata: MediaDownloadMetadata? = nil,
         mediaFormatPreference: MediaDownloadFormatPreference? = nil,
         requiresMediaRecoveryReset: Bool = false,
+        mediaOutputConflictIdentifier: UUID? = nil,
         downloadLimitOverride: TransferLimitOverride = .inherit,
         uploadLimitOverride: TransferLimitOverride = .inherit,
         torrentFingerprint: String? = nil,
@@ -455,6 +466,7 @@ final class DownloadItem: Identifiable {
         self.mediaMetadata = mediaMetadata
         self.mediaFormatPreference = mediaFormatPreference
         self.requiresMediaRecoveryReset = requiresMediaRecoveryReset
+        self.mediaOutputConflictIdentifier = mediaOutputConflictIdentifier
         self.downloadLimitOverride = downloadLimitOverride
         self.uploadLimitOverride = uploadLimitOverride
         self.torrentFingerprint = torrentFingerprint
@@ -502,6 +514,7 @@ final class DownloadItem: Identifiable {
             mediaMetadata: record.mediaMetadata,
             mediaFormatPreference: record.mediaFormatPreference,
             requiresMediaRecoveryReset: record.requiresMediaRecoveryReset,
+            mediaOutputConflictIdentifier: record.mediaOutputConflictIdentifier,
             downloadLimitOverride: record.downloadLimitOverride,
             uploadLimitOverride: record.uploadLimitOverride,
             torrentFingerprint: record.torrentFingerprint,
@@ -540,6 +553,7 @@ final class DownloadItem: Identifiable {
         mediaMetadata = record.mediaMetadata
         mediaFormatPreference = record.mediaFormatPreference
         requiresMediaRecoveryReset = record.requiresMediaRecoveryReset
+        mediaOutputConflictIdentifier = record.mediaOutputConflictIdentifier
         downloadLimitOverride = record.downloadLimitOverride
         uploadLimitOverride = record.uploadLimitOverride
         torrentFingerprint = record.torrentFingerprint
@@ -747,6 +761,7 @@ final class DownloadItem: Identifiable {
             mediaMetadata: mediaMetadata?.persistenceSnapshot,
             mediaFormatPreference: mediaFormatPreference,
             requiresMediaRecoveryReset: requiresMediaRecoveryReset,
+            mediaOutputConflictIdentifier: mediaOutputConflictIdentifier,
             downloadLimitOverride: downloadLimitOverride,
             uploadLimitOverride: uploadLimitOverride,
             torrentFingerprint: torrentFingerprint,

@@ -114,10 +114,24 @@ struct DownloadDestinationResolver: @unchecked Sendable {
 
     nonisolated func moveDownloadedFile(from sourceURL: URL, to destinationURL: URL) throws {
         try createDirectoryIfNeeded(destinationURL.deletingLastPathComponent())
-        guard try pathEntryExists(at: destinationURL) == false else {
-            throw CocoaError(.fileWriteFileExists)
+        let result = sourceURL.path.withCString { sourcePath in
+            destinationURL.path.withCString { destinationPath in
+                Darwin.renameatx_np(
+                    AT_FDCWD,
+                    sourcePath,
+                    AT_FDCWD,
+                    destinationPath,
+                    UInt32(RENAME_EXCL)
+                )
+            }
         }
-        try fileManager.moveItem(at: sourceURL, to: destinationURL)
+        guard result == 0 else {
+            let code = errno
+            if code == EEXIST || code == ENOTEMPTY {
+                throw CocoaError(.fileWriteFileExists)
+            }
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
         try DurableFileSystem.synchronizeParentDirectory(of: destinationURL)
     }
 

@@ -33,6 +33,22 @@ nonisolated struct PendingDownloadDataRemovalManifest: Codable, Sendable {
     }
 }
 
+nonisolated enum PendingDownloadDataRemovalEntry: Sendable {
+    case valid(PendingDownloadDataRemovalManifest)
+    case invalid(downloadID: UUID?, message: String)
+    case unavailable(downloadID: UUID?, message: String)
+
+    var downloadID: UUID? {
+        switch self {
+        case let .valid(manifest):
+            manifest.record.id
+        case let .invalid(downloadID, _),
+             let .unavailable(downloadID, _):
+            downloadID
+        }
+    }
+}
+
 nonisolated final class PendingDownloadDataRemovalStore: @unchecked Sendable {
     private let fileManager: FileManager
     private let directoryURL: URL
@@ -82,16 +98,30 @@ nonisolated final class PendingDownloadDataRemovalStore: @unchecked Sendable {
     }
 
     func entries() throws -> [PendingDownloadDataRemovalManifest] {
+        try recoveryEntries().map { entry in
+            switch entry {
+            case let .valid(manifest):
+                manifest
+            case .invalid:
+                throw CocoaError(.fileReadCorruptFile)
+            case let .unavailable(_, message):
+                throw PendingDownloadDataRemovalStoreError.unavailable(message)
+            }
+        }
+    }
+
+    func recoveryEntries() throws -> [PendingDownloadDataRemovalEntry] {
         try withLock {
             guard try itemExists(at: directoryURL) else {
                 return []
             }
+            try validateDirectory()
             return try fileManager.contentsOfDirectory(
                 at: directoryURL,
                 includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
             )
             .filter { $0.pathExtension == "json" }
-            .map(validatedManifest(at:))
+            .map(recoveryEntry(at:))
         }
     }
 
@@ -105,6 +135,7 @@ nonisolated final class PendingDownloadDataRemovalStore: @unchecked Sendable {
             guard try itemExists(at: url) else {
                 return
             }
+            try validateDirectory()
             try fileManager.removeItem(at: url)
             try DurableFileSystem.synchronizeDirectory(at: directoryURL)
         }
@@ -115,6 +146,7 @@ nonisolated final class PendingDownloadDataRemovalStore: @unchecked Sendable {
         to phase: PendingDownloadRemovalPhase
     ) throws -> PendingDownloadDataRemovalManifest {
         try withLock {
+            try validateDirectory()
             let url = manifestURL(for: downloadID)
             let current = try validatedManifest(at: url)
             if current.phase == phase || current.phase == .backendCleanup {
@@ -174,6 +206,73 @@ nonisolated final class PendingDownloadDataRemovalStore: @unchecked Sendable {
         return manifest
     }
 
+    private func recoveryEntry(
+        at url: URL
+    ) -> PendingDownloadDataRemovalEntry {
+        let filenameID = UUID(
+            uuidString: url.deletingPathExtension().lastPathComponent
+        )
+        guard url.deletingLastPathComponent().standardizedFileURL
+                == directoryURL.standardizedFileURL,
+              url.pathExtension == "json",
+              filenameID != nil else {
+            return .invalid(
+                downloadID: filenameID,
+                message: "A pending download cleanup journal has an invalid filename."
+            )
+        }
+
+        let values: URLResourceValues
+        do {
+            values = try url.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            )
+        } catch {
+            return .unavailable(
+                downloadID: filenameID,
+                message: error.localizedDescription
+            )
+        }
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true else {
+            return .invalid(
+                downloadID: filenameID,
+                message: "A pending download cleanup journal is not a regular file."
+            )
+        }
+
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            return .unavailable(
+                downloadID: filenameID,
+                message: error.localizedDescription
+            )
+        }
+
+        let manifest: PendingDownloadDataRemovalManifest
+        do {
+            manifest = try JSONDecoder().decode(
+                PendingDownloadDataRemovalManifest.self,
+                from: data
+            )
+        } catch {
+            return .invalid(
+                downloadID: filenameID,
+                message: "A pending download cleanup journal is malformed."
+            )
+        }
+        guard manifest.version == PendingDownloadDataRemovalManifest.currentVersion,
+              manifest.record.id == filenameID else {
+            return .invalid(
+                downloadID: filenameID,
+                message: "A pending download cleanup journal has invalid ownership metadata."
+            )
+        }
+        return .valid(manifest)
+    }
+
     private func manifestURL(for id: UUID) -> URL {
         directoryURL
             .appendingPathComponent(id.uuidString)
@@ -186,8 +285,21 @@ nonisolated final class PendingDownloadDataRemovalStore: @unchecked Sendable {
             at: directoryURL,
             withIntermediateDirectories: true
         )
+        try validateDirectory()
         if existed == false {
             try DurableFileSystem.synchronizeParentDirectory(of: directoryURL)
+        }
+    }
+
+    private func validateDirectory() throws {
+        let values = try directoryURL.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        guard values.isDirectory == true,
+              values.isSymbolicLink != true else {
+            throw PendingDownloadDataRemovalStoreError.unavailable(
+                "Harbor’s pending download cleanup directory is not a safe owned directory."
+            )
         }
     }
 
@@ -208,5 +320,16 @@ nonisolated final class PendingDownloadDataRemovalStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return try work()
+    }
+}
+
+private enum PendingDownloadDataRemovalStoreError: LocalizedError {
+    case unavailable(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .unavailable(message):
+            message
+        }
     }
 }

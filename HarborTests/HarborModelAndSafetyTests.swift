@@ -957,6 +957,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             }
         )
         center.downloads = [browserItem, occupiedSlot]
+        center.markInitializationLoadedForTesting()
 
         center.cancelDownload(id: browserItem.id)
         center.retryDownload(id: browserItem.id)
@@ -2064,6 +2065,68 @@ final class HarborModelAndSafetyTests: XCTestCase {
         )
     }
 
+    func testConcurrentDestinationMovesPublishExactlyOnePayloadWithoutReplacement() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborExclusiveDestinationTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        let resolver = DownloadDestinationResolver(fileManager: fileManager)
+
+        for iteration in 0 ..< 25 {
+            let payloads = [
+                Data("first-\(iteration)".utf8),
+                Data("second-\(iteration)".utf8)
+            ]
+            let sourceURLs = payloads.indices.map { index in
+                directoryURL.appendingPathComponent("source-\(iteration)-\(index).part")
+            }
+            for index in payloads.indices {
+                try payloads[index].write(to: sourceURLs[index])
+            }
+            let destinationURL = directoryURL.appendingPathComponent("archive-\(iteration).bin")
+            let results = ConcurrentMoveResults()
+            let ready = DispatchSemaphore(value: 0)
+            let start = DispatchSemaphore(value: 0)
+            let group = DispatchGroup()
+
+            for index in payloads.indices {
+                group.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    defer { group.leave() }
+                    ready.signal()
+                    start.wait()
+                    do {
+                        try resolver.moveDownloadedFile(
+                            from: sourceURLs[index],
+                            to: destinationURL
+                        )
+                        results.recordSuccess(index)
+                    } catch let error as CocoaError {
+                        results.recordCocoaError(error.code)
+                    } catch {
+                        results.recordUnexpectedError(error)
+                    }
+                }
+            }
+
+            XCTAssertEqual(ready.wait(timeout: .now() + 2), .success)
+            XCTAssertEqual(ready.wait(timeout: .now() + 2), .success)
+            start.signal()
+            start.signal()
+            XCTAssertEqual(group.wait(timeout: .now() + 5), .success)
+
+            let snapshot = results.snapshot
+            XCTAssertEqual(snapshot.successfulIndices.count, 1)
+            XCTAssertEqual(snapshot.cocoaErrorCodes, [.fileWriteFileExists])
+            XCTAssertTrue(snapshot.unexpectedErrors.isEmpty)
+            let winningIndex = try XCTUnwrap(snapshot.successfulIndices.first)
+            let losingIndex = winningIndex == 0 ? 1 : 0
+            XCTAssertEqual(try Data(contentsOf: destinationURL), payloads[winningIndex])
+            XCTAssertEqual(try Data(contentsOf: sourceURLs[losingIndex]), payloads[losingIndex])
+        }
+    }
+
     func testRecordedDestinationCollisionDoesNotCorruptIntactHandoffPayload() throws {
         let fileManager = FileManager.default
         let testRoot = fileManager.temporaryDirectory
@@ -2849,6 +2912,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             status: .downloading
         )
         center.downloads = [mediaItem]
+        center.markInitializationLoadedForTesting()
 
         center.togglePauseResume(id: mediaItem.id)
         let retiredAttempt = try XCTUnwrap(
@@ -2974,6 +3038,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             status: .downloading
         )
         center.downloads = [mediaItem, occupiedSlot]
+        center.markInitializationLoadedForTesting()
 
         center.pauseDownloads(ids: [mediaItem.id])
         center.resumeDownloads(ids: [mediaItem.id])
@@ -3387,6 +3452,9 @@ final class HarborModelAndSafetyTests: XCTestCase {
         let recordsAfterRemoval = try await persistence.load()
         XCTAssertTrue(recordsAfterRemoval.isEmpty)
         XCTAssertEqual(try pendingStore.entries().map(\.record.id), [item.id])
+        XCTAssertTrue(
+            firstCenter.hasPendingRemovalReservationForTesting(id: item.id)
+        )
         XCTAssertEqual(recoveryStore.recoveredByteCount(id: item.id), 7)
         let didShutDownFirstCenter = await firstCenter.shutdownForTermination()
         XCTAssertTrue(didShutDownFirstCenter)
@@ -3908,6 +3976,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
         )
         mediaItem.backendIdentifier = "123"
         center.downloads = [mediaItem]
+        center.markInitializationLoadedForTesting()
         center.pauseDownloads(ids: [mediaItem.id])
 
         let shutdownTask = Task { @MainActor in
@@ -3965,6 +4034,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
                 status: .paused
             )
         ]
+        center.markInitializationLoadedForTesting()
 
         let didShutDown = await center.shutdownForTermination()
         XCTAssertFalse(didShutDown)
@@ -4085,6 +4155,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             browserResumeData: Data("browser-resume".utf8)
         )
         center.downloads = [retryingItem, queuedBrowserItem]
+        center.markInitializationLoadedForTesting()
         let attemptIdentifier = UUID()
         center.installDirectAttemptForTesting(
             id: retryingItem.id,
@@ -4161,6 +4232,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             status: .waitingToRetry
         )
         center.downloads = [cancellingItem, removingItem]
+        center.markInitializationLoadedForTesting()
         center.installReadyDirectRetryForTesting(id: cancellingItem.id)
         center.installReadyDirectRetryForTesting(id: removingItem.id)
 
@@ -5556,6 +5628,290 @@ final class HarborModelAndSafetyTests: XCTestCase {
         )
     }
 
+    func testMediaProcessOwnershipRequiresExactPersistedIdentity() throws {
+        let temporaryRoot = URL(
+            fileURLWithPath: "/tmp/HarborMediaOwnership",
+            isDirectory: true
+        )
+        let downloadID = UUID()
+        let launchedExecutablePath = "/Applications/Harbor.app/Contents/Resources/MediaRuntime/bin/yt-dlp"
+        let executablePath = "/usr/bin/python3"
+        let temporaryFolder = temporaryRoot
+            .appendingPathComponent(downloadID.uuidString, isDirectory: true)
+        let command = "\(executablePath) \(launchedExecutablePath) --paths temp:\(temporaryFolder.path) https://example.test/video"
+        let manifest = MediaProcessOwnershipManifest(
+            downloadID: downloadID,
+            attemptIdentifier: UUID(),
+            pid: 9_001,
+            processGroupIdentifier: 9_001,
+            launchedExecutablePath: launchedExecutablePath,
+            executablePath: executablePath,
+            temporaryFolderPath: temporaryFolder.path,
+            startSignature: "1786420000:123456",
+            command: command
+        )
+        let exactOwner = MediaRunningProcess(
+            pid: 9_001,
+            parentPID: 1,
+            processGroupIdentifier: 9_001,
+            executablePath: executablePath,
+            startSignature: manifest.startSignature,
+            command: command
+        )
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                MediaProcessOwnershipManifest.self,
+                from: JSONEncoder().encode(manifest)
+            ),
+            manifest
+        )
+
+        XCTAssertTrue(
+            MediaDownloadService.isVerifiedOwnedRootProcess(
+                exactOwner,
+                manifest: manifest,
+                currentProcessIdentifier: 8_000,
+                currentProcessGroupIdentifier: 8_000,
+                temporaryRoot: temporaryRoot
+            )
+        )
+
+        let unrelatedReader = MediaRunningProcess(
+            pid: manifest.pid,
+            parentPID: 1,
+            processGroupIdentifier: manifest.processGroupIdentifier,
+            executablePath: "/usr/bin/tail",
+            startSignature: manifest.startSignature,
+            command: "/usr/bin/tail -f \(temporaryFolder.appendingPathComponent("payload.part").path)"
+        )
+        XCTAssertFalse(
+            MediaDownloadService.isVerifiedOwnedRootProcess(
+                unrelatedReader,
+                manifest: manifest,
+                currentProcessIdentifier: 8_000,
+                currentProcessGroupIdentifier: 8_000,
+                temporaryRoot: temporaryRoot
+            )
+        )
+
+        let reusedIdentity = MediaRunningProcess(
+            pid: exactOwner.pid,
+            parentPID: exactOwner.parentPID,
+            processGroupIdentifier: exactOwner.processGroupIdentifier,
+            executablePath: exactOwner.executablePath,
+            startSignature: "1786420000:123457",
+            command: exactOwner.command
+        )
+        XCTAssertFalse(
+            MediaDownloadService.isVerifiedOwnedRootProcess(
+                reusedIdentity,
+                manifest: manifest,
+                currentProcessIdentifier: 8_000,
+                currentProcessGroupIdentifier: 8_000,
+                temporaryRoot: temporaryRoot
+            )
+        )
+
+        let survivingChild = MediaRunningProcess(
+            pid: 9_002,
+            parentPID: manifest.pid,
+            processGroupIdentifier: manifest.processGroupIdentifier,
+            executablePath: "/Applications/Harbor.app/Contents/Resources/MediaRuntime/bin/ffmpeg",
+            startSignature: "1786420001:123456",
+            command: "ffmpeg -i \(temporaryFolder.appendingPathComponent("payload.part").path)"
+        )
+        XCTAssertTrue(
+            MediaDownloadService.hasLiveProcessGroupMember(
+                manifest.processGroupIdentifier,
+                in: [survivingChild]
+            )
+        )
+        XCTAssertFalse(
+            MediaDownloadService.hasLiveProcessGroupMember(
+                manifest.processGroupIdentifier,
+                in: []
+            )
+        )
+        XCTAssertTrue(
+            MediaDownloadService.hasProcessReferencingRecoveryFolder(
+                temporaryFolder,
+                in: [unrelatedReader]
+            )
+        )
+        XCTAssertFalse(
+            MediaDownloadService.hasProcessReferencingRecoveryFolder(
+                temporaryFolder,
+                in: [
+                    MediaRunningProcess(
+                        pid: 9_003,
+                        parentPID: 1,
+                        processGroupIdentifier: 9_003,
+                        executablePath: "/usr/bin/true",
+                        startSignature: "1786420002:123456",
+                        command: "/usr/bin/true"
+                    )
+                ]
+            )
+        )
+        XCTAssertTrue(
+            MediaDownloadService.hasUntrackedProcessReferencingRecoveryRoot(
+                temporaryRoot,
+                in: [survivingChild],
+                trackedProcessGroups: []
+            )
+        )
+        XCTAssertFalse(
+            MediaDownloadService.hasUntrackedProcessReferencingRecoveryRoot(
+                temporaryRoot,
+                in: [survivingChild],
+                trackedProcessGroups: [manifest.processGroupIdentifier]
+            )
+        )
+    }
+
+    func testMediaRecoveryCleanupPreservesDurableProcessOwnershipMarker() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborMediaOwnedCleanup-\(UUID().uuidString)")
+        let downloadID = UUID()
+        let recoveryFolder = root
+            .appendingPathComponent(downloadID.uuidString, isDirectory: true)
+        let ownershipMarker = recoveryFolder
+            .appendingPathComponent(".harbor-process-owner.json")
+        defer { try? fileManager.removeItem(at: root) }
+
+        try fileManager.createDirectory(
+            at: recoveryFolder,
+            withIntermediateDirectories: true
+        )
+        try Data("unverifiable-owner".utf8).write(to: ownershipMarker)
+        let service = MediaDownloadService(
+            eventHandler: { _, _ in },
+            fileManager: fileManager,
+            temporaryRoot: root
+        )
+
+        do {
+            try await service.discardRecoveryData(id: downloadID)
+            XCTFail("Cleanup must fail closed while durable process ownership remains")
+        } catch {
+            XCTAssertTrue(fileManager.fileExists(atPath: recoveryFolder.path))
+            XCTAssertTrue(fileManager.fileExists(atPath: ownershipMarker.path))
+        }
+
+        // A process scan is the authority that can retire malformed ownership
+        // metadata: with no writer referencing the recovery root, cleanup can
+        // safely remove the marker and then the recovery directory.
+        try await service.terminateOrphanedMediaProcesses()
+        XCTAssertFalse(fileManager.fileExists(atPath: ownershipMarker.path))
+        try await service.discardRecoveryData(id: downloadID)
+        XCTAssertFalse(fileManager.fileExists(atPath: recoveryFolder.path))
+
+        let redirectedID = UUID()
+        let redirectedTarget = root.appendingPathComponent("redirected", isDirectory: true)
+        let redirectedFolder = root.appendingPathComponent(
+            redirectedID.uuidString,
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: redirectedTarget, withIntermediateDirectories: true)
+        try Data("external-fragment".utf8).write(
+            to: redirectedTarget.appendingPathComponent("payload.part")
+        )
+        try fileManager.createSymbolicLink(
+            at: redirectedFolder,
+            withDestinationURL: redirectedTarget
+        )
+        let redirectedBytes = await service.recoverableByteCount(id: redirectedID)
+        XCTAssertNil(redirectedBytes)
+        do {
+            try await service.discardRecoveryData(id: redirectedID)
+            XCTFail("Cleanup must not remove a symlinked media recovery folder")
+        } catch {}
+        XCTAssertEqual(
+            try Data(contentsOf: redirectedTarget.appendingPathComponent("payload.part")),
+            Data("external-fragment".utf8)
+        )
+        XCTAssertTrue(fileManager.fileExists(atPath: redirectedFolder.path))
+    }
+
+    func testMediaRecoveryCleanupRejectsSymlinkedRootWithoutDeletingTarget() async throws {
+        let fileManager = FileManager.default
+        let container = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborMediaSymlinkedRoot-\(UUID().uuidString)")
+        let recoveryRoot = container.appendingPathComponent("Recovery", isDirectory: true)
+        let externalRoot = container.appendingPathComponent("External", isDirectory: true)
+        let downloadID = UUID()
+        let externalFolder = externalRoot
+            .appendingPathComponent(downloadID.uuidString, isDirectory: true)
+        let externalPayload = externalFolder.appendingPathComponent("payload.part")
+        defer { try? fileManager.removeItem(at: container) }
+
+        try fileManager.createDirectory(
+            at: externalFolder,
+            withIntermediateDirectories: true
+        )
+        let payload = Data("not-owned-by-harbor".utf8)
+        try payload.write(to: externalPayload)
+        try fileManager.createSymbolicLink(
+            at: recoveryRoot,
+            withDestinationURL: externalRoot
+        )
+        let service = MediaDownloadService(
+            eventHandler: { _, _ in },
+            fileManager: fileManager,
+            temporaryRoot: recoveryRoot
+        )
+
+        do {
+            try await service.discardRecoveryData(id: downloadID)
+            XCTFail("Item cleanup must reject a symlinked media recovery root")
+        } catch {}
+        do {
+            try await service.discardOrphanedRecoveryData(retaining: [])
+            XCTFail("Orphan cleanup must reject a symlinked media recovery root")
+        } catch {}
+        do {
+            try await service.terminateOrphanedMediaProcesses()
+            XCTFail("Ownership cleanup must reject a symlinked media recovery root")
+        } catch {}
+
+        XCTAssertTrue(fileManager.fileExists(atPath: externalFolder.path))
+        XCTAssertEqual(try Data(contentsOf: externalPayload), payload)
+    }
+
+    func testMediaCompletionRejectsUnchangedPreexistingDestinationIdentity() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborMediaOutputIdentity-\(UUID().uuidString)")
+        let outputURL = root.appendingPathComponent("video.mp4")
+        defer { try? fileManager.removeItem(at: root) }
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("existing-output".utf8).write(to: outputURL)
+        let service = MediaDownloadService(
+            eventHandler: { _, _ in },
+            fileManager: fileManager,
+            temporaryRoot: root.appendingPathComponent("Recovery")
+        )
+
+        let before = try await service.regularFileIdentity(at: outputURL)
+        let unchanged = try await service.regularFileIdentity(at: outputURL)
+        XCTAssertFalse(
+            MediaDownloadService.isAttemptProducedOutput(
+                previousIdentity: before,
+                currentIdentity: unchanged
+            )
+        )
+
+        try Data("new-attempt-output".utf8).write(to: outputURL, options: .atomic)
+        let replaced = try await service.regularFileIdentity(at: outputURL)
+        XCTAssertTrue(
+            MediaDownloadService.isAttemptProducedOutput(
+                previousIdentity: before,
+                currentIdentity: replaced
+            )
+        )
+    }
+
     func testTorrentSubmissionReservationIsStableUntilExactAcknowledgement() throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory
@@ -5716,12 +6072,54 @@ final class HarborModelAndSafetyTests: XCTestCase {
             formatPreference: .bestAvailable,
             speedLimitBytesPerSecond: nil
         )
+        let outputConflictIdentifier = UUID()
+        let collisionSafeArguments = try MediaDownloadService.downloadArguments(
+            runtime: runtime,
+            sourceURL: sourceURL,
+            destinationFolder: destinationURL,
+            temporaryFolder: temporaryURL,
+            metadata: nil,
+            formatPreference: .bestAvailable,
+            outputConflictIdentifier: outputConflictIdentifier,
+            speedLimitBytesPerSecond: nil
+        )
 
         let limitIndex = try XCTUnwrap(limitedArguments.firstIndex(of: "--limit-rate"))
         XCTAssertEqual(limitedArguments[limitedArguments.index(after: limitIndex)], "345678")
         XCTAssertFalse(unlimitedArguments.contains("--limit-rate"))
         XCTAssertFalse(limitedArguments.contains("--format"))
         XCTAssertFalse(unlimitedArguments.contains("--format"))
+        let collisionOutputIndex = try XCTUnwrap(
+            collisionSafeArguments.firstIndex(of: "--output")
+        )
+        XCTAssertEqual(
+            collisionSafeArguments[collisionSafeArguments.index(after: collisionOutputIndex)],
+            "%(title).180B [%(id)s] [Harbor \(outputConflictIdentifier.uuidString)].%(ext)s"
+        )
+        let concurrentDownloadID = UUID()
+        XCTAssertNil(
+            MediaDownloadService.outputIdentifier(
+                requested: nil,
+                downloadID: concurrentDownloadID,
+                hasCompetingDestination: false
+            )
+        )
+        XCTAssertEqual(
+            MediaDownloadService.outputIdentifier(
+                requested: nil,
+                downloadID: concurrentDownloadID,
+                hasCompetingDestination: true
+            ),
+            concurrentDownloadID
+        )
+        XCTAssertEqual(
+            MediaDownloadService.outputIdentifier(
+                requested: outputConflictIdentifier,
+                downloadID: concurrentDownloadID,
+                hasCompetingDestination: true
+            ),
+            outputConflictIdentifier
+        )
 
         let retryValues = zip(limitedArguments, limitedArguments.dropFirst())
             .filter { $0.0 == "--retry-sleep" }
@@ -5902,7 +6300,8 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertFalse(String(decoding: encodedRecord, as: UTF8.self).contains("formatOptions"))
     }
 
-    func testMediaRecoveryResetBarrierPersistsAndDefaultsSafelyForLegacyRecords() throws {
+    func testMediaRecoveryBarriersPersistAndDefaultSafelyForLegacyRecords() throws {
+        let outputConflictIdentifier = UUID()
         let item = DownloadItem(
             sourceURL: try XCTUnwrap(URL(string: "https://example.test/video")),
             sourceKind: .mediaURL,
@@ -5910,23 +6309,23 @@ final class HarborModelAndSafetyTests: XCTestCase {
             preferredFilename: nil,
             destinationFolderPath: "/tmp",
             status: .cancelled,
-            requiresMediaRecoveryReset: true
+            requiresMediaRecoveryReset: true,
+            mediaOutputConflictIdentifier: outputConflictIdentifier
         )
         let encoded = try JSONEncoder().encode(item.makeRecord())
-        XCTAssertTrue(
-            try JSONDecoder().decode(DownloadRecord.self, from: encoded)
-                .requiresMediaRecoveryReset
-        )
+        let decoded = try JSONDecoder().decode(DownloadRecord.self, from: encoded)
+        XCTAssertTrue(decoded.requiresMediaRecoveryReset)
+        XCTAssertEqual(decoded.mediaOutputConflictIdentifier, outputConflictIdentifier)
 
         var legacyObject = try XCTUnwrap(
             JSONSerialization.jsonObject(with: encoded) as? [String: Any]
         )
         legacyObject.removeValue(forKey: "requiresMediaRecoveryReset")
+        legacyObject.removeValue(forKey: "mediaOutputConflictIdentifier")
         let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
-        XCTAssertFalse(
-            try JSONDecoder().decode(DownloadRecord.self, from: legacyData)
-                .requiresMediaRecoveryReset
-        )
+        let legacyRecord = try JSONDecoder().decode(DownloadRecord.self, from: legacyData)
+        XCTAssertFalse(legacyRecord.requiresMediaRecoveryReset)
+        XCTAssertNil(legacyRecord.mediaOutputConflictIdentifier)
     }
 
     func testStartupMediaCleanupKeepsBarrierWhenClearedStateCannotBeSaved() async throws {
@@ -6280,6 +6679,140 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertEqual(item.progress, 1)
     }
 
+    func testMediaOutputConflictPersistsCollisionSafeFilenameBeforeRetry() async throws {
+        let suiteName = "HarborTests.MediaOutputConflict.\(UUID().uuidString)"
+        let userDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let fileManager = FileManager.default
+        let testRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborMediaOutputConflict-\(UUID().uuidString)")
+        defer { try? fileManager.removeItem(at: testRoot) }
+        let persistence = DownloadPersistence(
+            directoryURL: testRoot.appendingPathComponent("Persistence", isDirectory: true)
+        )
+        let center = DownloadCenter(
+            settings: AppSettingsStore(userDefaults: userDefaults),
+            persistence: persistence,
+            mediaService: MediaDownloadService(
+                eventHandler: { _, _ in },
+                fileManager: fileManager,
+                temporaryRoot: testRoot.appendingPathComponent("Recovery", isDirectory: true)
+            )
+        )
+        let item = DownloadItem(
+            sourceURL: try XCTUnwrap(URL(string: "https://example.test/video")),
+            sourceKind: .mediaURL,
+            backend: .ytDlp,
+            preferredFilename: nil,
+            destinationFolderPath: testRoot.path,
+            status: .downloading
+        )
+        center.downloads = [item]
+        try await persistence.save([item.makeRecord()])
+        let attemptIdentifier = UUID()
+        center.installMediaAttemptForTesting(
+            id: item.id,
+            attemptIdentifier: attemptIdentifier
+        )
+
+        center.handle(
+            .failed(
+                id: item.id,
+                message: "yt-dlp reused an unchanged destination file.",
+                disposition: .outputConflict
+            ),
+            attemptIdentifier: attemptIdentifier
+        )
+        for _ in 0 ..< 200
+        where item.status != .failed || item.mediaOutputConflictIdentifier == nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        let conflictIdentifier = try XCTUnwrap(item.mediaOutputConflictIdentifier)
+        XCTAssertEqual(item.status, .failed)
+        XCTAssertNil(center.activeMediaAttemptIdentifier(for: item.id))
+        let storedRecords = try await persistence.load()
+        let storedRecord = try XCTUnwrap(storedRecords.first)
+        XCTAssertEqual(storedRecord.status, .failed)
+        XCTAssertEqual(
+            storedRecord.mediaOutputConflictIdentifier,
+            conflictIdentifier
+        )
+        let shutdownSucceeded = await center.shutdownForTermination()
+        XCTAssertTrue(shutdownSucceeded)
+    }
+
+    func testMissingJournalAfterMediaFinishedEventRotatesOutputBeforeRetry() async throws {
+        let suiteName = "HarborTests.MediaMissingCompletionJournal.\(UUID().uuidString)"
+        let userDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let fileManager = FileManager.default
+        let testRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborMediaMissingCompletionJournal-\(UUID().uuidString)")
+        let destinationRoot = testRoot.appendingPathComponent("Destination", isDirectory: true)
+        let completedURL = destinationRoot.appendingPathComponent("video.mp4")
+        defer { try? fileManager.removeItem(at: testRoot) }
+        try fileManager.createDirectory(at: destinationRoot, withIntermediateDirectories: true)
+        let payload = Data("completed-with-lost-journal".utf8)
+        try payload.write(to: completedURL)
+
+        let persistence = DownloadPersistence(
+            directoryURL: testRoot.appendingPathComponent("Persistence", isDirectory: true)
+        )
+        let center = DownloadCenter(
+            settings: AppSettingsStore(userDefaults: userDefaults),
+            persistence: persistence,
+            mediaService: MediaDownloadService(
+                eventHandler: { _, _ in },
+                fileManager: fileManager,
+                temporaryRoot: testRoot.appendingPathComponent("Recovery", isDirectory: true)
+            )
+        )
+        let item = DownloadItem(
+            sourceURL: try XCTUnwrap(URL(string: "https://example.test/video")),
+            sourceKind: .mediaURL,
+            backend: .ytDlp,
+            preferredFilename: nil,
+            destinationFolderPath: destinationRoot.path,
+            status: .downloading
+        )
+        center.downloads = [item]
+        center.markInitializationLoadedForTesting()
+        try await persistence.save([item.makeRecord()])
+        let attemptIdentifier = UUID()
+        center.installMediaAttemptForTesting(
+            id: item.id,
+            attemptIdentifier: attemptIdentifier
+        )
+
+        center.handle(
+            .finished(
+                id: item.id,
+                fileURL: completedURL,
+                payloadURLs: [completedURL],
+                expectedBytes: Int64(payload.count)
+            ),
+            attemptIdentifier: attemptIdentifier
+        )
+        for _ in 0 ..< 200
+        where item.status != .failed || item.mediaOutputConflictIdentifier == nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        let conflictIdentifier = try XCTUnwrap(item.mediaOutputConflictIdentifier)
+        XCTAssertEqual(item.status, .failed)
+        XCTAssertEqual(try Data(contentsOf: completedURL), payload)
+        let storedRecords = try await persistence.load()
+        let storedRecord = try XCTUnwrap(storedRecords.first)
+        XCTAssertEqual(storedRecord.mediaOutputConflictIdentifier, conflictIdentifier)
+        let shutdownSucceeded = await center.shutdownForTermination()
+        XCTAssertTrue(shutdownSucceeded)
+    }
+
     func testMediaCompletionJournalRestoresCollectionAfterRelaunch() async throws {
         let suiteName = "HarborTests.MediaCompletionReplay.\(UUID().uuidString)"
         let userDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -6475,6 +7008,92 @@ final class HarborModelAndSafetyTests: XCTestCase {
         let recordsAfterRecovery = try await persistence.load()
         XCTAssertEqual(recordsAfterRecovery.first?.status, .completed)
         let shutdownSucceeded = await restoredCenter.shutdownForTermination()
+        XCTAssertTrue(shutdownSucceeded)
+    }
+
+    func testInvalidMediaCompletionRotatesOutputPathBeforeDiscardingJournal() async throws {
+        let suiteName = "HarborTests.InvalidMediaCompletionOutput.\(UUID().uuidString)"
+        let userDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let fileManager = FileManager.default
+        let testRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborInvalidMediaCompletion-\(UUID().uuidString)")
+        let persistenceRoot = testRoot.appendingPathComponent("Persistence", isDirectory: true)
+        let recoveryRoot = testRoot.appendingPathComponent("MediaRecovery", isDirectory: true)
+        let destinationRoot = testRoot.appendingPathComponent("Destination", isDirectory: true)
+        let payloadURL = destinationRoot.appendingPathComponent("video.mp4")
+        defer { try? fileManager.removeItem(at: testRoot) }
+        try fileManager.createDirectory(at: destinationRoot, withIntermediateDirectories: true)
+        let originalPayload = Data("original-completed-media".utf8)
+        try originalPayload.write(to: payloadURL)
+
+        let item = DownloadItem(
+            sourceURL: try XCTUnwrap(URL(string: "https://example.test/video")),
+            sourceKind: .mediaURL,
+            backend: .ytDlp,
+            preferredFilename: nil,
+            destinationFolderPath: destinationRoot.path,
+            status: .downloading
+        )
+        let manifest = MediaCompletionManifest(
+            downloadID: item.id,
+            attemptIdentifier: UUID(),
+            sourceURL: item.sourceURL,
+            destinationFolderPath: destinationRoot.path,
+            fileLocationPath: payloadURL.path,
+            payloads: [
+                MediaCompletedFileManifest(
+                    path: payloadURL.path,
+                    byteCount: Int64(originalPayload.count),
+                    sha256: SHA256.hash(data: originalPayload)
+                        .map { String(format: "%02x", $0) }
+                        .joined()
+                )
+            ],
+            actualBytes: Int64(originalPayload.count)
+        )
+        let recoveryFolder = recoveryRoot
+            .appendingPathComponent(item.id.uuidString, isDirectory: true)
+        let markerURL = recoveryFolder.appendingPathComponent(".harbor-completion.json")
+        try fileManager.createDirectory(at: recoveryFolder, withIntermediateDirectories: true)
+        try JSONEncoder().encode(manifest).write(to: markerURL)
+        let replacementPayload = Data("replacement-owned-by-another-writer".utf8)
+        try replacementPayload.write(to: payloadURL)
+
+        let persistence = DownloadPersistence(directoryURL: persistenceRoot)
+        try await persistence.save([item.makeRecord()])
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        settings.startDownloadsAutomatically = false
+        let center = DownloadCenter(
+            settings: settings,
+            persistence: persistence,
+            directRecoveryDirectoryURL: testRoot.appendingPathComponent("DirectRecovery"),
+            completedHandoffDirectoryURL: testRoot.appendingPathComponent("Handoffs"),
+            browserRecoveryDirectoryURL: testRoot.appendingPathComponent("BrowserRecovery"),
+            pendingDataRemovalDirectoryURL: testRoot.appendingPathComponent("PendingRemoval"),
+            mediaService: MediaDownloadService(
+                eventHandler: { _, _ in },
+                fileManager: fileManager,
+                temporaryRoot: recoveryRoot
+            )
+        )
+        await center.initializeIfNeeded()
+
+        let restored = try XCTUnwrap(center.downloads.first)
+        let conflictIdentifier = try XCTUnwrap(
+            restored.mediaOutputConflictIdentifier
+        )
+        XCTAssertEqual(restored.status, .failed)
+        XCTAssertFalse(fileManager.fileExists(atPath: markerURL.path))
+        XCTAssertEqual(try Data(contentsOf: payloadURL), replacementPayload)
+        let storedRecords = try await persistence.load()
+        XCTAssertEqual(
+            storedRecords.first?.mediaOutputConflictIdentifier,
+            conflictIdentifier
+        )
+        let shutdownSucceeded = await center.shutdownForTermination()
         XCTAssertTrue(shutdownSucceeded)
     }
 
@@ -6785,6 +7404,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             shouldSeedAfterDownload: true
         )
         center.downloads = [item]
+        center.markInitializationLoadedForTesting()
 
         center.stopSeeding(id: item.id)
         await removalEntered.wait()
@@ -7138,6 +7758,207 @@ final class HarborModelAndSafetyTests: XCTestCase {
         let secondClaim = try await secondClaimTask.value
         _ = try store.finalize(secondClaim)
         XCTAssertEqual(try store.entries().count, 2)
+    }
+
+    func testMalformedPendingRemovalJournalDoesNotBlockDownloadRestoration() async throws {
+        let fileManager = FileManager.default
+        let testRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborMalformedPendingRemoval-\(UUID().uuidString)")
+        let persistenceRoot = testRoot.appendingPathComponent("Persistence", isDirectory: true)
+        let pendingRoot = testRoot.appendingPathComponent("Pending", isDirectory: true)
+        let handoffRoot = testRoot.appendingPathComponent("Handoffs", isDirectory: true)
+        defer { try? fileManager.removeItem(at: testRoot) }
+        try fileManager.createDirectory(at: pendingRoot, withIntermediateDirectories: true)
+
+        let suiteName = "HarborTests.MalformedPendingRemoval.\(UUID().uuidString)"
+        let userDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        settings.startDownloadsAutomatically = false
+
+        let item = DownloadItem(
+            sourceURL: try XCTUnwrap(URL(string: "https://example.test/archive.bin")),
+            sourceKind: .directURL,
+            backend: .urlSession,
+            preferredFilename: "archive.bin",
+            destinationFolderPath: testRoot.path,
+            status: .paused
+        )
+        let quarantinedItem = DownloadItem(
+            sourceURL: try XCTUnwrap(URL(string: "https://example.test/quarantined.bin")),
+            sourceKind: .directURL,
+            backend: .urlSession,
+            preferredFilename: "quarantined.bin",
+            destinationFolderPath: testRoot.path,
+            status: .queued
+        )
+        let persistence = DownloadPersistence(directoryURL: persistenceRoot)
+        try await persistence.save([item.makeRecord(), quarantinedItem.makeRecord()])
+        let malformedID = quarantinedItem.id
+        let malformedURL = pendingRoot
+            .appendingPathComponent(malformedID.uuidString)
+            .appendingPathExtension("json")
+        try Data("{not-valid-json".utf8).write(to: malformedURL)
+        let completedPayloadURL = testRoot.appendingPathComponent("quarantined-completion.bin")
+        try Data("completion-must-remain-quarantined".utf8).write(to: completedPayloadURL)
+        let retainedHandoff = try makeCompletedHandoff(
+            payloadURL: completedPayloadURL,
+            handoffDirectoryURL: handoffRoot,
+            downloadID: quarantinedItem.id,
+            attemptIdentifier: UUID(),
+            sourceURL: quarantinedItem.sourceURL,
+            suggestedFilename: "quarantined.bin"
+        )
+
+        let center = DownloadCenter(
+            settings: settings,
+            persistence: persistence,
+            directRecoveryDirectoryURL: testRoot.appendingPathComponent("DirectRecovery"),
+            completedHandoffDirectoryURL: handoffRoot,
+            browserRecoveryDirectoryURL: testRoot.appendingPathComponent("BrowserRecovery"),
+            pendingDataRemovalDirectoryURL: pendingRoot,
+            mediaService: MediaDownloadService(
+                eventHandler: { _, _ in },
+                fileManager: fileManager,
+                temporaryRoot: testRoot.appendingPathComponent("MediaRecovery")
+            )
+        )
+        await center.initializeIfNeeded()
+
+        XCTAssertEqual(
+            Set(center.downloads.map(\.id)),
+            Set([item.id, quarantinedItem.id])
+        )
+        XCTAssertEqual(center.downloads.first { $0.id == item.id }?.status, .paused)
+        let quarantined = try XCTUnwrap(
+            center.downloads.first { $0.id == quarantinedItem.id }
+        )
+        XCTAssertEqual(quarantined.status, .failed)
+        XCTAssertTrue(quarantined.lastError?.contains("cleanup journal") == true)
+        XCTAssertFalse(center.canRetryInitialization)
+        XCTAssertNil(center.initializationFailureMessage)
+        XCTAssertTrue(fileManager.fileExists(atPath: malformedURL.path))
+        let recoveryEntries = try PendingDownloadDataRemovalStore(
+            directoryURL: pendingRoot
+        ).recoveryEntries()
+        guard case let .invalid(downloadID, _) = try XCTUnwrap(recoveryEntries.first) else {
+            return XCTFail("Expected malformed cleanup journal classification")
+        }
+        XCTAssertEqual(downloadID, malformedID)
+        XCTAssertEqual(center.activeAlert?.title, "Download Cleanup Needs Attention")
+        center.retryDownload(id: quarantinedItem.id)
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        XCTAssertEqual(quarantined.status, .failed)
+        XCTAssertNil(quarantined.fileLocationPath)
+        XCTAssertTrue(fileManager.fileExists(atPath: retainedHandoff.packageURL.path))
+        let shutdownSucceeded = await center.shutdownForTermination()
+        XCTAssertTrue(shutdownSucceeded)
+    }
+
+    func testPendingRemovalStoreRejectsSymlinkedRootWithoutConsumingExternalJournal() throws {
+        let fileManager = FileManager.default
+        let testRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborSymlinkedPendingRemoval-\(UUID().uuidString)")
+        let pendingRoot = testRoot.appendingPathComponent("Pending", isDirectory: true)
+        let externalRoot = testRoot.appendingPathComponent("External", isDirectory: true)
+        defer { try? fileManager.removeItem(at: testRoot) }
+        try fileManager.createDirectory(at: externalRoot, withIntermediateDirectories: true)
+
+        let item = DownloadItem(
+            sourceURL: try XCTUnwrap(URL(string: "https://example.test/archive.bin")),
+            sourceKind: .directURL,
+            backend: .urlSession,
+            preferredFilename: "archive.bin",
+            destinationFolderPath: testRoot.path,
+            status: .failed
+        )
+        let journalURL = externalRoot
+            .appendingPathComponent(item.id.uuidString)
+            .appendingPathExtension("json")
+        try JSONEncoder().encode(
+            PendingDownloadDataRemovalManifest(record: item.makeRecord())
+        ).write(to: journalURL)
+        try fileManager.createSymbolicLink(
+            at: pendingRoot,
+            withDestinationURL: externalRoot
+        )
+
+        let store = PendingDownloadDataRemovalStore(directoryURL: pendingRoot)
+        XCTAssertThrowsError(try store.recoveryEntries())
+        XCTAssertThrowsError(try store.acknowledgeOrThrow(downloadID: item.id))
+        XCTAssertTrue(fileManager.fileExists(atPath: journalURL.path))
+    }
+
+    func testInitializationCanRetryAfterPersistenceIsRepaired() async throws {
+        let fileManager = FileManager.default
+        let testRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborInitializationRetry-\(UUID().uuidString)")
+        let persistenceRoot = testRoot.appendingPathComponent("Persistence", isDirectory: true)
+        defer { try? fileManager.removeItem(at: testRoot) }
+        try fileManager.createDirectory(at: persistenceRoot, withIntermediateDirectories: true)
+        try Data("not-json".utf8).write(
+            to: persistenceRoot.appendingPathComponent("downloads.json")
+        )
+
+        let suiteName = "HarborTests.InitializationRetry.\(UUID().uuidString)"
+        let userDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        settings.startDownloadsAutomatically = false
+        let persistence = DownloadPersistence(directoryURL: persistenceRoot)
+        func makeCenter() -> DownloadCenter {
+            DownloadCenter(
+                settings: settings,
+                persistence: persistence,
+                directRecoveryDirectoryURL: testRoot.appendingPathComponent("DirectRecovery"),
+                completedHandoffDirectoryURL: testRoot.appendingPathComponent("Handoffs"),
+                browserRecoveryDirectoryURL: testRoot.appendingPathComponent("BrowserRecovery"),
+                pendingDataRemovalDirectoryURL: testRoot.appendingPathComponent("Pending"),
+                mediaService: MediaDownloadService(
+                    eventHandler: { _, _ in },
+                    fileManager: fileManager,
+                    temporaryRoot: testRoot.appendingPathComponent("MediaRecovery")
+                ),
+                torrentShutdownOperation: { _ in }
+            )
+        }
+        let failedCenter = makeCenter()
+
+        await failedCenter.initializeIfNeeded()
+        XCTAssertTrue(failedCenter.canRetryInitialization)
+        XCTAssertNotNil(failedCenter.initializationFailureMessage)
+        XCTAssertTrue(failedCenter.downloads.isEmpty)
+        let corruptRecords = try Data(
+            contentsOf: persistenceRoot.appendingPathComponent("downloads.json")
+        )
+        let failedCenterShutdownSucceeded = await failedCenter.shutdownForTermination()
+        XCTAssertTrue(failedCenterShutdownSucceeded)
+        XCTAssertEqual(
+            try Data(contentsOf: persistenceRoot.appendingPathComponent("downloads.json")),
+            corruptRecords
+        )
+
+        let item = DownloadItem(
+            sourceURL: try XCTUnwrap(URL(string: "https://example.test/repaired.bin")),
+            sourceKind: .directURL,
+            backend: .urlSession,
+            preferredFilename: "repaired.bin",
+            destinationFolderPath: testRoot.path,
+            status: .paused
+        )
+        try await persistence.save([item.makeRecord()])
+        let restoredCenter = makeCenter()
+        await restoredCenter.initializeIfNeeded()
+
+        XCTAssertFalse(restoredCenter.canRetryInitialization)
+        XCTAssertNil(restoredCenter.initializationFailureMessage)
+        XCTAssertEqual(restoredCenter.downloads.map(\.id), [item.id])
+        let shutdownSucceeded = await restoredCenter.shutdownForTermination()
+        XCTAssertTrue(shutdownSucceeded)
     }
 
     func testBackendCleanupJournalCannotAuthorizeDeletingReplacementPayload() async throws {
@@ -7794,6 +8615,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             status: .downloading
         )
         center.downloads = [mediaItem, occupiedSlot]
+        center.markInitializationLoadedForTesting()
 
         center.cancelDownload(id: mediaItem.id)
         await retryCleanupEntered.wait()
@@ -7865,6 +8687,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             backendIdentifier: "pause-intent-gid"
         )
         center.downloads = [item]
+        center.markInitializationLoadedForTesting()
 
         center.pauseDownloads(ids: [item.id])
         await pauseEntered.wait()
@@ -7922,6 +8745,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             shouldSeedAfterDownload: true
         )
         center.downloads = [item]
+        center.markInitializationLoadedForTesting()
 
         center.stopSeeding(id: item.id)
         await removalEntered.wait()
@@ -7993,6 +8817,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             status: .queued
         )
         center.downloads = [torrentItem, queuedItem]
+        center.markInitializationLoadedForTesting()
 
         center.resumeDownloads(ids: [torrentItem.id])
         for _ in 0 ..< 200 where torrentItem.backendIdentifier == nil {
@@ -8120,6 +8945,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             shouldSeedAfterDownload: true
         )
         center.downloads = [item]
+        center.markInitializationLoadedForTesting()
 
         center.stopSeeding(id: item.id)
         await removalEntered.wait()
@@ -8191,6 +9017,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             shouldSeedAfterDownload: true
         )
         center.downloads = [item]
+        center.markInitializationLoadedForTesting()
 
         center.stopSeeding(id: item.id)
         await removalEntered.wait()
@@ -8381,6 +9208,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             status: .paused
         )
         center.downloads = [item]
+        center.markInitializationLoadedForTesting()
 
         center.resumeDownloads(ids: [item.id])
         for _ in 0 ..< 200 where item.status != .failed {
@@ -8432,6 +9260,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             status: .queued
         )
         center.downloads = [torrentItem, queuedItem]
+        center.markInitializationLoadedForTesting()
 
         center.reflectTorrentUnpauseUncertaintyForTesting(
             torrentItem,
@@ -8548,6 +9377,47 @@ final class HarborModelAndSafetyTests: XCTestCase {
             fileLocationPath: fileLocationPath,
             status: status,
             metadataName: metadataName
+        )
+    }
+}
+
+private final class ConcurrentMoveResults: @unchecked Sendable {
+    struct Snapshot {
+        let successfulIndices: [Int]
+        let cocoaErrorCodes: [CocoaError.Code]
+        let unexpectedErrors: [String]
+    }
+
+    private let lock = NSLock()
+    private var successfulIndices: [Int] = []
+    private var cocoaErrorCodes: [CocoaError.Code] = []
+    private var unexpectedErrors: [String] = []
+
+    func recordSuccess(_ index: Int) {
+        lock.lock()
+        successfulIndices.append(index)
+        lock.unlock()
+    }
+
+    func recordCocoaError(_ code: CocoaError.Code) {
+        lock.lock()
+        cocoaErrorCodes.append(code)
+        lock.unlock()
+    }
+
+    func recordUnexpectedError(_ error: Error) {
+        lock.lock()
+        unexpectedErrors.append(error.localizedDescription)
+        lock.unlock()
+    }
+
+    var snapshot: Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(
+            successfulIndices: successfulIndices,
+            cocoaErrorCodes: cocoaErrorCodes,
+            unexpectedErrors: unexpectedErrors
         )
     }
 }

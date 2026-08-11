@@ -38,6 +38,12 @@ final class DownloadCenter {
         }
     }
 
+    private enum InitializationState {
+        case notLoaded
+        case loading
+        case loaded
+    }
+
     private enum PendingDirectPauseFailure {
         case direct(DirectDownloadFailure)
         case browser(DirectDownloadFailure)
@@ -122,7 +128,8 @@ final class DownloadCenter {
     @ObservationIgnored private var browserCoordinator: BrowserDownloadCoordinator! = nil
     @ObservationIgnored private let torrentService: Aria2TorrentService
     @ObservationIgnored private var mediaService: MediaDownloadService! = nil
-    @ObservationIgnored private var hasLoaded = false
+    @ObservationIgnored private var initializationState: InitializationState = .notLoaded
+    @ObservationIgnored private var initializationWaiters: [CheckedContinuation<Void, Never>] = []
     @ObservationIgnored private var hasInstalledExternalOpenHandler = false
     @ObservationIgnored private var persistTask: Task<Void, Never>?
     @ObservationIgnored private var torrentRefreshTask: Task<Void, Never>?
@@ -140,6 +147,8 @@ final class DownloadCenter {
     @ObservationIgnored private var pendingTorrentSeedingRestartIDs: Set<UUID> = []
     @ObservationIgnored private var orphanedTorrentCleanupTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var pendingRemovalReconciliationTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingRemovalReservedIDs: Set<UUID> = []
+    @ObservationIgnored private var pendingRemovalQuarantinedIDs: Set<UUID> = []
     @ObservationIgnored private var directRetryTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private var directRetryAttempts: [UUID: Int] = [:]
     @ObservationIgnored private var readyDirectRetries: [UUID: Bool] = [:]
@@ -198,6 +207,11 @@ final class DownloadCenter {
     var addSheetDraft: AddDownloadSheetDraft?
     var activeBrowserSession: BrowserDownloadSession?
     var activeAlert: UserAlert?
+    private(set) var initializationFailureMessage: String?
+
+    var canRetryInitialization: Bool {
+        initializationState == .notLoaded && initializationFailureMessage != nil
+    }
 
     init(
         settings: AppSettingsStore,
@@ -325,14 +339,33 @@ final class DownloadCenter {
     }
 
     func initializeIfNeeded() async {
-        guard hasLoaded == false else {
+        guard initializationState == .notLoaded,
+              isShuttingDown == false else {
             return
         }
 
-        hasLoaded = true
+        let isRetryingInitialization = initializationFailureMessage != nil
+        initializationState = .loading
+        defer {
+            let waiters = initializationWaiters
+            initializationWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+        initializationFailureMessage = nil
+        if isRetryingInitialization {
+            activeAlert = nil
+        }
+        var orphanCleanupWarning: String?
 
         do {
-            try await mediaService.terminateOrphanedMediaProcesses()
+            do {
+                try await mediaService.terminateOrphanedMediaProcesses()
+            } catch {
+                // Exact process ownership is verified by the media service.
+                // Failure to stop one owned orphan must not prevent unrelated
+                // records and queues from being restored.
+                orphanCleanupWarning = error.localizedDescription
+            }
             let records = try await persistence.load()
             let restoredItems = records
                 .sorted { $0.createdAt > $1.createdAt }
@@ -393,7 +426,7 @@ final class DownloadCenter {
                 }
 
             downloads = restoredItems
-            try await reconcilePendingDataRemovals()
+            let pendingRemovalNeedsRetry = try await reconcilePendingDataRemovals()
             try await reconcileCompletedMediaDownloads()
             let browserCompletionRecoveryFailures: [UUID: String]
             do {
@@ -554,12 +587,23 @@ final class DownloadCenter {
                     retaining: retainedCompletionIDs
                 )
             }.value
-            try await mediaService.discardOrphanedRecoveryData(
-                retaining: Self.retainedMediaRecoveryIDs(in: downloads)
-            )
+            do {
+                try await mediaService.discardOrphanedRecoveryData(
+                    retaining: Self.retainedMediaRecoveryIDs(in: downloads)
+                )
+            } catch {
+                orphanCleanupWarning = [orphanCleanupWarning, error.localizedDescription]
+                    .compactMap { $0 }
+                    .joined(separator: "\n")
+            }
             try await saveRecordsNow()
             selectDownload(downloads.first?.id)
             await reconcileRestoredTorrentSession()
+            initializationState = .loaded
+            initializationFailureMessage = nil
+            if pendingRemovalNeedsRetry {
+                schedulePendingRemovalReconciliation()
+            }
             configureTorrentWatchFolder()
 
             if settings.startDownloadsAutomatically {
@@ -573,7 +617,15 @@ final class DownloadCenter {
                 startOrQueueDownload(id: item.id)
             }
             startTorrentRefreshLoopIfNeeded()
+            if let orphanCleanupWarning, activeAlert == nil {
+                activeAlert = UserAlert(
+                    title: String(localized: "Media Cleanup Still Pending"),
+                    message: orphanCleanupWarning
+                )
+            }
         } catch {
+            initializationState = .notLoaded
+            initializationFailureMessage = error.localizedDescription
             activeAlert = UserAlert(
                 title: String(
                     localized: "alert.restoreDownloads.title",
@@ -582,7 +634,6 @@ final class DownloadCenter {
                 ),
                 message: error.localizedDescription
             )
-            startTorrentRefreshLoopIfNeeded()
         }
     }
 
@@ -607,6 +658,10 @@ final class DownloadCenter {
         }
 
         for invalidPackage in invalidPackages {
+            if let id = invalidPackage.id,
+               pendingRemovalReservedIDs.contains(id) {
+                continue
+            }
             if let id = invalidPackage.id,
                validHandoffsByID[id]?.isEmpty == false {
                 // A valid package is authoritative for this download. An
@@ -656,6 +711,7 @@ final class DownloadCenter {
 
         for unavailablePackage in unavailablePackages {
             guard let id = unavailablePackage.id,
+                  pendingRemovalReservedIDs.contains(id) == false,
                   validHandoffsByID[id]?.isEmpty != false,
                   let item = item(for: id),
                   item.backend == .urlSession,
@@ -699,6 +755,9 @@ final class DownloadCenter {
         }
 
         for (id, candidates) in validHandoffsByID {
+            guard pendingRemovalReservedIDs.contains(id) == false else {
+                continue
+            }
             guard let item = item(for: id),
                   item.backend == .urlSession,
                   item.status != .cancelled else {
@@ -739,6 +798,9 @@ final class DownloadCenter {
         for entry in entries {
             switch entry {
             case let .valid(manifest):
+                guard pendingRemovalReservedIDs.contains(manifest.downloadID) == false else {
+                    continue
+                }
                 guard let item = item(for: manifest.downloadID),
                       mediaCompletion(manifest, belongsTo: item),
                       item.status != .cancelled else {
@@ -748,6 +810,9 @@ final class DownloadCenter {
                 _ = await commitMediaCompletion(manifest, to: item)
 
             case let .invalid(downloadID, message):
+                guard pendingRemovalReservedIDs.contains(downloadID) == false else {
+                    continue
+                }
                 guard let item = item(for: downloadID),
                       item.backend == .ytDlp,
                       item.status != .cancelled,
@@ -757,13 +822,17 @@ final class DownloadCenter {
                 }
                 let didPersistFailure = await persistMediaCompletionFailure(
                     message,
-                    for: item
+                    for: item,
+                    rotatingOutputConflictIdentifier: true
                 )
                 if didPersistFailure {
                     await discardInvalidMediaCompletionMarker(id: downloadID)
                 }
 
             case let .unavailable(downloadID, message):
+                guard pendingRemovalReservedIDs.contains(downloadID) == false else {
+                    continue
+                }
                 guard let item = item(for: downloadID),
                       item.backend == .ytDlp,
                       item.status != .cancelled,
@@ -872,10 +941,14 @@ final class DownloadCenter {
     @discardableResult
     private func persistMediaCompletionFailure(
         _ message: String,
-        for item: DownloadItem
+        for item: DownloadItem,
+        rotatingOutputConflictIdentifier: Bool = false
     ) async -> Bool {
         var didPersistFailure = false
         var persistenceFailure: Error?
+        let replacementOutputConflictIdentifier = rotatingOutputConflictIdentifier
+            ? UUID()
+            : nil
         await performSerializedDurableMutation { [weak self, weak item] in
             guard let self,
                   let item,
@@ -886,6 +959,9 @@ final class DownloadCenter {
                 return
             }
             let originalRecord = item.makeRecord()
+            if let replacementOutputConflictIdentifier {
+                item.mediaOutputConflictIdentifier = replacementOutputConflictIdentifier
+            }
             item.backendIdentifier = nil
             item.lastError = message
             item.speedBytesPerSecond = 0
@@ -903,6 +979,13 @@ final class DownloadCenter {
                 // as preparing or downloading in memory would reserve a slot
                 // forever with no task capable of producing another event.
                 item.backendIdentifier = nil
+                if let replacementOutputConflictIdentifier {
+                    // Keep the collision barrier in memory even when the
+                    // immediate save failed. The invalid completion marker is
+                    // retained until a durable save succeeds, and an explicit
+                    // retry in this process still receives a fresh output path.
+                    item.mediaOutputConflictIdentifier = replacementOutputConflictIdentifier
+                }
                 item.speedBytesPerSecond = 0
                 item.uploadBytesPerSecond = 0
                 item.updatedAt = .now
@@ -946,11 +1029,65 @@ final class DownloadCenter {
         }
     }
 
-    private func reconcilePendingDataRemovals() async throws {
+    private func reconcilePendingDataRemovals() async throws -> Bool {
         let pendingDataRemovalStore = pendingDataRemovalStore
-        let manifests = try await Task.detached(priority: .utility) {
-            try pendingDataRemovalStore.entries()
+        let entries = try await Task.detached(priority: .utility) {
+            try pendingDataRemovalStore.recoveryEntries()
         }.value
+        let manifests: [PendingDownloadDataRemovalManifest] = entries.compactMap { entry in
+            guard case let .valid(manifest) = entry else {
+                return nil
+            }
+            return manifest
+        }
+        let unavailableMessages = entries.compactMap { entry -> String? in
+            switch entry {
+            case .valid:
+                nil
+            case let .invalid(downloadID, message),
+                 let .unavailable(downloadID, message):
+                if let downloadID {
+                    "\(downloadID.uuidString): \(message)"
+                } else {
+                    message
+                }
+            }
+        }
+        pendingRemovalReservedIDs = Set(entries.compactMap(\.downloadID))
+        let quarantinedIDs = Set(
+            entries.compactMap { entry -> UUID? in
+                switch entry {
+                case .valid:
+                    nil
+                case let .invalid(downloadID, _),
+                     let .unavailable(downloadID, _):
+                    downloadID
+                }
+            }
+        )
+        pendingRemovalQuarantinedIDs = quarantinedIDs
+        var didQuarantineTrackedItem = false
+        for id in quarantinedIDs {
+            guard let item = item(for: id),
+                  item.status != .completed,
+                  item.status != .cancelled else {
+                continue
+            }
+            let message = pendingRemovalQuarantineMessage
+            if item.status != .failed || item.lastError != message {
+                item.taskIdentifier = nil
+                item.backendIdentifier = nil
+                item.speedBytesPerSecond = 0
+                item.uploadBytesPerSecond = 0
+                item.lastError = message
+                item.updatedAt = .now
+                setStatus(for: item, to: .failed)
+                didQuarantineTrackedItem = true
+            }
+        }
+        if didQuarantineTrackedItem {
+            try await saveRecordsNow()
+        }
 
         for originalManifest in manifests.sorted(by: { $0.createdAt < $1.createdAt }) {
             var manifest = originalManifest
@@ -968,7 +1105,7 @@ final class DownloadCenter {
                     let trackedItem = trackedItemRestoringIfNeeded(from: record)
                     applyPartialDataRemovalResult(result, to: trackedItem)
                     try await saveRecordsNow()
-                    pendingDataRemovalStore.acknowledge(downloadID: record.id)
+                    try? acknowledgePendingDataRemoval(downloadID: record.id)
                     continue
                 }
                 manifest = try pendingDataRemovalStore.markBackendCleanup(
@@ -988,7 +1125,7 @@ final class DownloadCenter {
                     let trackedItem = trackedItemRestoringIfNeeded(from: record)
                     applyInterruptedDataRemovalInspection(inspection, to: trackedItem)
                     try await saveRecordsNow()
-                    try pendingDataRemovalStore.acknowledgeOrThrow(downloadID: record.id)
+                    try acknowledgePendingDataRemoval(downloadID: record.id)
                     activeAlert = UserAlert(
                         title: String(localized: "Download Data Was Left in Place"),
                         message: trackedItem.lastError ?? ""
@@ -1014,7 +1151,7 @@ final class DownloadCenter {
                 )
                 moveOriginalTorrentFileToTrashIfNeeded(for: cleanupItem)
                 removeManagedTorrentSourceIfNeeded(for: cleanupItem)
-                pendingDataRemovalStore.acknowledge(downloadID: record.id)
+                try? acknowledgePendingDataRemoval(downloadID: record.id)
             } catch {
                 // This phase contains no payload mutation. Retaining it is
                 // safe even if a different file later appears at the old path.
@@ -1022,7 +1159,39 @@ final class DownloadCenter {
                     title: String(localized: "Download Removed; Backend Cleanup Pending"),
                     message: error.localizedDescription
                 )
-                schedulePendingRemovalReconciliation()
+            }
+        }
+
+        if unavailableMessages.isEmpty == false, activeAlert == nil {
+            activeAlert = UserAlert(
+                title: String(localized: "Download Cleanup Needs Attention"),
+                message: unavailableMessages.joined(separator: "\n")
+            )
+        }
+
+        // Invalid journals need user intervention and must not create an
+        // endless retry loop. Valid or temporarily unavailable journals remain
+        // replayable, including a valid entry whose final acknowledgement was
+        // interrupted.
+        let remainingEntries = try pendingDataRemovalStore.recoveryEntries()
+        pendingRemovalReservedIDs = Set(remainingEntries.compactMap(\.downloadID))
+        pendingRemovalQuarantinedIDs = Set(
+            remainingEntries.compactMap { entry -> UUID? in
+                switch entry {
+                case .valid:
+                    nil
+                case let .invalid(downloadID, _),
+                     let .unavailable(downloadID, _):
+                    downloadID
+                }
+            }
+        )
+        return remainingEntries.contains { entry in
+            switch entry {
+            case .valid, .unavailable:
+                true
+            case .invalid:
+                false
             }
         }
     }
@@ -1038,8 +1207,23 @@ final class DownloadCenter {
         return restored
     }
 
+    private func acknowledgePendingDataRemoval(downloadID: UUID) throws {
+        try pendingDataRemovalStore.acknowledgeOrThrow(downloadID: downloadID)
+        pendingRemovalReservedIDs.remove(downloadID)
+        pendingRemovalQuarantinedIDs.remove(downloadID)
+    }
+
+    private var pendingRemovalQuarantineMessage: String {
+        String(
+            localized: "download.cleanupJournal.quarantined",
+            defaultValue: "Harbor found an unreadable cleanup journal for this download. Its data was left untouched.",
+            comment: "Failure shown when one download is quarantined because its durable cleanup journal cannot be verified."
+        )
+    }
+
     private func schedulePendingRemovalReconciliation() {
         guard pendingRemovalReconciliationTask == nil,
+              initializationState == .loaded,
               isShuttingDown == false else {
             return
         }
@@ -1048,17 +1232,25 @@ final class DownloadCenter {
                 return
             }
             defer { self.pendingRemovalReconciliationTask = nil }
-            for delay in [Duration.seconds(2), .seconds(10), .seconds(30)] {
+            let delays = [
+                Duration.seconds(2),
+                .seconds(10),
+                .seconds(30),
+                .seconds(60)
+            ]
+            var retryIndex = 0
+            while true {
                 do {
+                    let delay = delays[min(retryIndex, delays.count - 1)]
                     try await Task.sleep(for: delay)
                     guard self.isShuttingDown == false else {
                         return
                     }
-                    try await self.reconcilePendingDataRemovals()
-                    let entries = try self.pendingDataRemovalStore.entries()
-                    if entries.isEmpty {
+                    let needsRetry = try await self.reconcilePendingDataRemovals()
+                    if needsRetry == false {
                         return
                     }
+                    retryIndex += 1
                 } catch is CancellationError {
                     return
                 } catch {
@@ -1066,6 +1258,7 @@ final class DownloadCenter {
                         title: String(localized: "Download Cleanup Still Pending"),
                         message: error.localizedDescription
                     )
+                    retryIndex += 1
                 }
             }
         }
@@ -1144,6 +1337,7 @@ final class DownloadCenter {
         item.lastError = nil
         item.backendIdentifier = nil
         item.requiresMediaRecoveryReset = false
+        item.mediaOutputConflictIdentifier = nil
         item.speedBytesPerSecond = 0
         item.uploadBytesPerSecond = 0
         item.updatedAt = .now
@@ -1499,7 +1693,10 @@ final class DownloadCenter {
             reservations = try await torrentService.pendingSubmissionReservations()
             let pendingDataRemovalStore = pendingDataRemovalStore
             pendingRemovalIDs = try await Task.detached(priority: .utility) {
-                Set(try pendingDataRemovalStore.entries().map { $0.record.id })
+                Set(
+                    try pendingDataRemovalStore.recoveryEntries()
+                        .compactMap(\.downloadID)
+                )
             }.value
         } catch {
             // Reservation enumeration is part of ownership recovery. If it is
@@ -2100,7 +2297,8 @@ final class DownloadCenter {
     }
 
     private func configureTorrentWatchFolder() {
-        guard hasLoaded else {
+        guard initializationState == .loaded,
+              isShuttingDown == false else {
             return
         }
 
@@ -2189,6 +2387,10 @@ final class DownloadCenter {
     @discardableResult
     func shutdownForTermination() async -> Bool {
         isShuttingDown = true
+        await waitForInitializationToFinish()
+        guard initializationState == .loaded else {
+            return await shutdownWithoutAuthoritativeRecords()
+        }
         let pendingRemovalReconciliation = pendingRemovalReconciliationTask
         pendingRemovalReconciliationTask = nil
         pendingRemovalReconciliation?.cancel()
@@ -2483,6 +2685,79 @@ final class DownloadCenter {
         return true
     }
 
+    private func shutdownWithoutAuthoritativeRecords() async -> Bool {
+        let pendingRemovalReconciliation = pendingRemovalReconciliationTask
+        pendingRemovalReconciliationTask = nil
+        pendingRemovalReconciliation?.cancel()
+        let pendingTorrentRefresh = torrentRefreshTask
+        torrentRefreshTask = nil
+        pendingTorrentRefresh?.cancel()
+        mediaStartTasks.values.forEach { $0.cancel() }
+        torrentStartTasks.values.forEach { $0.cancel() }
+        directRetryTasks.values.forEach { $0.cancel() }
+        directRetryTasks.removeAll()
+        readyDirectRetries.removeAll()
+        torrentWatchFolderService.stop()
+        await cancelPendingPersistenceAndWait()
+        await pendingRemovalReconciliation?.value
+        await pendingTorrentRefresh?.value
+
+        for task in Array(mediaStartTasks.values) + Array(torrentStartTasks.values) {
+            await task.value
+        }
+        await drainDurableTerminalMutationTasksForShutdown()
+        for task in Array(torrentStopSeedingTasks.values)
+            + Array(completionLookupTasks.values)
+            + Array(completionTasks.values) {
+            await task.value
+        }
+        for task in Array(directPauseTasks.values)
+            + Array(browserCancellationTasks.values)
+            + Array(mediaPauseTasks.values)
+            + Array(torrentPauseTasks.values) {
+            await task.value
+        }
+        // Terminal mutations and pause work can create backend cleanup after
+        // the earlier snapshots. Observe that producer boundary before taking
+        // the cleanup snapshot.
+        await drainDurableTerminalMutationTasksForShutdown()
+        for task in Array(mediaCleanupTasks.values) {
+            await task.value
+        }
+        await cancelOrphanedTorrentCleanupTasksAndWait()
+
+        let browserResults = await browserCoordinator.quiesceForShutdown()
+        for task in Array(completionTasks.values) {
+            await task.value
+        }
+        await drainDurableTerminalMutationTasksForShutdown()
+        if let failure = browserResults.values
+            .compactMap(\.writerQuiescenceUnavailableMessage)
+            .first {
+            activeAlert = UserAlert(
+                title: String(localized: "Browser Download Is Still Stopping"),
+                message: failure
+            )
+            browserCoordinator.resumeAfterFailedShutdown()
+            isShuttingDown = false
+            return false
+        }
+
+        await mediaService.shutdown()
+        do {
+            try await torrentShutdownOperation(torrentService)
+        } catch {
+            activeAlert = UserAlert(
+                title: String(localized: "Couldn’t Save Torrent Recovery Before Quitting"),
+                message: error.localizedDescription
+            )
+            browserCoordinator.resumeAfterFailedShutdown()
+            isShuttingDown = false
+            return false
+        }
+        return true
+    }
+
     private func drainDurableTerminalMutationTasksForShutdown() async {
         while true {
             let pendingTasks = Array(cancellationTasks.values)
@@ -2764,6 +3039,9 @@ final class DownloadCenter {
     func retryDownload(id: UUID) {
         guard isShuttingDown == false,
               let item = item(for: id) else {
+            return
+        }
+        guard isStartBlockedByPendingRemoval(for: item) == false else {
             return
         }
 
@@ -3669,6 +3947,8 @@ final class DownloadCenter {
                 record: item.makeRecord(),
                 removingData: removingData
             )
+            pendingRemovalReservedIDs.insert(id)
+            pendingRemovalQuarantinedIDs.remove(id)
         } catch {
             item.status = durableMutationFailureStatus(from: rollbackStatus)
             item.lastError = error.localizedDescription
@@ -3694,11 +3974,12 @@ final class DownloadCenter {
                 applyInterruptedDataRemovalInspection(inspection, to: item)
                 do {
                     try await saveRecordsNow()
-                    try pendingDataRemovalStore.acknowledgeOrThrow(downloadID: id)
+                    try acknowledgePendingDataRemoval(downloadID: id)
                 } catch {
                     item.lastError = [item.lastError, error.localizedDescription]
                         .compactMap { $0 }
                         .joined(separator: "\n")
+                    schedulePendingRemovalReconciliation()
                 }
                 activeAlert = UserAlert(
                     title: String(localized: "Download Data Was Left in Place"),
@@ -3722,6 +4003,7 @@ final class DownloadCenter {
                     title: String(localized: "Couldn’t Prepare Download Data Removal"),
                     message: error.localizedDescription
                 )
+                schedulePendingRemovalReconciliation()
                 return
             }
             let result = dataRemovalService.movePayloadDataToTrash(
@@ -3732,11 +4014,12 @@ final class DownloadCenter {
                 applyPartialDataRemovalResult(result, to: item)
                 do {
                     try await saveRecordsNow()
-                    try pendingDataRemovalStore.acknowledgeOrThrow(downloadID: id)
+                    try acknowledgePendingDataRemoval(downloadID: id)
                 } catch {
                     item.lastError = [item.lastError, error.localizedDescription]
                         .compactMap { $0 }
                         .joined(separator: "\n")
+                    schedulePendingRemovalReconciliation()
                 }
                 activeAlert = UserAlert(
                     title: String(localized: "Some Download Data Couldn’t Be Moved to Trash"),
@@ -3794,7 +4077,7 @@ final class DownloadCenter {
                     self.schedulePendingRemovalReconciliation()
                 } else {
                     do {
-                        try self.pendingDataRemovalStore.acknowledgeOrThrow(downloadID: id)
+                        try self.acknowledgePendingDataRemoval(downloadID: id)
                         self.downloads.insert(
                             item,
                             at: min(originalIndex, self.downloads.endIndex)
@@ -3845,7 +4128,15 @@ final class DownloadCenter {
         moveOriginalTorrentFileToTrashIfNeeded(for: item)
         removeManagedTorrentSourceIfNeeded(for: item)
         if didCompleteBackendCleanup {
-            pendingDataRemovalStore.acknowledge(downloadID: id)
+            do {
+                try acknowledgePendingDataRemoval(downloadID: id)
+            } catch {
+                activeAlert = UserAlert(
+                    title: String(localized: "Download Removed; Backend Cleanup Pending"),
+                    message: error.localizedDescription
+                )
+                schedulePendingRemovalReconciliation()
+            }
         }
     }
 
@@ -4063,6 +4354,9 @@ final class DownloadCenter {
     }
 
     private func resumeDownload(_ item: DownloadItem) {
+        guard isStartBlockedByPendingRemoval(for: item) == false else {
+            return
+        }
         guard directPauseTasks[item.id] == nil else {
             return
         }
@@ -4083,6 +4377,9 @@ final class DownloadCenter {
         guard let item = item(for: id),
               item.backend == .aria2,
               item.finishedAt != nil else {
+            return
+        }
+        guard isStartBlockedByPendingRemoval(for: item) == false else {
             return
         }
 
@@ -4321,8 +4618,13 @@ final class DownloadCenter {
         if activeBrowserSession?.downloadID == id {
             return
         }
-        guard let item = item(for: id),
-              item.sourceKind == .directURL,
+        guard let item = item(for: id) else {
+            return
+        }
+        guard isStartBlockedByPendingRemoval(for: item) == false else {
+            return
+        }
+        guard item.sourceKind == .directURL,
               item.status == .browserSessionRequired || item.browserResumeData != nil,
               browserCancellationTasks[id] == nil,
               completionTasks[id] == nil,
@@ -4440,7 +4742,8 @@ final class DownloadCenter {
     }
 
     private func startOrQueueDownload(id: UUID) {
-        guard isShuttingDown == false else {
+        guard initializationState == .loaded,
+              isShuttingDown == false else {
             return
         }
 
@@ -4450,6 +4753,10 @@ final class DownloadCenter {
         }
 
         guard let item = item(for: id) else {
+            return
+        }
+
+        guard isStartBlockedByPendingRemoval(for: item) == false else {
             return
         }
 
@@ -4578,6 +4885,23 @@ final class DownloadCenter {
                 )
             }
         }
+    }
+
+    private func isStartBlockedByPendingRemoval(for item: DownloadItem) -> Bool {
+        guard pendingRemovalReservedIDs.contains(item.id) else {
+            return false
+        }
+        if pendingRemovalQuarantinedIDs.contains(item.id) {
+            item.taskIdentifier = nil
+            item.backendIdentifier = nil
+            item.lastError = pendingRemovalQuarantineMessage
+            item.speedBytesPerSecond = 0
+            item.uploadBytesPerSecond = 0
+            item.updatedAt = .now
+            setStatus(for: item, to: .failed)
+            schedulePersist()
+        }
+        return true
     }
 
     private func startDirectDownload(
@@ -4987,12 +5311,10 @@ final class DownloadCenter {
             }
 
             if waitsForMediaStopEvent == false {
-                if let item = item(for: id),
-                   item.status == .paused || item.status == .cancelled {
-                    startNextQueuedDownloadsIfNeeded()
-                } else if item(for: id) == nil {
-                    startNextQueuedDownloadsIfNeeded()
-                }
+                // `mediaStartTasks` itself reserves the slot. Refill only after
+                // removing that reservation, regardless of whether this start
+                // succeeded, failed, or became irrelevant while suspended.
+                startNextQueuedDownloadsIfNeeded()
             }
         }
 
@@ -5113,6 +5435,7 @@ final class DownloadCenter {
                 destinationFolder: readyItem.destinationFolderURL,
                 metadata: validatedMetadata,
                 formatPreference: requestedFormat,
+                outputConflictIdentifier: readyItem.mediaOutputConflictIdentifier,
                 speedLimitBytesPerSecond: effectiveMediaDownloadLimit(for: readyItem)
             )
 
@@ -5160,6 +5483,16 @@ final class DownloadCenter {
                 return
             }
 
+            if let mediaError = error as? MediaDownloadError,
+               case .outputConflict = mediaError {
+                _ = await persistMediaCompletionFailure(
+                    error.localizedDescription,
+                    for: refreshedItem,
+                    rotatingOutputConflictIdentifier: true
+                )
+                return
+            }
+
             refreshedItem.backendIdentifier = nil
             refreshedItem.speedBytesPerSecond = 0
             refreshedItem.uploadBytesPerSecond = 0
@@ -5168,7 +5501,6 @@ final class DownloadCenter {
             transitionStatus(for: refreshedItem, to: .failed)
             presentMediaErrorIfNeeded(error)
             schedulePersist()
-            startNextQueuedDownloadsIfNeeded()
         }
     }
 
@@ -5924,7 +6256,8 @@ final class DownloadCenter {
     }
 
     private func startNextQueuedDownloadsIfNeeded() {
-        guard isShuttingDown == false else {
+        guard initializationState == .loaded,
+              isShuttingDown == false else {
             return
         }
 
@@ -5943,6 +6276,7 @@ final class DownloadCenter {
             .filter {
                 cancellationTasks[$0.id] == nil
                     && removalTasks[$0.id] == nil
+                    && pendingRemovalReservedIDs.contains($0.id) == false
                     && (
                         $0.status == .queued
                             || ($0.status == .waitingToRetry && readyDirectRetries[$0.id] != nil)
@@ -6024,7 +6358,9 @@ final class DownloadCenter {
     }
 
     private func startTorrentRefreshLoopIfNeeded() {
-        guard torrentRefreshTask == nil else {
+        guard initializationState == .loaded,
+              isShuttingDown == false,
+              torrentRefreshTask == nil else {
             return
         }
 
@@ -6033,6 +6369,15 @@ final class DownloadCenter {
                 await self?.refreshTorrentDownloads()
                 try? await Task.sleep(for: .seconds(1))
             }
+        }
+    }
+
+    private func waitForInitializationToFinish() async {
+        guard initializationState == .loading else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            initializationWaiters.append(continuation)
         }
     }
 
@@ -6922,7 +7267,8 @@ final class DownloadCenter {
             case let .invalid(_, message):
                 let didPersistFailure = await self.persistMediaCompletionFailure(
                     message,
-                    for: item
+                    for: item,
+                    rotatingOutputConflictIdentifier: true
                 )
                 guard didPersistFailure else {
                     return
@@ -7102,6 +7448,16 @@ final class DownloadCenter {
 
     func drainDownloadQueueForTesting() {
         startNextQueuedDownloadsIfNeeded()
+    }
+
+    func markInitializationLoadedForTesting() {
+        precondition(initializationState != .loading)
+        initializationState = .loaded
+        initializationFailureMessage = nil
+    }
+
+    func hasPendingRemovalReservationForTesting(id: UUID) -> Bool {
+        pendingRemovalReservedIDs.contains(id)
     }
 
     func installMediaAttemptForTesting(id: UUID, attemptIdentifier: UUID) {
@@ -7378,7 +7734,8 @@ final class DownloadCenter {
                             defaultValue: "Harbor could not verify the completed media: \(error.localizedDescription)",
                             comment: "Failure shown when a durable media-completion journal is temporarily inaccessible."
                         ),
-                        for: item
+                        for: item,
+                        rotatingOutputConflictIdentifier: true
                     )
                     return
                 }
@@ -7398,7 +7755,8 @@ final class DownloadCenter {
                           Set(eventPayloadPaths) == Set(manifestPayloadPaths) else {
                         _ = await self.persistMediaCompletionFailure(
                             "The completed media journal did not match the active download attempt.",
-                            for: item
+                            for: item,
+                            rotatingOutputConflictIdentifier: true
                         )
                         return
                     }
@@ -7407,7 +7765,8 @@ final class DownloadCenter {
                 case let .invalid(_, message):
                     let didPersistFailure = await self.persistMediaCompletionFailure(
                         message,
-                        for: item
+                        for: item,
+                        rotatingOutputConflictIdentifier: true
                     )
                     if didPersistFailure {
                         await self.discardInvalidMediaCompletionMarker(id: id)
@@ -7420,21 +7779,46 @@ final class DownloadCenter {
                             defaultValue: "Harbor could not verify the completed media: \(message)",
                             comment: "Failure shown when a durable media-completion journal is temporarily inaccessible."
                         ),
-                        for: item
+                        for: item,
+                        rotatingOutputConflictIdentifier: true
                     )
 
                 case nil:
                     _ = await self.persistMediaCompletionFailure(
                         "The completed media journal is missing.",
-                        for: item
+                        for: item,
+                        rotatingOutputConflictIdentifier: true
                     )
                 }
             }
             completionTasks[id] = task
             return
 
-        case let .failed(id, message):
+        case let .failed(id, message, disposition):
             guard let item = item(for: id) else {
+                return
+            }
+
+            if case .outputConflict = disposition {
+                let task = Task { @MainActor [weak self, weak item] in
+                    guard let self,
+                          let item,
+                          self.item(for: id) === item else {
+                        self?.completionTasks.removeValue(forKey: id)
+                        self?.startNextQueuedDownloadsIfNeeded()
+                        return
+                    }
+                    defer {
+                        self.completionTasks.removeValue(forKey: id)
+                        self.startNextQueuedDownloadsIfNeeded()
+                    }
+                    _ = await self.persistMediaCompletionFailure(
+                        message,
+                        for: item,
+                        rotatingOutputConflictIdentifier: true
+                    )
+                }
+                completionTasks[id] = task
                 return
             }
 
@@ -7466,7 +7850,7 @@ final class DownloadCenter {
              let .paused(id),
              let .cancelled(id),
              let .finished(id, _, _, _),
-             let .failed(id, _):
+             let .failed(id, _, _):
             id
         }
     }
