@@ -28,9 +28,6 @@ final class ManagedChildProcess: @unchecked Sendable {
     nonisolated(unsafe) private var hasRequestedTermination = false
     nonisolated(unsafe) private var hasNotifiedTermination = false
     nonisolated(unsafe) private var shouldStopOutputReaders = false
-#if DEBUG
-    nonisolated(unsafe) private var didReserveExitedProcessIdentityDuringOutputDrain = false
-#endif
 
     nonisolated init(
         executableURL: URL,
@@ -167,14 +164,6 @@ final class ManagedChildProcess: @unchecked Sendable {
         }
     }
 
-#if DEBUG
-    nonisolated var didReserveExitedProcessIdentityDuringOutputDrainForTesting: Bool {
-        lock.withLock {
-            didReserveExitedProcessIdentityDuringOutputDrain
-        }
-    }
-#endif
-
     private nonisolated func signalOwnedProcessGroup(_ signal: Int32) {
         lock.withLock {
             guard hasExited == false else {
@@ -279,12 +268,6 @@ final class ManagedChildProcess: @unchecked Sendable {
             // before reporting termination so callers can safely interpret a
             // final path or error line emitted immediately before exit.
             if self.outputReaders.wait(timeout: .now() + 1) == .timedOut {
-#if DEBUG
-                self.lock.withLock {
-                    self.didReserveExitedProcessIdentityDuringOutputDrain =
-                        self.hasObservedExitWithoutReaping && self.hasExited == false
-                }
-#endif
                 // A descendant can inherit the pipes and survive the leader.
                 self.signalOwnedProcessGroup(SIGTERM)
             }

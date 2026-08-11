@@ -274,16 +274,6 @@ actor Aria2TorrentService {
         Aria2BinaryResolver.resolveBinaryURL()?.path
     }
 
-#if DEBUG
-    func ensureDaemonReadyForTesting() async throws {
-        try await ensureDaemonRunning()
-    }
-
-    var isDaemonReadyForTesting: Bool {
-        isDaemonReady
-    }
-#endif
-
     func updateTransferSettings(
         _ transferSettings: DownloadTransferSettings,
         activeGIDs: [String],

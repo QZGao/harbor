@@ -178,10 +178,6 @@ final class DownloadCenter {
     @ObservationIgnored private let persistenceWriterIdentifier = UUID()
     @ObservationIgnored private var persistenceGateOwner: UUID?
     @ObservationIgnored private var persistenceGateWaiters: [PersistenceGateWaiter] = []
-#if DEBUG
-    @ObservationIgnored private var persistenceGateGrantHookForTesting: (() -> Void)?
-#endif
-
     var downloads: [DownloadItem] = []
     var selectedFilter: DownloadFilter = .all {
         didSet {
@@ -7383,146 +7379,6 @@ final class DownloadCenter {
         )
     }
 
-#if DEBUG
-    func installDirectAttemptForTesting(id: UUID, attemptIdentifier: UUID) {
-        directAttemptStates[id] = .active(attemptIdentifier)
-    }
-
-    @discardableResult
-    func installActiveBrowserDownloadForTesting(
-        id: UUID,
-        attemptIdentifier: UUID,
-        cancel: @escaping (@escaping @Sendable (Data?) -> Void) -> Void
-    ) -> BrowserDownloadSession? {
-        guard let item = item(for: id) else {
-            return nil
-        }
-        let session = browserCoordinator.startSession(
-            downloadID: id,
-            attemptIdentifier: attemptIdentifier,
-            sourceURL: item.sourceURL,
-            displayName: item.displayName
-        )
-        directAttemptStates[id] = .active(attemptIdentifier)
-        browserReservedIDs.insert(id)
-        activeBrowserSession = session
-        setStatus(for: item, to: .downloading)
-        browserCoordinator.installActiveDownloadForTesting(
-            session: session,
-            cancel: cancel
-        )
-        return session
-    }
-
-    func installBrowserCompletionPublicationForTesting(
-        downloadID: UUID,
-        attemptIdentifier: UUID,
-        operation: @escaping @MainActor @Sendable () async -> BrowserDownloadEvent
-    ) {
-        browserCoordinator.installCompletionPublicationForTesting(
-            downloadID: downloadID,
-            attemptIdentifier: attemptIdentifier,
-            operation: operation
-        )
-    }
-
-    func hasBrowserReservationForTesting(id: UUID) -> Bool {
-        browserReservedIDs.contains(id)
-    }
-
-    func hasTerminalMutationTaskForTesting(id: UUID) -> Bool {
-        cancellationTasks[id] != nil || removalTasks[id] != nil
-    }
-
-    func installTerminalMutationTaskForTesting(
-        id: UUID,
-        operation: @escaping @MainActor @Sendable () async -> Void
-    ) {
-        let task = Task { @MainActor [weak self] in
-            await operation()
-            self?.cancellationTasks.removeValue(forKey: id)
-        }
-        cancellationTasks[id] = task
-    }
-
-    var isBrowserQuiescingForShutdownForTesting: Bool {
-        browserCoordinator.isQuiescingForShutdownForTesting
-    }
-
-    func installReadyDirectRetryForTesting(
-        id: UUID,
-        restartingFromBeginning: Bool = false
-    ) {
-        readyDirectRetries[id] = restartingFromBeginning
-    }
-
-    func drainDownloadQueueForTesting() {
-        startNextQueuedDownloadsIfNeeded()
-    }
-
-    func markInitializationLoadedForTesting() {
-        precondition(initializationState != .loading)
-        initializationState = .loaded
-        initializationFailureMessage = nil
-    }
-
-    func hasPendingRemovalReservationForTesting(id: UUID) -> Bool {
-        pendingRemovalReservedIDs.contains(id)
-    }
-
-    func installMediaAttemptForTesting(id: UUID, attemptIdentifier: UUID) {
-        activeMediaAttemptIdentifiers[id] = attemptIdentifier
-    }
-
-    func reflectTorrentPauseFailureForTesting(
-        _ item: DownloadItem,
-        error: Error
-    ) {
-        reflectActiveTorrentAfterPauseFailure(item, error: error)
-    }
-
-    func reflectTorrentUnpauseUncertaintyForTesting(
-        _ item: DownloadItem,
-        error: Error
-    ) {
-        reflectActiveTorrentAfterUnpauseUncertainty(item, error: error)
-    }
-
-    func applyTorrentLineageForTesting(
-        _ lineage: TorrentStatusLineage,
-        to id: UUID
-    ) async {
-        guard let item = item(for: id) else {
-            return
-        }
-        await apply(lineage: lineage, to: item)
-    }
-
-    func scheduleOrphanedTorrentCleanupForTesting(
-        gid: String,
-        ownerDownloadID: UUID? = nil
-    ) {
-        scheduleOrphanedTorrentCleanup(
-            gid: gid,
-            ownerDownloadID: ownerDownloadID,
-            retryDelays: [.zero]
-        )
-    }
-
-    func reconcileTorrentReservationsForTesting(
-        engineGIDs: Set<String>
-    ) async {
-        await reconcileRestoredTorrentSession(
-            knownEngineGIDs: engineGIDs,
-            stopsAfterReservationAdoption: true
-        )
-    }
-
-    var orphanedTorrentCleanupTaskCountForTesting: Int {
-        orphanedTorrentCleanupTasks.count
-    }
-#endif
-
     private func beginCompletedHandoff(
         id: UUID,
         attemptIdentifier: UUID,
@@ -8494,37 +8350,8 @@ final class DownloadCenter {
         }
         let next = persistenceGateWaiters.removeFirst()
         persistenceGateOwner = next.token
-#if DEBUG
-        let grantHook = persistenceGateGrantHookForTesting
-        persistenceGateGrantHookForTesting = nil
-        grantHook?()
-#endif
         next.continuation.resume()
     }
-
-#if DEBUG
-    func performSerializedDurableMutationForTesting(
-        _ operation: () async -> Void
-    ) async {
-        await performSerializedDurableMutation(operation)
-    }
-
-    func persistCurrentRecordsForTesting() async throws {
-        try await persistCurrentRecords()
-    }
-
-    func installPersistenceGateGrantHookForTesting(_ hook: @escaping () -> Void) {
-        persistenceGateGrantHookForTesting = hook
-    }
-
-    var isPersistenceGateIdleForTesting: Bool {
-        persistenceGateOwner == nil && persistenceGateWaiters.isEmpty
-    }
-
-    var persistenceGateWaiterCountForTesting: Int {
-        persistenceGateWaiters.count
-    }
-#endif
 
     private func nextPersistenceRevision() -> DownloadPersistenceRevision {
         persistenceRevision &+= 1

@@ -2235,12 +2235,6 @@ actor MediaDownloadService {
         }
     }
 
-#if DEBUG
-    func runningProcessForTesting(pid: pid_t) throws -> MediaRunningProcess? {
-        try runningProcesses().first { $0.pid == pid }
-    }
-#endif
-
     private func matchingProcesses(
         _ expected: [MediaRunningProcess],
         in current: [MediaRunningProcess]
