@@ -7,6 +7,64 @@ import XCTest
 
 @MainActor
 final class HarborModelAndSafetyTests: XCTestCase {
+    private struct ChildMediaAttemptReceipt: Encodable {
+        let version: Int
+        let downloadID: UUID
+        let attemptIdentifier: UUID
+        let sourceURL: URL
+        let destinationFolderPath: String
+        let isCollection: Bool
+        let preexistingDestinationFiles: [
+            String: MediaDownloadService.RegularFileIdentity
+        ]
+        let createdAt: Date
+    }
+
+    private func writeChildOwnedMediaCompletionEvidence(
+        recoveryFolder: URL,
+        downloadID: UUID,
+        attemptIdentifier: UUID,
+        sourceURL: URL,
+        destinationFolder: URL,
+        completedURLs: [URL],
+        isCollection: Bool = false,
+        includeSuccessMarker: Bool = true,
+        preexistingDestinationFiles: [
+            String: MediaDownloadService.RegularFileIdentity
+        ] = [:]
+    ) throws {
+        let receipt = ChildMediaAttemptReceipt(
+            version: 1,
+            downloadID: downloadID,
+            attemptIdentifier: attemptIdentifier,
+            sourceURL: sourceURL,
+            destinationFolderPath: destinationFolder.standardizedFileURL.path,
+            isCollection: isCollection,
+            preexistingDestinationFiles: preexistingDestinationFiles,
+            createdAt: .now
+        )
+        try JSONEncoder().encode(receipt).write(
+            to: recoveryFolder.appendingPathComponent(".harbor-attempt.json"),
+            options: .atomic
+        )
+        let pathLines = try completedURLs.map { url in
+            let encodedPath = try XCTUnwrap(
+                String(data: JSONEncoder().encode(url.path), encoding: .utf8)
+            )
+            return "harbor-file:\(encodedPath)"
+        }.joined(separator: "\n") + "\n"
+        try Data(pathLines.utf8).write(
+            to: recoveryFolder.appendingPathComponent(".harbor-final-paths.jsonl"),
+            options: .atomic
+        )
+        if includeSuccessMarker {
+            try Data("\(attemptIdentifier.uuidString)\n".utf8).write(
+                to: recoveryFolder.appendingPathComponent(".harbor-process-succeeded"),
+                options: .atomic
+            )
+        }
+    }
+
     private func makeCompletedHandoff(
         payloadURL: URL,
         handoffDirectoryURL: URL,
@@ -6053,6 +6111,9 @@ final class HarborModelAndSafetyTests: XCTestCase {
         let sourceURL = try XCTUnwrap(URL(string: "https://example.com/video"))
         let destinationURL = URL(fileURLWithPath: "/tmp/downloads", isDirectory: true)
         let temporaryURL = URL(fileURLWithPath: "/tmp/media", isDirectory: true)
+        let completionReceiptURL = URL(
+            fileURLWithPath: "/tmp/media%owned/final-paths.jsonl"
+        )
 
         let limitedArguments = try MediaDownloadService.downloadArguments(
             runtime: runtime,
@@ -6061,6 +6122,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             temporaryFolder: temporaryURL,
             metadata: nil,
             formatPreference: .bestAvailable,
+            completionReceiptURL: completionReceiptURL,
             speedLimitBytesPerSecond: 345_678
         )
         let unlimitedArguments = try MediaDownloadService.downloadArguments(
@@ -6070,6 +6132,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             temporaryFolder: temporaryURL,
             metadata: nil,
             formatPreference: .bestAvailable,
+            completionReceiptURL: completionReceiptURL,
             speedLimitBytesPerSecond: nil
         )
         let outputConflictIdentifier = UUID()
@@ -6081,6 +6144,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             metadata: nil,
             formatPreference: .bestAvailable,
             outputConflictIdentifier: outputConflictIdentifier,
+            completionReceiptURL: completionReceiptURL,
             speedLimitBytesPerSecond: nil
         )
 
@@ -6147,6 +6211,22 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertEqual(value(after: "--fragment-retries"), "10")
         XCTAssertEqual(value(after: "--file-access-retries"), "3")
         XCTAssertEqual(value(after: "--extractor-retries"), "3")
+        let printToFileIndex = try XCTUnwrap(
+            limitedArguments.firstIndex(of: "--print-to-file")
+        )
+        XCTAssertFalse(limitedArguments.contains("--print"))
+        XCTAssertEqual(
+            limitedArguments[limitedArguments.index(after: printToFileIndex)],
+            "after_move:harbor-file:%(filepath)j"
+        )
+        let receiptPathIndex = limitedArguments.index(
+            printToFileIndex,
+            offsetBy: 2
+        )
+        XCTAssertEqual(
+            limitedArguments[receiptPathIndex],
+            "/tmp/media%%owned/final-paths.jsonl"
+        )
 
         let videoFormat = MediaDownloadFormatOption(
             formatID: "137",
@@ -6200,6 +6280,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             temporaryFolder: temporaryURL,
             metadata: metadata.persistenceSnapshot,
             formatPreference: .specific(selection),
+            completionReceiptURL: temporaryURL.appendingPathComponent("final-paths.jsonl"),
             speedLimitBytesPerSecond: 345_678
         )
 
@@ -6226,6 +6307,150 @@ final class HarborModelAndSafetyTests: XCTestCase {
             MediaDownloadFormatPreference.bestAvailable
                 .initialExpectedBytes(metadataEstimate: 243_768_398),
             243_768_398
+        )
+    }
+
+    func testMediaCompletionMonitorPublishesSuccessOnlyAfterCleanExit() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory.appendingPathComponent(
+            "Harbor Media Monitor ; $()-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? fileManager.removeItem(at: root) }
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+
+        func runMonitor(
+            mediaExecutableURL: URL,
+            successMarkerURL: URL,
+            attemptIdentifier: UUID
+        ) throws -> Int32 {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = MediaDownloadService.completionMonitorArguments(
+                mediaExecutableURL: mediaExecutableURL,
+                successMarkerURL: successMarkerURL,
+                attemptIdentifier: attemptIdentifier,
+                mediaArguments: []
+            )
+            process.standardOutput = Pipe()
+            process.standardError = Pipe()
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        }
+
+        let successfulAttempt = UUID()
+        let successfulMarker = root.appendingPathComponent("success marker")
+        XCTAssertEqual(
+            try runMonitor(
+                mediaExecutableURL: URL(fileURLWithPath: "/usr/bin/true"),
+                successMarkerURL: successfulMarker,
+                attemptIdentifier: successfulAttempt
+            ),
+            0
+        )
+        XCTAssertEqual(
+            try String(contentsOf: successfulMarker, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            successfulAttempt.uuidString
+        )
+
+        let failedAttempt = UUID()
+        let failedMarker = root.appendingPathComponent("failed marker")
+        XCTAssertEqual(
+            try runMonitor(
+                mediaExecutableURL: URL(fileURLWithPath: "/usr/bin/false"),
+                successMarkerURL: failedMarker,
+                attemptIdentifier: failedAttempt
+            ),
+            1
+        )
+        XCTAssertFalse(fileManager.fileExists(atPath: failedMarker.path))
+
+        let unavailableMarker = root
+            .appendingPathComponent("missing", isDirectory: true)
+            .appendingPathComponent("success marker")
+        XCTAssertEqual(
+            try runMonitor(
+                mediaExecutableURL: URL(fileURLWithPath: "/usr/bin/true"),
+                successMarkerURL: unavailableMarker,
+                attemptIdentifier: UUID()
+            ),
+            MediaDownloadService.completionMonitorPublicationFailureExitCode
+        )
+        XCTAssertFalse(fileManager.fileExists(atPath: unavailableMarker.path))
+
+        let blockedMarker = root.appendingPathComponent("blocked marker")
+        let blockedTemporaryMarker = URL(
+            fileURLWithPath: blockedMarker.path + ".tmp"
+        )
+        let sentinel = Data("preexisting-temp".utf8)
+        try sentinel.write(to: blockedTemporaryMarker)
+        XCTAssertEqual(
+            try runMonitor(
+                mediaExecutableURL: URL(fileURLWithPath: "/usr/bin/true"),
+                successMarkerURL: blockedMarker,
+                attemptIdentifier: UUID()
+            ),
+            MediaDownloadService.completionMonitorPublicationFailureExitCode
+        )
+        XCTAssertFalse(fileManager.fileExists(atPath: blockedMarker.path))
+        XCTAssertEqual(try Data(contentsOf: blockedTemporaryMarker), sentinel)
+
+        let terminatedMarker = root.appendingPathComponent("terminated marker")
+        let terminatedState = ManagedProcessTestState()
+        let terminated = expectation(description: "completion monitor terminated")
+        let managedMonitor = try ManagedChildProcess(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: MediaDownloadService.completionMonitorArguments(
+                mediaExecutableURL: URL(fileURLWithPath: "/bin/sleep"),
+                successMarkerURL: terminatedMarker,
+                attemptIdentifier: UUID(),
+                mediaArguments: ["30"]
+            ),
+            environment: ProcessInfo.processInfo.environment,
+            onStdout: { terminatedState.appendStdout($0) },
+            onStderr: { terminatedState.appendStderr($0) },
+            onTermination: { termination in
+                terminatedState.recordTermination(termination)
+                terminated.fulfill()
+            }
+        )
+        try await Task.sleep(for: .milliseconds(100))
+        managedMonitor.terminate(grace: 0.2)
+        await fulfillment(of: [terminated], timeout: 3)
+        XCTAssertFalse(terminatedState.snapshot.termination?.isSuccess ?? true)
+        XCTAssertEqual(terminatedState.snapshot.termination?.exitCode, 1)
+        XCTAssertFalse(fileManager.fileExists(atPath: terminatedMarker.path))
+    }
+
+    func testDurableAtomicWriteDoesNotReplaceExistingJournal() throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory.appendingPathComponent(
+            "HarborDurableExclusiveWrite-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? fileManager.removeItem(at: root) }
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        let journalURL = root.appendingPathComponent("journal.json")
+        let original = Data("original-journal".utf8)
+
+        try DurableFileSystem.writeAtomicallyWithoutReplacing(
+            original,
+            to: journalURL
+        )
+        XCTAssertThrowsError(
+            try DurableFileSystem.writeAtomicallyWithoutReplacing(
+                Data("replacement-journal".utf8),
+                to: journalURL
+            )
+        ) { error in
+            XCTAssertEqual((error as? CocoaError)?.code, .fileWriteFileExists)
+        }
+        XCTAssertEqual(try Data(contentsOf: journalURL), original)
+        XCTAssertFalse(
+            try fileManager.contentsOfDirectory(atPath: root.path)
+                .contains { $0.hasPrefix(".harbor-") && $0.hasSuffix(".tmp") }
         )
     }
 
@@ -6813,7 +7038,377 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertTrue(shutdownSucceeded)
     }
 
-    func testMediaCompletionJournalRestoresCollectionAfterRelaunch() async throws {
+    func testChildOwnedMediaReceiptRestoresCompletionAfterParentCrash() async throws {
+        let fileManager = FileManager.default
+        let testRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborChildMediaReceipt-\(UUID().uuidString)")
+        let recoveryRoot = testRoot.appendingPathComponent("Recovery", isDirectory: true)
+        let destinationRoot = testRoot.appendingPathComponent("Destination", isDirectory: true)
+        defer { try? fileManager.removeItem(at: testRoot) }
+        try fileManager.createDirectory(at: recoveryRoot, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: destinationRoot, withIntermediateDirectories: true)
+
+        let downloadID = UUID()
+        let attemptIdentifier = UUID()
+        let sourceURL = try XCTUnwrap(URL(string: "https://example.test/video"))
+        let recoveryFolder = recoveryRoot
+            .appendingPathComponent(downloadID.uuidString, isDirectory: true)
+        try fileManager.createDirectory(at: recoveryFolder, withIntermediateDirectories: true)
+        let completedURL = destinationRoot.appendingPathComponent("video.mp4")
+        let payload = Data("completed-before-parent-crash".utf8)
+        try payload.write(to: completedURL)
+
+        try writeChildOwnedMediaCompletionEvidence(
+            recoveryFolder: recoveryFolder,
+            downloadID: downloadID,
+            attemptIdentifier: attemptIdentifier,
+            sourceURL: sourceURL,
+            destinationFolder: destinationRoot,
+            completedURLs: [completedURL]
+        )
+
+        let service = MediaDownloadService(
+            eventHandler: { _, _ in },
+            fileManager: fileManager,
+            temporaryRoot: recoveryRoot
+        )
+        let entry = try await service.completedDownloadEntry(id: downloadID)
+        guard case let .valid(manifest)? = entry else {
+            return XCTFail("Expected the child-owned completion receipt to be promoted")
+        }
+        XCTAssertEqual(manifest.downloadID, downloadID)
+        XCTAssertEqual(manifest.attemptIdentifier, attemptIdentifier)
+        XCTAssertEqual(manifest.sourceURL, sourceURL)
+        XCTAssertEqual(manifest.destinationFolderPath, destinationRoot.standardizedFileURL.path)
+        XCTAssertEqual(manifest.fileLocationPath, completedURL.standardizedFileURL.path)
+        XCTAssertEqual(manifest.actualBytes, Int64(payload.count))
+        XCTAssertEqual(manifest.payloads.map(\.path), [completedURL.standardizedFileURL.path])
+        XCTAssertTrue(
+            fileManager.fileExists(
+                atPath: recoveryFolder.appendingPathComponent(".harbor-completion.json").path
+            )
+        )
+    }
+
+    func testChildOwnedMediaReceiptRejectsUnchangedPreexistingOutput() async throws {
+        let fileManager = FileManager.default
+        let testRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborChildMediaPreexisting-\(UUID().uuidString)")
+        let recoveryRoot = testRoot.appendingPathComponent("Recovery", isDirectory: true)
+        let destinationRoot = testRoot.appendingPathComponent("Destination", isDirectory: true)
+        defer { try? fileManager.removeItem(at: testRoot) }
+        try fileManager.createDirectory(at: recoveryRoot, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: destinationRoot, withIntermediateDirectories: true)
+
+        let downloadID = UUID()
+        let attemptIdentifier = UUID()
+        let sourceURL = try XCTUnwrap(URL(string: "https://example.test/preexisting"))
+        let recoveryFolder = recoveryRoot
+            .appendingPathComponent(downloadID.uuidString, isDirectory: true)
+        try fileManager.createDirectory(at: recoveryFolder, withIntermediateDirectories: true)
+        let completedURL = destinationRoot.appendingPathComponent("video.mp4")
+        let originalPayload = Data("output-that-predated-the-attempt".utf8)
+        try originalPayload.write(to: completedURL)
+
+        let service = MediaDownloadService(
+            eventHandler: { _, _ in },
+            fileManager: fileManager,
+            temporaryRoot: recoveryRoot
+        )
+        let preexistingIdentity = try await service.regularFileIdentity(at: completedURL)
+        try writeChildOwnedMediaCompletionEvidence(
+            recoveryFolder: recoveryFolder,
+            downloadID: downloadID,
+            attemptIdentifier: attemptIdentifier,
+            sourceURL: sourceURL,
+            destinationFolder: destinationRoot,
+            completedURLs: [completedURL],
+            preexistingDestinationFiles: [
+                completedURL.standardizedFileURL.resolvingSymlinksInPath().path:
+                    preexistingIdentity
+            ]
+        )
+
+        let entry = try await service.completedDownloadEntry(id: downloadID)
+        guard case let .invalid(rejectedID, message)? = entry else {
+            return XCTFail("Expected unchanged pre-attempt output to be rejected")
+        }
+        XCTAssertEqual(rejectedID, downloadID)
+        XCTAssertTrue(message.contains("existed before this attempt"))
+        XCTAssertEqual(try Data(contentsOf: completedURL), originalPayload)
+        XCTAssertFalse(
+            fileManager.fileExists(
+                atPath: recoveryFolder.appendingPathComponent(".harbor-completion.json").path
+            )
+        )
+    }
+
+    func testInvalidChildOwnedMediaReceiptCanBeResetForRetry() async throws {
+        let fileManager = FileManager.default
+        let testRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborInvalidChildMediaReceipt-\(UUID().uuidString)")
+        let recoveryRoot = testRoot.appendingPathComponent("Recovery", isDirectory: true)
+        let destinationRoot = testRoot.appendingPathComponent("Destination", isDirectory: true)
+        defer { try? fileManager.removeItem(at: testRoot) }
+        try fileManager.createDirectory(at: recoveryRoot, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: destinationRoot, withIntermediateDirectories: true)
+
+        let downloadID = UUID()
+        let attemptIdentifier = UUID()
+        let recoveryFolder = recoveryRoot
+            .appendingPathComponent(downloadID.uuidString, isDirectory: true)
+        try fileManager.createDirectory(at: recoveryFolder, withIntermediateDirectories: true)
+        let completedURL = destinationRoot.appendingPathComponent("video.mp4")
+        try Data("completed-output".utf8).write(to: completedURL)
+        try writeChildOwnedMediaCompletionEvidence(
+            recoveryFolder: recoveryFolder,
+            downloadID: downloadID,
+            attemptIdentifier: attemptIdentifier,
+            sourceURL: try XCTUnwrap(URL(string: "https://example.test/mismatch")),
+            destinationFolder: destinationRoot,
+            completedURLs: [completedURL]
+        )
+        try Data("\(UUID().uuidString)\n".utf8).write(
+            to: recoveryFolder.appendingPathComponent(".harbor-process-succeeded"),
+            options: .atomic
+        )
+
+        let service = MediaDownloadService(
+            eventHandler: { _, _ in },
+            fileManager: fileManager,
+            temporaryRoot: recoveryRoot
+        )
+        guard case .invalid? = try await service.completedDownloadEntry(id: downloadID) else {
+            return XCTFail("Expected mismatched child evidence to be invalid")
+        }
+
+        try await service.discardCompletionMarker(id: downloadID)
+        let resetEntry = try await service.completedDownloadEntry(id: downloadID)
+        XCTAssertNil(resetEntry)
+        for filename in [
+            ".harbor-completion.json",
+            ".harbor-process-succeeded",
+            ".harbor-final-paths.jsonl",
+            ".harbor-attempt.json"
+        ] {
+            XCTAssertFalse(
+                fileManager.fileExists(
+                    atPath: recoveryFolder.appendingPathComponent(filename).path
+                )
+            )
+        }
+    }
+
+    func testOrphanCleanupPromotesChildReceiptBeforeRetiringOwnership() async throws {
+        let fileManager = FileManager.default
+        let testRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborOrphanChildMediaReceipt-\(UUID().uuidString)")
+        let recoveryRoot = testRoot.appendingPathComponent("Recovery", isDirectory: true)
+        let destinationRoot = testRoot.appendingPathComponent("Destination", isDirectory: true)
+        defer { try? fileManager.removeItem(at: testRoot) }
+        try fileManager.createDirectory(at: recoveryRoot, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: destinationRoot, withIntermediateDirectories: true)
+
+        let downloadID = UUID()
+        let attemptIdentifier = UUID()
+        let sourceURL = try XCTUnwrap(URL(string: "https://example.test/orphan"))
+        let recoveryFolder = recoveryRoot
+            .appendingPathComponent(downloadID.uuidString, isDirectory: true)
+        try fileManager.createDirectory(at: recoveryFolder, withIntermediateDirectories: true)
+        let completedURL = destinationRoot.appendingPathComponent("video.mp4")
+        try Data("orphan-completed-output".utf8).write(to: completedURL)
+        try writeChildOwnedMediaCompletionEvidence(
+            recoveryFolder: recoveryFolder,
+            downloadID: downloadID,
+            attemptIdentifier: attemptIdentifier,
+            sourceURL: sourceURL,
+            destinationFolder: destinationRoot,
+            completedURLs: [completedURL]
+        )
+
+        let absentPID = pid_t(Int32.max)
+        let ownership = MediaProcessOwnershipManifest(
+            downloadID: downloadID,
+            attemptIdentifier: attemptIdentifier,
+            pid: absentPID,
+            processGroupIdentifier: absentPID,
+            launchedExecutablePath: "/bin/sh",
+            executablePath: "/bin/sh",
+            temporaryFolderPath: recoveryFolder.standardizedFileURL.path,
+            startSignature: "1:1",
+            command: "/bin/sh \(recoveryFolder.path)"
+        )
+        let ownershipURL = recoveryFolder
+            .appendingPathComponent(".harbor-process-owner.json")
+        try JSONEncoder().encode(ownership).write(to: ownershipURL, options: .atomic)
+
+        let service = MediaDownloadService(
+            eventHandler: { _, _ in },
+            fileManager: fileManager,
+            temporaryRoot: recoveryRoot
+        )
+        try await service.terminateOrphanedMediaProcesses()
+
+        XCTAssertFalse(fileManager.fileExists(atPath: ownershipURL.path))
+        XCTAssertTrue(
+            fileManager.fileExists(
+                atPath: recoveryFolder.appendingPathComponent(".harbor-completion.json").path
+            )
+        )
+        guard case let .valid(manifest)? = try await service.completedDownloadEntry(
+            id: downloadID
+        ) else {
+            return XCTFail("Expected orphan cleanup to preserve the completed result")
+        }
+        XCTAssertEqual(manifest.attemptIdentifier, attemptIdentifier)
+        XCTAssertEqual(manifest.fileLocationPath, completedURL.standardizedFileURL.path)
+    }
+
+    func testMediaStartRechecksCompletionPublishedDuringOrphanCleanup() async throws {
+        let fileManager = FileManager.default
+        let testRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborMediaStartPromotionRace-\(UUID().uuidString)")
+        let recoveryRoot = testRoot.appendingPathComponent("Recovery", isDirectory: true)
+        let destinationRoot = testRoot.appendingPathComponent("Destination", isDirectory: true)
+        defer { try? fileManager.removeItem(at: testRoot) }
+        try fileManager.createDirectory(at: recoveryRoot, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: destinationRoot, withIntermediateDirectories: true)
+
+        let downloadID = UUID()
+        let attemptIdentifier = UUID()
+        let replacementAttemptIdentifier = UUID()
+        let sourceURL = try XCTUnwrap(URL(string: "https://example.test/orphan-race"))
+        let recoveryFolder = recoveryRoot
+            .appendingPathComponent(downloadID.uuidString, isDirectory: true)
+        try fileManager.createDirectory(at: recoveryFolder, withIntermediateDirectories: true)
+        let completedURL = destinationRoot.appendingPathComponent("video.mp4")
+        try Data("completed-by-orphan".utf8).write(to: completedURL)
+        try writeChildOwnedMediaCompletionEvidence(
+            recoveryFolder: recoveryFolder,
+            downloadID: downloadID,
+            attemptIdentifier: attemptIdentifier,
+            sourceURL: sourceURL,
+            destinationFolder: destinationRoot,
+            completedURLs: [completedURL],
+            includeSuccessMarker: false
+        )
+
+        // If the spawn-boundary recheck regresses, preparation reaches this
+        // deliberately unsafe stale marker and reports the wrong failure after
+        // deleting the child receipt. With the recheck, it remains untouched.
+        let staleMarkerTarget = testRoot.appendingPathComponent("stale-marker-target")
+        try Data("sentinel".utf8).write(to: staleMarkerTarget)
+        let staleTemporaryMarker = recoveryFolder
+            .appendingPathComponent(".harbor-process-succeeded.tmp")
+        try fileManager.createSymbolicLink(
+            at: staleTemporaryMarker,
+            withDestinationURL: staleMarkerTarget
+        )
+
+        let successMarker = recoveryFolder
+            .appendingPathComponent(".harbor-process-succeeded")
+        let ownerTerminated = expectation(description: "orphan owner terminated")
+        let ownerScript = #"""
+        trap 'printf "%s\n" "$2" > "$1"; exit 0' TERM
+        while :; do /bin/sleep 1; done
+        """#
+        let owner = try ManagedChildProcess(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: [
+                "-c",
+                ownerScript,
+                "harbor-media-race-owner",
+                successMarker.path,
+                attemptIdentifier.uuidString
+            ],
+            environment: ProcessInfo.processInfo.environment,
+            onStdout: { _ in },
+            onStderr: { _ in },
+            onTermination: { _ in ownerTerminated.fulfill() }
+        )
+        defer { owner.terminate(grace: 0.1) }
+
+        let service = MediaDownloadService(
+            eventHandler: { _, _ in },
+            fileManager: fileManager,
+            temporaryRoot: recoveryRoot
+        )
+        let discoveredOwner = try await service.runningProcessForTesting(
+            pid: owner.processIdentifier
+        )
+        let runningOwner = try XCTUnwrap(discoveredOwner)
+        let executablePath = try XCTUnwrap(runningOwner.executablePath)
+        let startSignature = try XCTUnwrap(runningOwner.startSignature)
+        let ownership = MediaProcessOwnershipManifest(
+            downloadID: downloadID,
+            attemptIdentifier: attemptIdentifier,
+            pid: runningOwner.pid,
+            processGroupIdentifier: runningOwner.processGroupIdentifier,
+            launchedExecutablePath: "/bin/sh",
+            executablePath: executablePath,
+            temporaryFolderPath: recoveryFolder.standardizedFileURL.path,
+            startSignature: startSignature,
+            command: runningOwner.command
+        )
+        let ownershipURL = recoveryFolder
+            .appendingPathComponent(".harbor-process-owner.json")
+        try JSONEncoder().encode(ownership).write(to: ownershipURL, options: .atomic)
+
+        let metadata = MediaDownloadMetadata(
+            title: "Orphan Race",
+            platform: "Test",
+            extractorKey: "Test",
+            thumbnailURL: nil,
+            webpageURL: sourceURL,
+            expectedBytes: 0,
+            mediaType: .video,
+            entryCount: 1,
+            capabilities: .unavailable
+        )
+        do {
+            _ = try await service.startDownload(
+                id: downloadID,
+                attemptIdentifier: replacementAttemptIdentifier,
+                sourceURL: sourceURL,
+                destinationFolder: destinationRoot,
+                metadata: metadata,
+                formatPreference: .bestAvailable
+            )
+            XCTFail("A promoted orphan completion must block a replacement process")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription,
+                "A completed media result is still awaiting durable reconciliation."
+            )
+        }
+
+        await fulfillment(of: [ownerTerminated], timeout: 3)
+        XCTAssertFalse(fileManager.fileExists(atPath: ownershipURL.path))
+        guard case let .valid(manifest)? = try await service.completedDownloadEntry(
+            id: downloadID
+        ) else {
+            return XCTFail("Expected the preserved child receipt to reconcile")
+        }
+        XCTAssertEqual(manifest.attemptIdentifier, attemptIdentifier)
+        XCTAssertTrue(
+            fileManager.fileExists(
+                atPath: recoveryFolder.appendingPathComponent(".harbor-completion.json").path
+            )
+        )
+        XCTAssertTrue(fileManager.fileExists(atPath: staleTemporaryMarker.path))
+        XCTAssertTrue(
+            fileManager.fileExists(
+                atPath: recoveryFolder.appendingPathComponent(".harbor-attempt.json").path
+            )
+        )
+        XCTAssertTrue(
+            fileManager.fileExists(
+                atPath: recoveryFolder.appendingPathComponent(".harbor-final-paths.jsonl").path
+            )
+        )
+    }
+
+    func testChildOwnedMediaReceiptRestoresCollectionThroughDownloadCenter() async throws {
         let suiteName = "HarborTests.MediaCompletionReplay.\(UUID().uuidString)"
         let userDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         userDefaults.removePersistentDomain(forName: suiteName)
@@ -6846,34 +7441,18 @@ final class HarborModelAndSafetyTests: XCTestCase {
             expectedBytes: 100
         )
         let attemptIdentifier = UUID()
-        func digest(_ data: Data) -> String {
-            SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        }
-        let manifest = MediaCompletionManifest(
-            downloadID: item.id,
-            attemptIdentifier: attemptIdentifier,
-            sourceURL: item.sourceURL,
-            destinationFolderPath: destinationRoot.path,
-            fileLocationPath: destinationRoot.path,
-            payloads: [
-                MediaCompletedFileManifest(
-                    path: firstURL.path,
-                    byteCount: Int64(firstPayload.count),
-                    sha256: digest(firstPayload)
-                ),
-                MediaCompletedFileManifest(
-                    path: secondURL.path,
-                    byteCount: Int64(secondPayload.count),
-                    sha256: digest(secondPayload)
-                )
-            ],
-            actualBytes: Int64(firstPayload.count + secondPayload.count)
-        )
+        let actualBytes = Int64(firstPayload.count + secondPayload.count)
         let recoveryFolder = temporaryRoot
             .appendingPathComponent(item.id.uuidString, isDirectory: true)
         try fileManager.createDirectory(at: recoveryFolder, withIntermediateDirectories: true)
-        try JSONEncoder().encode(manifest).write(
-            to: recoveryFolder.appendingPathComponent(".harbor-completion.json")
+        try writeChildOwnedMediaCompletionEvidence(
+            recoveryFolder: recoveryFolder,
+            downloadID: item.id,
+            attemptIdentifier: attemptIdentifier,
+            sourceURL: item.sourceURL,
+            destinationFolder: destinationRoot,
+            completedURLs: [firstURL, secondURL],
+            isCollection: true
         )
 
         let persistence = DownloadPersistence(directoryURL: persistenceRoot)
@@ -6900,8 +7479,8 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertEqual(restored.status, .completed)
         XCTAssertEqual(restored.fileLocationPath, destinationRoot.path)
         XCTAssertEqual(restored.torrentPayloadPaths, [firstURL.path, secondURL.path])
-        XCTAssertEqual(restored.bytesWritten, manifest.actualBytes)
-        XCTAssertEqual(restored.expectedBytes, manifest.actualBytes)
+        XCTAssertEqual(restored.bytesWritten, actualBytes)
+        XCTAssertEqual(restored.expectedBytes, actualBytes)
         XCTAssertEqual(restored.progress, 1)
         XCTAssertFalse(fileManager.fileExists(atPath: recoveryFolder.path))
         XCTAssertTrue(fileManager.fileExists(atPath: firstURL.path))
@@ -7892,6 +8471,80 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertTrue(fileManager.fileExists(atPath: journalURL.path))
     }
 
+    func testDownloadMutationsWaitForAuthoritativeInitialization() async throws {
+        let fileManager = FileManager.default
+        let testRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborInitializationMutationGate-\(UUID().uuidString)")
+        defer { try? fileManager.removeItem(at: testRoot) }
+
+        let suiteName = "HarborTests.InitializationMutationGate.\(UUID().uuidString)"
+        let userDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        settings.startDownloadsAutomatically = false
+        let center = DownloadCenter(
+            settings: settings,
+            persistence: DownloadPersistence(
+                directoryURL: testRoot.appendingPathComponent("Persistence", isDirectory: true)
+            ),
+            directRecoveryDirectoryURL: testRoot.appendingPathComponent("DirectRecovery"),
+            completedHandoffDirectoryURL: testRoot.appendingPathComponent("Handoffs"),
+            browserRecoveryDirectoryURL: testRoot.appendingPathComponent("BrowserRecovery"),
+            pendingDataRemovalDirectoryURL: testRoot.appendingPathComponent("Pending"),
+            mediaService: MediaDownloadService(
+                eventHandler: { _, _ in },
+                fileManager: fileManager,
+                temporaryRoot: testRoot.appendingPathComponent("MediaRecovery")
+            ),
+            torrentShutdownOperation: { _ in }
+        )
+
+        XCTAssertFalse(center.canAddDownloads)
+        center.presentAddSheet()
+        XCTAssertNil(center.addSheetDraft)
+
+        let directURL = try XCTUnwrap(URL(string: "https://example.test/new.bin"))
+        center.queueDownload(
+            AddDownloadRequest(
+                sourceKind: .directURL,
+                sourceURL: directURL,
+                customFilename: nil,
+                destinationFolder: testRoot,
+                shouldStartImmediately: true
+            )
+        )
+        XCTAssertTrue(center.downloads.isEmpty)
+
+        let externalURL = try XCTUnwrap(URL(string: "https://example.test/external.bin"))
+        center.receiveExternalAddSources([externalURL])
+        XCTAssertNil(center.addSheetDraft)
+
+        await center.initializeIfNeeded()
+
+        XCTAssertTrue(center.canAddDownloads)
+        XCTAssertEqual(center.addSheetDraft?.sourceURLText, externalURL.absoluteString)
+        XCTAssertTrue(center.downloads.isEmpty)
+        center.handleAddSheetDismissal()
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+
+        center.queueDownload(
+            AddDownloadRequest(
+                sourceKind: .directURL,
+                sourceURL: directURL,
+                customFilename: nil,
+                destinationFolder: testRoot,
+                shouldStartImmediately: false
+            )
+        )
+        XCTAssertEqual(center.downloads.map(\.sourceURL), [directURL])
+        let shutdownSucceeded = await center.shutdownForTermination()
+        XCTAssertTrue(shutdownSucceeded)
+        XCTAssertFalse(center.canAddDownloads)
+    }
+
     func testInitializationCanRetryAfterPersistenceIsRepaired() async throws {
         let fileManager = FileManager.default
         let testRoot = fileManager.temporaryDirectory
@@ -7932,11 +8585,14 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertTrue(failedCenter.canRetryInitialization)
         XCTAssertNotNil(failedCenter.initializationFailureMessage)
         XCTAssertTrue(failedCenter.downloads.isEmpty)
+        let queuedExternalURL = try XCTUnwrap(
+            URL(string: "https://example.test/queued-during-retry.bin")
+        )
+        failedCenter.receiveExternalAddSources([queuedExternalURL])
+        XCTAssertNil(failedCenter.addSheetDraft)
         let corruptRecords = try Data(
             contentsOf: persistenceRoot.appendingPathComponent("downloads.json")
         )
-        let failedCenterShutdownSucceeded = await failedCenter.shutdownForTermination()
-        XCTAssertTrue(failedCenterShutdownSucceeded)
         XCTAssertEqual(
             try Data(contentsOf: persistenceRoot.appendingPathComponent("downloads.json")),
             corruptRecords
@@ -7951,13 +8607,16 @@ final class HarborModelAndSafetyTests: XCTestCase {
             status: .paused
         )
         try await persistence.save([item.makeRecord()])
-        let restoredCenter = makeCenter()
-        await restoredCenter.initializeIfNeeded()
+        await failedCenter.initializeIfNeeded()
 
-        XCTAssertFalse(restoredCenter.canRetryInitialization)
-        XCTAssertNil(restoredCenter.initializationFailureMessage)
-        XCTAssertEqual(restoredCenter.downloads.map(\.id), [item.id])
-        let shutdownSucceeded = await restoredCenter.shutdownForTermination()
+        XCTAssertFalse(failedCenter.canRetryInitialization)
+        XCTAssertNil(failedCenter.initializationFailureMessage)
+        XCTAssertEqual(failedCenter.downloads.map(\.id), [item.id])
+        XCTAssertEqual(
+            failedCenter.addSheetDraft?.sourceURLText,
+            queuedExternalURL.absoluteString
+        )
+        let shutdownSucceeded = await failedCenter.shutdownForTermination()
         XCTAssertTrue(shutdownSucceeded)
     }
 

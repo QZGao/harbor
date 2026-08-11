@@ -158,7 +158,7 @@ actor MediaDownloadService {
         }
     }
 
-    struct RegularFileIdentity: Equatable, Sendable {
+    struct RegularFileIdentity: Codable, Equatable, Sendable {
         let device: dev_t
         let inode: ino_t
         let size: off_t
@@ -166,6 +166,38 @@ actor MediaDownloadService {
         let modificationNanoseconds: Int64
         let statusChangeSeconds: time_t
         let statusChangeNanoseconds: Int64
+    }
+
+    private struct MediaAttemptManifest: Codable, Equatable, Sendable {
+        static let currentVersion = 1
+
+        let version: Int
+        let downloadID: UUID
+        let attemptIdentifier: UUID
+        let sourceURL: URL
+        let destinationFolderPath: String
+        let isCollection: Bool
+        let preexistingDestinationFiles: [String: RegularFileIdentity]
+        let createdAt: Date
+
+        init(
+            downloadID: UUID,
+            attemptIdentifier: UUID,
+            sourceURL: URL,
+            destinationFolderPath: String,
+            isCollection: Bool,
+            preexistingDestinationFiles: [String: RegularFileIdentity],
+            createdAt: Date = .now
+        ) {
+            self.version = Self.currentVersion
+            self.downloadID = downloadID
+            self.attemptIdentifier = attemptIdentifier
+            self.sourceURL = sourceURL
+            self.destinationFolderPath = destinationFolderPath
+            self.isCollection = isCollection
+            self.preexistingDestinationFiles = preexistingDestinationFiles
+            self.createdAt = createdAt
+        }
     }
 
     private struct RunningDownload {
@@ -189,6 +221,11 @@ actor MediaDownloadService {
         let destinationPath: String
     }
 
+    private struct ChildCompletionEvidence {
+        let attempt: MediaAttemptManifest
+        let reportedURLs: [URL]
+    }
+
     nonisolated private let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "Harbor",
         category: "MediaEngine"
@@ -204,6 +241,11 @@ actor MediaDownloadService {
     private var terminalOutcomes: [UUID: MediaTerminalOutcome] = [:]
     private static let completionManifestFilename = ".harbor-completion.json"
     private static let processOwnershipManifestFilename = ".harbor-process-owner.json"
+    private static let attemptManifestFilename = ".harbor-attempt.json"
+    private static let finalPathReceiptFilename = ".harbor-final-paths.jsonl"
+    private static let processSucceededMarkerFilename = ".harbor-process-succeeded"
+    private static let completionMonitorURL = URL(fileURLWithPath: "/bin/sh")
+    nonisolated static let completionMonitorPublicationFailureExitCode: Int32 = 74
 
     init(
         eventHandler: @escaping EventHandler,
@@ -253,7 +295,7 @@ actor MediaDownloadService {
                 "The previous media start is still being prepared."
             )
         }
-        if try completionManifestExists(id: id) {
+        if try completionEvidenceExists(id: id) {
             throw MediaDownloadError.unavailable(
                 "A completed media result is still awaiting durable reconciliation."
             )
@@ -327,11 +369,27 @@ actor MediaDownloadService {
                 "Harbor found an unverifiable owner for this download’s recovery data and left it untouched."
             )
         }
+        // Orphan cleanup can promote a child-owned success receipt after the
+        // first check above. Recheck at the spawn boundary so that recovery
+        // and a replacement process can never win the same start attempt.
+        guard try completionEvidenceExists(id: id) == false else {
+            throw MediaDownloadError.unavailable(
+                "A completed media result is still awaiting durable reconciliation."
+            )
+        }
 
         try createAndValidateTemporaryFolder(temporaryFolder)
         try fileManager.createDirectory(at: destinationFolder, withIntermediateDirectories: true)
         let preexistingDestinationFiles = try destinationFileIdentities(
             in: destinationFolder
+        )
+        try prepareCompletionAttempt(
+            id: id,
+            attemptIdentifier: attemptIdentifier,
+            sourceURL: sourceURL,
+            destinationFolder: destinationFolder,
+            isCollection: metadata?.isCollection == true,
+            preexistingDestinationFiles: preexistingDestinationFiles
         )
 
         let arguments = try Self.downloadArguments(
@@ -342,14 +400,21 @@ actor MediaDownloadService {
             metadata: metadata,
             formatPreference: formatPreference,
             outputConflictIdentifier: effectiveOutputIdentifier,
+            completionReceiptURL: finalPathReceiptURL(id: id),
             speedLimitBytesPerSecond: speedLimitBytesPerSecond
+        )
+        let processArguments = Self.completionMonitorArguments(
+            mediaExecutableURL: runtime.ytDlpURL,
+            successMarkerURL: processSucceededMarkerURL(id: id),
+            attemptIdentifier: attemptIdentifier,
+            mediaArguments: arguments
         )
 
         let environment = processEnvironment(runtime: runtime)
         let outputCapture = MediaProcessOutputCapture()
         let process = try ManagedChildProcess(
-            executableURL: runtime.ytDlpURL,
-            arguments: arguments,
+            executableURL: Self.completionMonitorURL,
+            arguments: processArguments,
             environment: environment,
             onStdout: { [weak self] output in
                 outputCapture.appendStdout(output)
@@ -393,7 +458,7 @@ actor MediaDownloadService {
                 processIdentifier: process.processIdentifier,
                 downloadID: id,
                 attemptIdentifier: attemptIdentifier,
-                executableURL: runtime.ytDlpURL,
+                executableURL: Self.completionMonitorURL,
                 temporaryFolder: temporaryFolder
             )
         } catch {
@@ -606,22 +671,24 @@ actor MediaDownloadService {
             guard let id = UUID(uuidString: folder.lastPathComponent) else {
                 continue
             }
-            let manifestURL = completionManifestURL(id: id)
-            let hasManifest: Bool
+            let hasCompletionEvidence: Bool
             do {
-                hasManifest = try itemExists(at: manifestURL)
+                hasCompletionEvidence = try completionEvidenceExists(id: id)
             } catch {
                 entries.append(
                     .unavailable(downloadID: id, message: error.localizedDescription)
                 )
                 continue
             }
-            guard hasManifest else {
+            guard hasCompletionEvidence else {
                 continue
             }
 
             do {
-                entries.append(.valid(try validatedCompletionManifest(id: id)))
+                guard let manifest = try materializeChildCompletionManifestIfNeeded(id: id) else {
+                    continue
+                }
+                entries.append(.valid(manifest))
             } catch let error as CompletionManifestIntegrityError {
                 entries.append(
                     .invalid(downloadID: id, message: error.localizedDescription)
@@ -636,9 +703,8 @@ actor MediaDownloadService {
     }
 
     func completedDownloadEntry(id: UUID) throws -> MediaCompletionEntry? {
-        let manifestURL = completionManifestURL(id: id)
         do {
-            guard try itemExists(at: manifestURL) else {
+            guard try completionEvidenceExists(id: id) else {
                 return nil
             }
         } catch {
@@ -646,7 +712,10 @@ actor MediaDownloadService {
         }
 
         do {
-            return .valid(try validatedCompletionManifest(id: id))
+            guard let manifest = try materializeChildCompletionManifestIfNeeded(id: id) else {
+                return nil
+            }
+            return .valid(manifest)
         } catch let error as CompletionManifestIntegrityError {
             return .invalid(downloadID: id, message: error.localizedDescription)
         } catch {
@@ -686,13 +755,32 @@ actor MediaDownloadService {
     }
 
     func discardCompletionMarker(id: UUID) throws {
-        let url = completionManifestURL(id: id)
-        guard try itemExists(at: url) else {
+        guard runningDownloads[id] == nil,
+              startingDownloads[id] == nil else {
+            throw MediaDownloadError.unavailable(
+                "Harbor could not reset media completion evidence while its process was active."
+            )
+        }
+        let folder = temporaryFolder(for: id)
+        guard try itemExists(at: folder) else {
             return
         }
-        try validateTemporaryFolder(temporaryFolder(for: id))
-        try fileManager.removeItem(at: url)
-        try DurableFileSystem.synchronizeParentDirectory(of: url)
+        try validateTemporaryFolder(folder)
+        guard try itemExists(at: processOwnershipManifestURL(id: id)) == false else {
+            throw MediaDownloadError.unavailable(
+                "Harbor could not reset media completion evidence while an earlier process owner remained."
+            )
+        }
+        for url in [
+            completionManifestURL(id: id),
+            processSucceededMarkerURL(id: id),
+            processSucceededTemporaryMarkerURL(id: id),
+            finalPathReceiptURL(id: id),
+            attemptManifestURL(id: id)
+        ] {
+            try removeOwnedCompletionEvidenceFileIfPresent(url, in: folder)
+        }
+        try DurableFileSystem.synchronizeDirectory(at: folder)
     }
 
     private func waitForTermination(id: UUID) async {
@@ -767,9 +855,8 @@ actor MediaDownloadService {
                 continue
             }
 
-            // Final paths are consumed from the synchronously captured output
-            // only after both pipes reach EOF. That prevents termination from
-            // racing an actor task carrying the process's last line.
+            // Final paths are consumed from the child-owned receipt only after
+            // the completion monitor exits. Progress output remains actor-fed.
         }
     }
 
@@ -802,7 +889,7 @@ actor MediaDownloadService {
         _ termination: ManagedChildProcessTermination,
         for id: UUID,
         attemptIdentifier: UUID,
-        capturedStdout: String,
+        capturedStdout _: String,
         capturedStderr: String
     ) {
         guard let current = runningDownloads[id],
@@ -811,30 +898,42 @@ actor MediaDownloadService {
         }
         let download = current
         runningDownloads.removeValue(forKey: id)
-        do {
-            try discardProcessOwnership(for: download)
-        } catch {
-            // The child has already been reaped. A stale exact-identity marker
-            // is harmless and will be retired by the next ownership scan.
-            logger.warning(
-                "Could not retire media process ownership for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
-            )
-        }
 
         let waiters = terminationWaiters.removeValue(forKey: id) ?? []
         defer {
             waiters.forEach { $0.resume() }
         }
+        defer {
+            do {
+                // Keep the writer-exclusion marker until this callback has
+                // either published a parent manifest or left child-owned
+                // terminal evidence for relaunch reconciliation.
+                try discardProcessOwnership(for: download)
+            } catch {
+                // The child has already been reaped. A stale exact-identity
+                // marker is harmless and will be retired by the next scan.
+                logger.warning(
+                    "Could not retire media process ownership for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+            }
+        }
 
         logger.info("Media download \(id.uuidString, privacy: .public) exited with status \(termination.waitStatus, privacy: .public)")
 
         var successfulCompletionError: Error?
-        if termination.isSuccess {
+        let childSuccessMarkerExists: Bool
+        do {
+            childSuccessMarkerExists = try itemExists(
+                at: processSucceededMarkerURL(id: id)
+            )
+        } catch {
+            childSuccessMarkerExists = false
+            successfulCompletionError = error
+        }
+        if termination.isSuccess || childSuccessMarkerExists {
             do {
                 let event = try successfulCompletionEvent(
-                    for: download,
-                    capturedStdout: capturedStdout,
-                    capturedStderr: capturedStderr
+                    for: download
                 )
                 // Completion is not publishable until its payload manifest is
                 // durable. A visible destination file alone cannot survive a
@@ -861,6 +960,35 @@ actor MediaDownloadService {
             } catch {
                 successfulCompletionError = error
             }
+        }
+
+        if childSuccessMarkerExists || successfulCompletionError != nil {
+            // The child claimed a complete result, or Harbor could not safely
+            // determine whether it did. Preserve every receipt and destination
+            // byte instead of allowing a simultaneous Cancel to erase the only
+            // recovery evidence.
+            emitTerminal(
+                .failed(
+                    id: id,
+                    message: successfulCompletionError?.localizedDescription
+                        ?? "Harbor could not verify the child-owned media completion receipt.",
+                    disposition: .outputConflict
+                ),
+                for: download
+            )
+            return
+        }
+
+        if termination.exitCode == Self.completionMonitorPublicationFailureExitCode {
+            emitTerminal(
+                .failed(
+                    id: id,
+                    message: "yt-dlp finished, but Harbor could not publish its durable completion receipt.",
+                    disposition: .outputConflict
+                ),
+                for: download
+            )
+            return
         }
 
         // A process that reached a validated successful output wins a
@@ -907,13 +1035,19 @@ actor MediaDownloadService {
     }
 
     private func successfulCompletionEvent(
-        for download: RunningDownload,
-        capturedStdout: String,
-        capturedStderr: String
+        for download: RunningDownload
     ) throws -> MediaDownloadEvent {
-        let capturedLines = (capturedStdout + "\n" + capturedStderr)
-            .components(separatedBy: .newlines)
-        let reportedURLs = capturedLines.compactMap(MediaDownloadFinalPathParser.fileURL(from:))
+        let evidence = try validatedChildCompletionEvidence(id: download.id)
+        guard evidence.attempt.attemptIdentifier == download.attemptIdentifier,
+              evidence.attempt.sourceURL == download.sourceURL,
+              evidence.attempt.destinationFolderPath
+                == download.destinationFolder.standardizedFileURL.path,
+              evidence.attempt.isCollection == (download.metadata?.isCollection == true) else {
+            throw CompletionManifestIntegrityError.invalid(
+                "The child-owned media completion receipt does not match the active attempt."
+            )
+        }
+        let reportedURLs = evidence.reportedURLs
 
         let fileURL: URL
         let payloadURLs: [URL]
@@ -1085,6 +1219,7 @@ actor MediaDownloadService {
         metadata: MediaDownloadMetadata?,
         formatPreference: MediaDownloadFormatPreference,
         outputConflictIdentifier: UUID? = nil,
+        completionReceiptURL: URL,
         speedLimitBytesPerSecond: Int64?
     ) throws -> [String] {
         let outputTemplate: String
@@ -1123,8 +1258,9 @@ actor MediaDownloadService {
             "temp:\(temporaryFolder.path)",
             "--output",
             outputTemplate,
-            "--print",
+            "--print-to-file",
             "after_move:harbor-file:%(filepath)j",
+            outputTemplatePath(for: completionReceiptURL),
             "--progress-template",
             "download:harbor-progress:%(progress.downloaded_bytes|0)s\t%(progress.total_bytes,progress.total_bytes_estimate|0)s\t%(progress.speed|0)s",
             "--ffmpeg-location",
@@ -1160,6 +1296,61 @@ actor MediaDownloadService {
         return arguments
     }
 
+    nonisolated static func completionMonitorArguments(
+        mediaExecutableURL: URL,
+        successMarkerURL: URL,
+        attemptIdentifier: UUID,
+        mediaArguments: [String]
+    ) -> [String] {
+        let publicationFailureExitCode = completionMonitorPublicationFailureExitCode
+        let script = #"""
+        media_executable=$1
+        success_marker=$2
+        attempt_identifier=$3
+        shift 3
+
+        # Harbor signals the entire private process group on Pause/Cancel. Keep
+        # this monitor alive long enough to observe the child's real status and
+        # publish success once yt-dlp has returned zero. The subshell resets
+        # signal handling before exec so yt-dlp and its descendants still stop.
+        trap '' HUP INT TERM
+        (
+            trap - HUP INT TERM
+            exec "$media_executable" "$@"
+        )
+        status=$?
+        if [ "$status" -ne 0 ]; then
+            # Harbor classifies failures from stderr, not the executable's
+            # numeric status. Collapse child failures so the reserved receipt
+            # publication status below cannot collide with a yt-dlp exit code.
+            exit 1
+        fi
+
+        temporary_marker="${success_marker}.tmp"
+        umask 077
+        if ! (set -C; printf '%s\n' "$attempt_identifier" > "$temporary_marker"); then
+            exit \#(publicationFailureExitCode)
+        fi
+        if ! /bin/mv -f "$temporary_marker" "$success_marker"; then
+            /bin/rm -f "$temporary_marker"
+            exit \#(publicationFailureExitCode)
+        fi
+        exit 0
+        """#
+        return [
+            "-c",
+            script,
+            "harbor-media-completion-monitor",
+            mediaExecutableURL.path,
+            successMarkerURL.path,
+            attemptIdentifier.uuidString
+        ] + mediaArguments
+    }
+
+    nonisolated private static func outputTemplatePath(for url: URL) -> String {
+        url.path.replacingOccurrences(of: "%", with: "%%")
+    }
+
     nonisolated static func outputIdentifier(
         requested: UUID?,
         downloadID: UUID,
@@ -1191,6 +1382,25 @@ actor MediaDownloadService {
         temporaryRoot.appendingPathComponent(id.uuidString, isDirectory: true)
     }
 
+    private func attemptManifestURL(id: UUID) -> URL {
+        temporaryFolder(for: id)
+            .appendingPathComponent(Self.attemptManifestFilename)
+    }
+
+    private func finalPathReceiptURL(id: UUID) -> URL {
+        temporaryFolder(for: id)
+            .appendingPathComponent(Self.finalPathReceiptFilename)
+    }
+
+    private func processSucceededMarkerURL(id: UUID) -> URL {
+        temporaryFolder(for: id)
+            .appendingPathComponent(Self.processSucceededMarkerFilename)
+    }
+
+    private func processSucceededTemporaryMarkerURL(id: UUID) -> URL {
+        URL(fileURLWithPath: processSucceededMarkerURL(id: id).path + ".tmp")
+    }
+
     private func completionManifestURL(id: UUID) -> URL {
         temporaryFolder(for: id)
             .appendingPathComponent(Self.completionManifestFilename)
@@ -1198,6 +1408,65 @@ actor MediaDownloadService {
 
     private func completionManifestExists(id: UUID) throws -> Bool {
         try itemExists(at: completionManifestURL(id: id))
+    }
+
+    private func completionEvidenceExists(id: UUID) throws -> Bool {
+        try completionManifestExists(id: id)
+            || itemExists(at: processSucceededMarkerURL(id: id))
+    }
+
+    private func prepareCompletionAttempt(
+        id: UUID,
+        attemptIdentifier: UUID,
+        sourceURL: URL,
+        destinationFolder: URL,
+        isCollection: Bool,
+        preexistingDestinationFiles: [String: RegularFileIdentity]
+    ) throws {
+        let folder = temporaryFolder(for: id)
+        try validateTemporaryFolder(folder)
+        for url in [
+            finalPathReceiptURL(id: id),
+            attemptManifestURL(id: id),
+            processSucceededTemporaryMarkerURL(id: id)
+        ] {
+            try removeOwnedCompletionEvidenceFileIfPresent(url, in: folder)
+        }
+        try DurableFileSystem.synchronizeDirectory(at: folder)
+
+        let manifest = MediaAttemptManifest(
+            downloadID: id,
+            attemptIdentifier: attemptIdentifier,
+            sourceURL: sourceURL,
+            destinationFolderPath: destinationFolder.standardizedFileURL.path,
+            isCollection: isCollection,
+            preexistingDestinationFiles: preexistingDestinationFiles
+        )
+        let url = attemptManifestURL(id: id)
+        try JSONEncoder().encode(manifest).write(to: url, options: .atomic)
+        try DurableFileSystem.synchronizeFile(at: url)
+        try DurableFileSystem.synchronizeDirectory(at: folder)
+        try DurableFileSystem.synchronizeParentDirectory(of: folder)
+    }
+
+    private func removeOwnedCompletionEvidenceFileIfPresent(
+        _ url: URL,
+        in folder: URL
+    ) throws {
+        guard try itemExists(at: url) else {
+            return
+        }
+        try validateTemporaryFolder(folder)
+        let values = try url.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true else {
+            throw MediaDownloadError.unavailable(
+                "Harbor found unsafe media completion evidence and left it untouched."
+            )
+        }
+        try fileManager.removeItem(at: url)
     }
 
     private func persistCompletionManifest(
@@ -1212,13 +1481,37 @@ actor MediaDownloadService {
             )
         }
 
+        let manifest = try makeCompletionManifest(
+            downloadID: download.id,
+            attemptIdentifier: download.attemptIdentifier,
+            sourceURL: download.sourceURL,
+            destinationFolder: download.destinationFolder,
+            fileLocationURL: fileURL,
+            payloadURLs: payloadURLs
+        )
+        guard manifest.actualBytes == expectedBytes else {
+            throw CompletionManifestIntegrityError.invalid(
+                "The completed media payload size did not match its terminal event."
+            )
+        }
+        try persistCompletionManifest(manifest, id: download.id)
+    }
+
+    private func makeCompletionManifest(
+        downloadID: UUID,
+        attemptIdentifier: UUID,
+        sourceURL: URL,
+        destinationFolder: URL,
+        fileLocationURL: URL,
+        payloadURLs: [URL]
+    ) throws -> MediaCompletionManifest {
         var payloads: [MediaCompletedFileManifest] = []
         var seenPaths = Set<String>()
         var totalBytes: Int64 = 0
         for payloadURL in payloadURLs {
             let validated = try validatedFinalFile(
                 payloadURL,
-                destinationFolder: download.destinationFolder
+                destinationFolder: destinationFolder
             )
             let path = validated.url.standardizedFileURL.path
             guard seenPaths.insert(path).inserted else {
@@ -1246,31 +1539,201 @@ actor MediaDownloadService {
                 )
             )
         }
-        guard payloads.isEmpty == false,
-              totalBytes == expectedBytes else {
+        guard payloads.isEmpty == false else {
             throw CompletionManifestIntegrityError.invalid(
-                "The completed media payload size did not match its terminal event."
+                "The media completion evidence did not contain validated payloads."
             )
         }
 
-        let manifest = MediaCompletionManifest(
-            downloadID: download.id,
-            attemptIdentifier: download.attemptIdentifier,
-            sourceURL: download.sourceURL,
-            destinationFolderPath: download.destinationFolder.standardizedFileURL.path,
-            fileLocationPath: fileURL.standardizedFileURL.path,
+        return MediaCompletionManifest(
+            downloadID: downloadID,
+            attemptIdentifier: attemptIdentifier,
+            sourceURL: sourceURL,
+            destinationFolderPath: destinationFolder.standardizedFileURL.path,
+            fileLocationPath: fileLocationURL.standardizedFileURL.path,
             payloads: payloads,
             actualBytes: totalBytes
         )
-        try createAndValidateTemporaryFolder(download.temporaryFolder)
-        let manifestURL = completionManifestURL(id: download.id)
-        try JSONEncoder().encode(manifest).write(
-            to: manifestURL,
-            options: [.atomic, .withoutOverwriting]
+    }
+
+    private func persistCompletionManifest(
+        _ manifest: MediaCompletionManifest,
+        id: UUID
+    ) throws {
+        let folder = temporaryFolder(for: id)
+        try createAndValidateTemporaryFolder(folder)
+        let manifestURL = completionManifestURL(id: id)
+        try DurableFileSystem.writeAtomicallyWithoutReplacing(
+            JSONEncoder().encode(manifest),
+            to: manifestURL
         )
-        try DurableFileSystem.synchronizeFile(at: manifestURL)
-        try DurableFileSystem.synchronizeDirectory(at: download.temporaryFolder)
-        try DurableFileSystem.synchronizeParentDirectory(of: download.temporaryFolder)
+        try DurableFileSystem.synchronizeParentDirectory(of: folder)
+    }
+
+    private func materializeChildCompletionManifestIfNeeded(
+        id: UUID
+    ) throws -> MediaCompletionManifest? {
+        if try completionManifestExists(id: id) {
+            return try validatedCompletionManifest(id: id)
+        }
+        guard try itemExists(at: processSucceededMarkerURL(id: id)) else {
+            return nil
+        }
+
+        let evidence = try validatedChildCompletionEvidence(id: id)
+        let destinationFolder = URL(
+            fileURLWithPath: evidence.attempt.destinationFolderPath,
+            isDirectory: true
+        ).standardizedFileURL
+        let payloadURLs: [URL]
+        let fileLocationURL: URL
+        if evidence.attempt.isCollection {
+            payloadURLs = evidence.reportedURLs
+            fileLocationURL = destinationFolder
+        } else {
+            guard let finalURL = evidence.reportedURLs.last else {
+                throw CompletionManifestIntegrityError.invalid(
+                    "The child-owned media completion receipt did not contain a final path."
+                )
+            }
+            payloadURLs = [finalURL]
+            fileLocationURL = finalURL
+        }
+        let manifest: MediaCompletionManifest
+        do {
+            try payloadURLs.forEach {
+                try requireAttemptProduced(
+                    $0,
+                    preexistingDestinationFiles: evidence.attempt.preexistingDestinationFiles
+                )
+            }
+            manifest = try makeCompletionManifest(
+                downloadID: id,
+                attemptIdentifier: evidence.attempt.attemptIdentifier,
+                sourceURL: evidence.attempt.sourceURL,
+                destinationFolder: destinationFolder,
+                fileLocationURL: fileLocationURL,
+                payloadURLs: payloadURLs
+            )
+        } catch let error as MediaDownloadError {
+            throw CompletionManifestIntegrityError.invalid(
+                error.localizedDescription
+            )
+        }
+        try persistCompletionManifest(manifest, id: id)
+        return try validatedCompletionManifest(id: id)
+    }
+
+    private func validatedChildCompletionEvidence(
+        id: UUID
+    ) throws -> ChildCompletionEvidence {
+        let folder = temporaryFolder(for: id)
+        try validateTemporaryFolder(folder)
+
+        let attemptData = try validatedCompletionEvidenceData(
+            at: attemptManifestURL(id: id),
+            missingMessage: "The media attempt journal is missing."
+        )
+        let attempt: MediaAttemptManifest
+        do {
+            attempt = try JSONDecoder().decode(MediaAttemptManifest.self, from: attemptData)
+        } catch let error as DecodingError {
+            throw CompletionManifestIntegrityError.invalid(error.localizedDescription)
+        }
+        guard attempt.version == MediaAttemptManifest.currentVersion,
+              attempt.downloadID == id,
+              attempt.destinationFolderPath.hasPrefix("/") else {
+            throw CompletionManifestIntegrityError.invalid(
+                "The media attempt journal contains invalid ownership metadata."
+            )
+        }
+        let destinationFolder = URL(
+            fileURLWithPath: attempt.destinationFolderPath,
+            isDirectory: true
+        ).standardizedFileURL.resolvingSymlinksInPath()
+        guard attempt.preexistingDestinationFiles.allSatisfy({ path, identity in
+            let fileURL = URL(fileURLWithPath: path)
+                .standardizedFileURL.resolvingSymlinksInPath()
+            return path.hasPrefix("/")
+                && fileURL.deletingLastPathComponent() == destinationFolder
+                && identity.size >= 0
+                && identity.modificationNanoseconds >= 0
+                && identity.modificationNanoseconds < 1_000_000_000
+                && identity.statusChangeNanoseconds >= 0
+                && identity.statusChangeNanoseconds < 1_000_000_000
+        }) else {
+            throw CompletionManifestIntegrityError.invalid(
+                "The media attempt journal contains invalid destination identities."
+            )
+        }
+
+        let successData = try validatedCompletionEvidenceData(
+            at: processSucceededMarkerURL(id: id),
+            missingMessage: "The child-owned media success marker is missing."
+        )
+        guard let successText = String(data: successData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            let succeededAttemptIdentifier = UUID(uuidString: successText),
+            succeededAttemptIdentifier == attempt.attemptIdentifier else {
+            throw CompletionManifestIntegrityError.invalid(
+                "The child-owned media success marker does not match its attempt journal."
+            )
+        }
+
+        let pathData = try validatedCompletionEvidenceData(
+            at: finalPathReceiptURL(id: id),
+            missingMessage: "The child-owned media final-path receipt is missing."
+        )
+        guard let pathText = String(data: pathData, encoding: .utf8) else {
+            throw CompletionManifestIntegrityError.invalid(
+                "The child-owned media final-path receipt is not valid UTF-8."
+            )
+        }
+        let pathLines = pathText.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.isEmpty == false }
+        guard pathLines.isEmpty == false else {
+            throw CompletionManifestIntegrityError.invalid(
+                "The child-owned media final-path receipt is empty."
+            )
+        }
+        let reportedURLs = try pathLines.map { line in
+            guard let url = MediaDownloadFinalPathParser.fileURL(from: line) else {
+                throw CompletionManifestIntegrityError.invalid(
+                    "The child-owned media final-path receipt is malformed."
+                )
+            }
+            return url
+        }
+        return ChildCompletionEvidence(attempt: attempt, reportedURLs: reportedURLs)
+    }
+
+    private func validatedCompletionEvidenceData(
+        at url: URL,
+        missingMessage: String
+    ) throws -> Data {
+        guard try itemExists(at: url) else {
+            throw CompletionManifestIntegrityError.invalid(missingMessage)
+        }
+        let identity = try regularFileIdentity(at: url)
+        try DurableFileSystem.synchronizeFile(at: url)
+        let data = try Data(contentsOf: url)
+        guard try regularFileIdentity(at: url) == identity else {
+            throw CompletionManifestIntegrityError.invalid(
+                "The media completion evidence changed while it was being verified."
+            )
+        }
+        return data
+    }
+
+    private func recoverChildCompletionBeforeRetiringOwnership(id: UUID) {
+        do {
+            _ = try materializeChildCompletionManifestIfNeeded(id: id)
+        } catch {
+            logger.warning(
+                "Could not promote child-owned media completion for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+        }
     }
 
     private func validatedCompletionManifest(id: UUID) throws -> MediaCompletionManifest {
@@ -1441,8 +1904,18 @@ actor MediaDownloadService {
         _ url: URL,
         for download: RunningDownload
     ) throws {
+        try requireAttemptProduced(
+            url,
+            preexistingDestinationFiles: download.preexistingDestinationFiles
+        )
+    }
+
+    private func requireAttemptProduced(
+        _ url: URL,
+        preexistingDestinationFiles: [String: RegularFileIdentity]
+    ) throws {
         let candidate = url.standardizedFileURL.resolvingSymlinksInPath()
-        guard let previousIdentity = download.preexistingDestinationFiles[candidate.path] else {
+        guard let previousIdentity = preexistingDestinationFiles[candidate.path] else {
             return
         }
         let currentIdentity = try regularFileIdentity(at: candidate)
@@ -1613,6 +2086,7 @@ actor MediaDownloadService {
                         "Harbor’s earlier media process exited, but members of its process group are still running. They were left untouched."
                     )
                 }
+                recoverChildCompletionBeforeRetiringOwnership(id: manifest.downloadID)
                 try discardProcessOwnershipManifest(manifest)
                 continue
             }
@@ -1638,6 +2112,7 @@ actor MediaDownloadService {
                     }
                     // The numeric PID was reused after Harbor's child exited.
                     // Retire only the stale marker; never signal the new owner.
+                    recoverChildCompletionBeforeRetiringOwnership(id: manifest.downloadID)
                     try discardProcessOwnershipManifest(manifest)
                     continue
                 }
@@ -1695,6 +2170,7 @@ actor MediaDownloadService {
                     "Harbor could not confirm that its earlier media processes stopped (PIDs: \(identifiers))."
                 )
             }
+            recoverChildCompletionBeforeRetiringOwnership(id: manifest.downloadID)
             try discardProcessOwnershipManifest(manifest)
         }
 
@@ -1725,6 +2201,7 @@ actor MediaDownloadService {
                   ) == false else {
                 continue
             }
+            recoverChildCompletionBeforeRetiringOwnership(id: id)
             try discardUnverifiableProcessOwnershipMarker(id: id)
         }
     }
@@ -1757,6 +2234,12 @@ actor MediaDownloadService {
                 && $0.command.contains(path)
         }
     }
+
+#if DEBUG
+    func runningProcessForTesting(pid: pid_t) throws -> MediaRunningProcess? {
+        try runningProcesses().first { $0.pid == pid }
+    }
+#endif
 
     private func matchingProcesses(
         _ expected: [MediaRunningProcess],
@@ -1927,12 +2410,10 @@ actor MediaDownloadService {
                 "A previous media process still owns this recovery directory."
             )
         }
-        try JSONEncoder().encode(manifest).write(
-            to: url,
-            options: [.atomic, .withoutOverwriting]
+        try DurableFileSystem.writeAtomicallyWithoutReplacing(
+            JSONEncoder().encode(manifest),
+            to: url
         )
-        try DurableFileSystem.synchronizeFile(at: url)
-        try DurableFileSystem.synchronizeDirectory(at: temporaryFolder)
         try DurableFileSystem.synchronizeParentDirectory(of: temporaryFolder)
         return manifest
     }

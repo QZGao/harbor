@@ -175,6 +175,7 @@ private struct DownloadToolbarContent: ToolbarContent {
             Button("New Download", systemImage: "plus") {
                 center.presentAddSheet()
             }
+            .disabled(center.canAddDownloads == false)
         }
 
         ToolbarItem(placement: .primaryAction) {

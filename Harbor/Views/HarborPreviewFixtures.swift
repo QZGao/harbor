@@ -21,6 +21,9 @@ enum HarborPreviewFixtures {
     ) -> DownloadCenter {
         let settings = makeSettings()
         let center = DownloadCenter(settings: settings)
+#if DEBUG
+        center.markInitializationLoadedForTesting()
+#endif
         center.downloads = sampleDownloads()
         center.selectedFilter = selectedFilter
         center.selectedDownloadID = center.downloads[safe: selectedDownloadIndex]?.id

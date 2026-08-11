@@ -118,6 +118,7 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
         let torrentURL = watchDirectoryURL.appendingPathComponent("watched.torrent")
         try Data("paused watched torrent".utf8).write(to: torrentURL)
 
+        center.markInitializationLoadedForTesting()
         center.receiveWatchedTorrent(torrentURL)
 
         for _ in 0 ..< 40 {

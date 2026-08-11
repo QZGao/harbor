@@ -128,7 +128,7 @@ final class DownloadCenter {
     @ObservationIgnored private var browserCoordinator: BrowserDownloadCoordinator! = nil
     @ObservationIgnored private let torrentService: Aria2TorrentService
     @ObservationIgnored private var mediaService: MediaDownloadService! = nil
-    @ObservationIgnored private var initializationState: InitializationState = .notLoaded
+    private var initializationState: InitializationState = .notLoaded
     @ObservationIgnored private var initializationWaiters: [CheckedContinuation<Void, Never>] = []
     @ObservationIgnored private var hasInstalledExternalOpenHandler = false
     @ObservationIgnored private var persistTask: Task<Void, Never>?
@@ -136,7 +136,7 @@ final class DownloadCenter {
     @ObservationIgnored private var hasShownTorrentBinaryAlert = false
     @ObservationIgnored private var hasShownMediaRuntimeAlert = false
     @ObservationIgnored private var hasShownWatchFolderUnavailableAlert = false
-    @ObservationIgnored private var isShuttingDown = false
+    private var isShuttingDown = false
     @ObservationIgnored private var isReconcilingSelection = false
     @ObservationIgnored private var mediaStartTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private var pendingMediaRecoveryResets: Set<UUID> = []
@@ -211,6 +211,10 @@ final class DownloadCenter {
 
     var canRetryInitialization: Bool {
         initializationState == .notLoaded && initializationFailureMessage != nil
+    }
+
+    var canAddDownloads: Bool {
+        initializationState == .loaded && isShuttingDown == false
     }
 
     init(
@@ -601,6 +605,7 @@ final class DownloadCenter {
             await reconcileRestoredTorrentSession()
             initializationState = .loaded
             initializationFailureMessage = nil
+            presentNextQueuedExternalAddSheetIfNeeded()
             if pendingRemovalNeedsRetry {
                 schedulePendingRemovalReconciliation()
             }
@@ -2331,7 +2336,7 @@ final class DownloadCenter {
     }
 
     func receiveWatchedTorrent(_ url: URL) {
-        guard isShuttingDown == false else {
+        guard canAddDownloads else {
             return
         }
 
@@ -2349,7 +2354,8 @@ final class DownloadCenter {
     }
 
     func presentAddSheet() {
-        guard addSheetDraft == nil else {
+        guard canAddDownloads,
+              addSheetDraft == nil else {
             return
         }
 
@@ -2848,6 +2854,10 @@ final class DownloadCenter {
     }
 
     func queueDownload(_ request: AddDownloadRequest) {
+        guard canAddDownloads else {
+            return
+        }
+
         if request.sourceKind == .torrentFile {
             Task { @MainActor [weak self] in
                 await self?.prepareAndQueueTorrent(request, isWatchedImport: false)
@@ -7975,7 +7985,8 @@ final class DownloadCenter {
     }
 
     private func presentNextQueuedExternalAddSheetIfNeeded() {
-        guard addSheetDraft == nil,
+        guard canAddDownloads,
+              addSheetDraft == nil,
               pendingExternalAddSheetDrafts.isEmpty == false
         else {
             return
