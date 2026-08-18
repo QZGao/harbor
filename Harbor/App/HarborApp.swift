@@ -22,6 +22,7 @@ struct HarborApp: App {
         WindowGroup("Harbor", id: "main") {
             RootView(center: center, settings: settings)
                 .frame(minWidth: 1_040, minHeight: 680)
+                .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
                 .task {
                     appDelegate.center = center
 
@@ -34,7 +35,7 @@ struct HarborApp: App {
                     await center.initializeIfNeeded()
                 }
         }
-        .handlesExternalEvents(matching: [])
+        .handlesExternalEvents(matching: ["*"])
         .defaultSize(width: 1_320, height: 820)
         .defaultPosition(.center)
         .windowToolbarStyle(.unified)
