@@ -4,6 +4,8 @@ import SwiftUI
 struct RootView: View {
     let center: DownloadCenter
     let settings: AppSettingsStore
+    @AppStorage("downloads.inspector.width")
+    private var storedInspectorWidth = Double(Layout.inspectorIdealWidth)
     @State private var isDownloadDropTargeted = false
     @FocusState private var isSearchFocused: Bool
 
@@ -36,9 +38,14 @@ struct RootView: View {
                 )
                 .inspector(isPresented: inspectorPresentation) {
                     DownloadDetailView(center: center)
+                        .onGeometryChange(for: CGFloat.self) { proxy in
+                            proxy.size.width
+                        } action: { width in
+                            persistInspectorWidth(width)
+                        }
                         .inspectorColumnWidth(
                             min: Layout.inspectorMinWidth,
-                            ideal: Layout.inspectorIdealWidth,
+                            ideal: restoredInspectorWidth,
                             max: Layout.inspectorMaxWidth
                         )
                 }
@@ -120,6 +127,31 @@ struct RootView: View {
                 }
             }
         )
+    }
+
+    private var restoredInspectorWidth: CGFloat {
+        min(
+            max(CGFloat(storedInspectorWidth), Layout.inspectorMinWidth),
+            Layout.inspectorMaxWidth
+        )
+    }
+
+    private func persistInspectorWidth(_ width: CGFloat) {
+        guard width.isFinite,
+              width >= Layout.inspectorMinWidth - 1,
+              width <= Layout.inspectorMaxWidth + 1 else {
+            return
+        }
+
+        let clampedWidth = min(
+            max(width, Layout.inspectorMinWidth),
+            Layout.inspectorMaxWidth
+        )
+        guard abs(storedInspectorWidth - Double(clampedWidth)) >= 0.5 else {
+            return
+        }
+
+        storedInspectorWidth = Double(clampedWidth)
     }
 
     private func loadExternalAddSources(_ providers: [NSItemProvider]) -> Bool {
