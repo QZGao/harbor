@@ -34,6 +34,7 @@ struct HarborApp: App {
                     await center.initializeIfNeeded()
                 }
         }
+        .handlesExternalEvents(matching: [])
         .defaultSize(width: 1_320, height: 820)
         .defaultPosition(.center)
         .windowToolbarStyle(.unified)
