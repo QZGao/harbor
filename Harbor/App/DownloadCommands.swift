@@ -75,6 +75,12 @@ struct DownloadCommands: Commands {
             .keyboardShortcut(.return, modifiers: [.command])
             .disabled(center.canOpenSelectedDownload == false)
 
+            Button("Quick Look") {
+                center.quickLookSelectedDownloads()
+            }
+            .keyboardShortcut(.space, modifiers: [])
+            .disabled(center.canQuickLookSelectedDownloads == false)
+
             Divider()
 
             Button("Remove Selected from List") {

@@ -186,6 +186,12 @@ struct DownloadsContentView: View {
             }
         }
 
+        if center.canQuickLookDownloads(ids: targetIDs) {
+            Button("Quick Look") {
+                center.quickLookDownloads(ids: targetIDs)
+            }
+        }
+
         if targetIDs.count == 1, item.backend == .aria2, item.status == .completed {
             Button("Start Seeding") {
                 center.startSeeding(id: item.id)

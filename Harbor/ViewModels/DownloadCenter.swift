@@ -13,6 +13,7 @@ final class DownloadCenter {
     @ObservationIgnored private let managedTorrentSourceStore: ManagedTorrentSourceStore
     @ObservationIgnored private let torrentWatchFolderService: TorrentWatchFolderService
     @ObservationIgnored private let sleepPreventionService: any DownloadSleepPreventing
+    @ObservationIgnored private let quickLookPreviewService: any QuickLookPreviewing
     @ObservationIgnored private var coordinator: DownloadCoordinator! = nil
     @ObservationIgnored private var browserCoordinator: BrowserDownloadCoordinator! = nil
     @ObservationIgnored private let torrentService: Aria2TorrentService
@@ -65,6 +66,7 @@ final class DownloadCenter {
         managedTorrentSourceStore: ManagedTorrentSourceStore = ManagedTorrentSourceStore(),
         torrentWatchFolderService: TorrentWatchFolderService? = nil,
         sleepPreventionService: (any DownloadSleepPreventing)? = nil,
+        quickLookPreviewService: (any QuickLookPreviewing)? = nil,
         torrentService: Aria2TorrentService? = nil,
         mediaService: MediaDownloadService? = nil
     ) {
@@ -76,6 +78,7 @@ final class DownloadCenter {
         self.managedTorrentSourceStore = managedTorrentSourceStore
         self.torrentWatchFolderService = torrentWatchFolderService ?? TorrentWatchFolderService()
         self.sleepPreventionService = sleepPreventionService ?? DownloadSleepPreventionService()
+        self.quickLookPreviewService = quickLookPreviewService ?? QuickLookPreviewService()
         self.torrentService = torrentService ?? Aria2TorrentService(transferSettings: settings.transferSettings)
         self.mediaService = mediaService ?? MediaDownloadService { [weak self] event in
             Task { @MainActor [weak self] in
@@ -434,6 +437,10 @@ final class DownloadCenter {
 
     var canOpenSelectedDownload: Bool {
         selectedDownloads.contains { $0.fileLocationURL != nil }
+    }
+
+    var canQuickLookSelectedDownloads: Bool {
+        canQuickLookDownloads(ids: selectedDownloadIDs)
     }
 
     func count(for filter: DownloadFilter) -> Int {
@@ -1334,6 +1341,30 @@ final class DownloadCenter {
         NSWorkspace.shared.open(url)
     }
 
+    func quickLookSelectedDownloads() {
+        quickLookDownloads(ids: selectedDownloadIDs)
+    }
+
+    func quickLookDownload(id: UUID) {
+        quickLookDownloads(ids: [id])
+    }
+
+    func quickLookDownloads(ids: Set<UUID>) {
+        let items = orderedDownloads(for: ids)
+        let previewURLs = items.compactMap(existingQuickLookURL(for:))
+
+        guard items.isEmpty == false,
+              previewURLs.count == items.count else {
+            activeAlert = UserAlert(
+                title: String(localized: "Quick Look Unavailable"),
+                message: String(localized: "The completed file could not be found on this Mac.")
+            )
+            return
+        }
+
+        quickLookPreviewService.preview(urls: previewURLs)
+    }
+
     func copySourceURL(id: UUID) {
         guard let sourceText = item(for: id)?.sourceDisplayText else {
             return
@@ -1395,6 +1426,22 @@ final class DownloadCenter {
 
     func canOpenDownloads(ids: Set<UUID>) -> Bool {
         orderedDownloads(for: ids).contains { $0.fileLocationURL != nil }
+    }
+
+    func canQuickLookDownloads(ids: Set<UUID>) -> Bool {
+        let items = orderedDownloads(for: ids)
+        return items.isEmpty == false && items.allSatisfy { existingQuickLookURL(for: $0) != nil }
+    }
+
+    private func existingQuickLookURL(for item: DownloadItem) -> URL? {
+        guard item.status == .completed,
+              let url = item.fileLocationURL,
+              url.isFileURL,
+              FileManager.default.fileExists(atPath: url.path) else {
+            return nil
+        }
+
+        return url
     }
 
     func pauseDownloads(ids: Set<UUID>) {

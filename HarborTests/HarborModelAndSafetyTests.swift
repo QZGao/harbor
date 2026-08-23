@@ -294,6 +294,48 @@ final class HarborModelAndSafetyTests: XCTestCase {
         )
     }
 
+    func testQuickLookRequiresCompletedExistingLocalFiles() throws {
+        let suiteName = "HarborTests.QuickLook.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Harbor-Quick-Look-\(UUID().uuidString).txt")
+        try Data("Preview".utf8).write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let previewService = FakeQuickLookPreviewService()
+        let center = DownloadCenter(
+            settings: AppSettingsStore(userDefaults: userDefaults),
+            quickLookPreviewService: previewService
+        )
+        let item = makeTorrentItem(
+            sourceURL: URL(fileURLWithPath: "/tmp/preview.torrent"),
+            sourceKind: .torrentFile,
+            fileLocationPath: fileURL.path
+        )
+        center.downloads = [item]
+        center.selectedDownloadID = item.id
+
+        XCTAssertTrue(center.canQuickLookSelectedDownloads)
+
+        center.quickLookSelectedDownloads()
+
+        XCTAssertEqual(previewService.previewedURLs, [fileURL])
+        XCTAssertEqual(item.status, .completed)
+
+        item.status = .paused
+        XCTAssertFalse(center.canQuickLookSelectedDownloads)
+
+        item.status = .completed
+        try FileManager.default.removeItem(at: fileURL)
+        XCTAssertFalse(center.canQuickLookSelectedDownloads)
+
+        center.quickLookSelectedDownloads()
+        XCTAssertEqual(center.activeAlert?.title, "Quick Look Unavailable")
+    }
+
     func testLegacyCompletedTorrentDoesNotSeed() throws {
         let record = try legacyTorrentRecord(status: .completed)
 
@@ -451,5 +493,14 @@ final class HarborModelAndSafetyTests: XCTestCase {
             status: status,
             metadataName: metadataName
         )
+    }
+}
+
+@MainActor
+private final class FakeQuickLookPreviewService: QuickLookPreviewing {
+    private(set) var previewedURLs: [URL] = []
+
+    func preview(urls: [URL]) {
+        previewedURLs = urls
     }
 }

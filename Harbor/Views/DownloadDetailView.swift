@@ -27,6 +27,8 @@ private struct DownloadInspectorContent: View {
                     startSeeding: startSeeding,
                     stopSeeding: stopSeeding,
                     openFile: openFile,
+                    quickLook: quickLook,
+                    canQuickLook: center.canQuickLookDownloads(ids: [item.id]),
                     revealInFinder: revealInFinder,
                     copySourceURL: copySourceURL
                 )
@@ -110,6 +112,10 @@ private struct DownloadInspectorContent: View {
 
     private func openFile() {
         center.openDownload(id: item.id)
+    }
+
+    private func quickLook() {
+        center.quickLookDownload(id: item.id)
     }
 
     private func revealInFinder() {
@@ -564,6 +570,8 @@ private struct DownloadActionRow: View {
     let startSeeding: () -> Void
     let stopSeeding: () -> Void
     let openFile: () -> Void
+    let quickLook: () -> Void
+    let canQuickLook: Bool
     let revealInFinder: () -> Void
     let copySourceURL: () -> Void
 
@@ -635,7 +643,13 @@ private struct DownloadActionRow: View {
 
     @ViewBuilder
     private var secondaryAction: some View {
-        if item.fileLocationURL != nil,
+        if item.status == .completed {
+            Button(action: quickLook) {
+                Label("Quick Look", systemImage: "eye")
+            }
+            .buttonStyle(LiquidPillButtonStyle(prominent: false))
+            .disabled(canQuickLook == false)
+        } else if item.fileLocationURL != nil,
            item.status != .completed {
             Button(action: openFile) {
                 Label("Open", systemImage: "doc.fill")
