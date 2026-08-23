@@ -133,7 +133,7 @@ struct BandwidthSettingsTab: View {
                     }
                 }
 
-                Text(trafficModeDescription)
+                Text("Unlimited has no limits. Balanced uses 25 MB/s down and 5 MB/s up. Quiet uses 5 MB/s down and 512 KB/s up. Custom uses the limits below.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -187,19 +187,6 @@ struct BandwidthSettingsTab: View {
             }
         }
         .formStyle(.grouped)
-    }
-
-    private var trafficModeDescription: LocalizedStringResource {
-        switch settings.trafficMode {
-        case .unlimited:
-            "Uses all available bandwidth."
-        case .balanced:
-            "Limits downloads to 25 MB/s and uploads to 5 MB/s."
-        case .quiet:
-            "Limits downloads to 5 MB/s and uploads to 512 KB/s."
-        case .custom:
-            "Uses the custom download and upload limits below."
-        }
     }
 }
 
