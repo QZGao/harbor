@@ -2,6 +2,10 @@ import AppKit
 import SwiftUI
 
 struct AddDownloadSheet: View {
+    private enum Layout {
+        static let groupedFormHorizontalInset: CGFloat = 40
+    }
+
     private enum Field: Hashable {
         case sourceURL
         case filename
@@ -111,6 +115,7 @@ struct AddDownloadSheet: View {
                 Toggle("Start immediately", isOn: $shouldStartImmediately)
             }
             .formStyle(.grouped)
+            .padding(.horizontal, -Layout.groupedFormHorizontalInset)
 
             if let validationMessage {
                 Text(validationMessage)
