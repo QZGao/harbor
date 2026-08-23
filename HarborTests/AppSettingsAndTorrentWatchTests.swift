@@ -38,6 +38,73 @@ final class AppSettingsAndTorrentWatchTests: XCTestCase {
         XCTAssertEqual(restoredSettings.seedingRatioLimit, 1.5)
     }
 
+    func testTrafficModesOverlayAndPreserveCustomLimits() {
+        let suiteName = "HarborTests.TrafficModes.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        XCTAssertEqual(settings.trafficMode, .unlimited)
+        XCTAssertEqual(settings.transferSettings, .default)
+
+        settings.globalSpeedLimitKilobytesPerSecond = 9_000
+        settings.perDownloadSpeedLimitKilobytesPerSecond = 3_000
+        settings.globalUploadSpeedLimitKilobytesPerSecond = 1_500
+        settings.perDownloadUploadSpeedLimitKilobytesPerSecond = 500
+        settings.globalSpeedLimitEnabled = true
+        settings.perDownloadSpeedLimitEnabled = true
+        settings.globalUploadSpeedLimitEnabled = true
+        settings.perDownloadUploadSpeedLimitEnabled = true
+        XCTAssertEqual(settings.trafficMode, .custom)
+
+        var observedSettings: DownloadTransferSettings?
+        settings.transferSettingsDidChange = { observedSettings = $0 }
+        settings.trafficMode = .balanced
+
+        XCTAssertEqual(observedSettings?.globalSpeedLimitBytesPerSecond, 25 * 1_024 * 1_024)
+        XCTAssertEqual(settings.transferSettings.perDownloadSpeedLimitBytesPerSecond, 5 * 1_024 * 1_024)
+        XCTAssertEqual(settings.transferSettings.globalUploadSpeedLimitBytesPerSecond, 5 * 1_024 * 1_024)
+        XCTAssertEqual(settings.transferSettings.perDownloadUploadSpeedLimitBytesPerSecond, 1_024 * 1_024)
+
+        settings.trafficMode = .quiet
+        XCTAssertEqual(settings.transferSettings.globalSpeedLimitBytesPerSecond, 5 * 1_024 * 1_024)
+        XCTAssertEqual(settings.transferSettings.perDownloadSpeedLimitBytesPerSecond, 1_024 * 1_024)
+        XCTAssertEqual(settings.transferSettings.globalUploadSpeedLimitBytesPerSecond, 512 * 1_024)
+        XCTAssertEqual(settings.transferSettings.perDownloadUploadSpeedLimitBytesPerSecond, 256 * 1_024)
+
+        settings.trafficMode = .unlimited
+        XCTAssertNil(settings.transferSettings.globalSpeedLimitBytesPerSecond)
+        XCTAssertNil(settings.transferSettings.perDownloadSpeedLimitBytesPerSecond)
+        XCTAssertNil(settings.transferSettings.globalUploadSpeedLimitBytesPerSecond)
+        XCTAssertNil(settings.transferSettings.perDownloadUploadSpeedLimitBytesPerSecond)
+
+        settings.trafficMode = .custom
+        XCTAssertEqual(settings.transferSettings.globalSpeedLimitBytesPerSecond, 9_000 * 1_024)
+        XCTAssertEqual(settings.transferSettings.perDownloadSpeedLimitBytesPerSecond, 3_000 * 1_024)
+        XCTAssertEqual(settings.transferSettings.globalUploadSpeedLimitBytesPerSecond, 1_500 * 1_024)
+        XCTAssertEqual(settings.transferSettings.perDownloadUploadSpeedLimitBytesPerSecond, 500 * 1_024)
+
+        let restoredSettings = AppSettingsStore(userDefaults: userDefaults)
+        XCTAssertEqual(restoredSettings.trafficMode, .custom)
+        XCTAssertEqual(restoredSettings.globalSpeedLimitKilobytesPerSecond, 9_000)
+        XCTAssertEqual(restoredSettings.perDownloadUploadSpeedLimitKilobytesPerSecond, 500)
+    }
+
+    func testLegacyEnabledLimitsMigrateToCustomTrafficMode() {
+        let suiteName = "HarborTests.LegacyTrafficMode.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        userDefaults.set(true, forKey: "globalSpeedLimitEnabled")
+        userDefaults.set(7_500, forKey: "globalSpeedLimitKilobytesPerSecond")
+
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        XCTAssertEqual(settings.trafficMode, .custom)
+        XCTAssertEqual(settings.transferSettings.globalSpeedLimitBytesPerSecond, 7_500 * 1_024)
+    }
+
     func testStartAtLoginReflectsControllerStateAndFailures() {
         let controller = FakeLoginItemController(status: .disabled)
         let settings = AppSettingsStore(loginItemController: controller)
@@ -109,6 +176,7 @@ final class AppSettingsAndTorrentWatchTests: XCTestCase {
         XCTAssertFalse(settings.stopSeedingAtRatioEnabled)
         XCTAssertEqual(settings.stopSeedingRatio, 2)
         XCTAssertNil(settings.seedingRatioLimit)
+        XCTAssertEqual(settings.trafficMode, .unlimited)
         XCTAssertEqual(
             settings.torrentDestinationURL.standardizedFileURL,
             regularDestinationURL

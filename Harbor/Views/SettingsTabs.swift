@@ -126,6 +126,18 @@ struct BandwidthSettingsTab: View {
         @Bindable var settings = settings
 
         Form {
+            Section("Traffic Mode") {
+                Picker("Mode", selection: $settings.trafficMode) {
+                    ForEach(TrafficMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+
+                Text(trafficModeDescription)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Connections") {
                 Stepper(
                     value: $settings.maxConcurrentDownloads,
@@ -142,7 +154,7 @@ struct BandwidthSettingsTab: View {
                 }
             }
 
-            Section("Download Limits") {
+            Section("Custom Download Limits") {
                 SpeedLimitRow(
                     title: "Global Download Limit",
                     isEnabled: $settings.globalSpeedLimitEnabled,
@@ -158,7 +170,7 @@ struct BandwidthSettingsTab: View {
                 }
             }
 
-            Section("Upload Limits") {
+            Section("Custom Upload Limits") {
                 SpeedLimitRow(
                     title: "Global Upload Limit",
                     isEnabled: $settings.globalUploadSpeedLimitEnabled,
@@ -175,6 +187,19 @@ struct BandwidthSettingsTab: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private var trafficModeDescription: LocalizedStringResource {
+        switch settings.trafficMode {
+        case .unlimited:
+            "Uses all available bandwidth."
+        case .balanced:
+            "Limits downloads to 25 MB/s and uploads to 5 MB/s."
+        case .quiet:
+            "Limits downloads to 5 MB/s and uploads to 512 KB/s."
+        case .custom:
+            "Uses the custom download and upload limits below."
+        }
     }
 }
 

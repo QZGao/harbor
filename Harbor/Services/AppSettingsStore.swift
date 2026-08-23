@@ -2,6 +2,52 @@ import AppKit
 import Foundation
 import Observation
 
+enum TrafficMode: String, CaseIterable, Identifiable, Sendable {
+    case unlimited
+    case balanced
+    case quiet
+    case custom
+
+    var id: String { rawValue }
+
+    var title: LocalizedStringResource {
+        switch self {
+        case .unlimited:
+            "Unlimited"
+        case .balanced:
+            "Balanced"
+        case .quiet:
+            "Quiet"
+        case .custom:
+            "Custom"
+        }
+    }
+
+    nonisolated func applying(to customSettings: DownloadTransferSettings) -> DownloadTransferSettings {
+        let limits: (download: Int64?, perDownload: Int64?, upload: Int64?, perUpload: Int64?)
+
+        switch self {
+        case .unlimited:
+            limits = (nil, nil, nil, nil)
+        case .balanced:
+            limits = (25 * 1_024 * 1_024, 5 * 1_024 * 1_024, 5 * 1_024 * 1_024, 1_024 * 1_024)
+        case .quiet:
+            limits = (5 * 1_024 * 1_024, 1_024 * 1_024, 512 * 1_024, 256 * 1_024)
+        case .custom:
+            return customSettings
+        }
+
+        return DownloadTransferSettings(
+            maxConcurrentDownloads: customSettings.maxConcurrentDownloads,
+            globalSpeedLimitBytesPerSecond: limits.download,
+            perDownloadSpeedLimitBytesPerSecond: limits.perDownload,
+            globalUploadSpeedLimitBytesPerSecond: limits.upload,
+            perDownloadUploadSpeedLimitBytesPerSecond: limits.perUpload,
+            perDownloadConnectionCount: customSettings.perDownloadConnectionCount
+        )
+    }
+}
+
 struct DownloadTransferSettings: Equatable, Sendable {
     nonisolated static var `default`: DownloadTransferSettings {
         DownloadTransferSettings(
@@ -37,6 +83,7 @@ final class AppSettingsStore {
         static let startDownloadsAutomatically = "startDownloadsAutomatically"
         static let notificationsEnabled = "notificationsEnabled"
         static let preventSleepWhileDownloading = "preventSleepWhileDownloading"
+        static let trafficMode = "trafficMode"
         static let globalSpeedLimitEnabled = "globalSpeedLimitEnabled"
         static let globalSpeedLimitKilobytesPerSecond = "globalSpeedLimitKilobytesPerSecond"
         static let perDownloadSpeedLimitEnabled = "perDownloadSpeedLimitEnabled"
@@ -136,38 +183,55 @@ final class AppSettingsStore {
     private(set) var startAtLogin = false
     private(set) var startAtLoginErrorMessage: String?
 
+    var trafficMode: TrafficMode {
+        didSet {
+            userDefaults.set(trafficMode.rawValue, forKey: Keys.trafficMode)
+            notifyTransferSettingsChanged()
+        }
+    }
+
     var globalSpeedLimitEnabled: Bool {
         didSet {
             userDefaults.set(globalSpeedLimitEnabled, forKey: Keys.globalSpeedLimitEnabled)
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
     var globalSpeedLimitKilobytesPerSecond: Int {
         didSet {
             userDefaults.set(globalSpeedLimitKilobytesPerSecond, forKey: Keys.globalSpeedLimitKilobytesPerSecond)
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
     var perDownloadSpeedLimitEnabled: Bool {
         didSet {
             userDefaults.set(perDownloadSpeedLimitEnabled, forKey: Keys.perDownloadSpeedLimitEnabled)
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
     var perDownloadSpeedLimitKilobytesPerSecond: Int {
         didSet {
             userDefaults.set(perDownloadSpeedLimitKilobytesPerSecond, forKey: Keys.perDownloadSpeedLimitKilobytesPerSecond)
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
     var globalUploadSpeedLimitEnabled: Bool {
         didSet {
             userDefaults.set(globalUploadSpeedLimitEnabled, forKey: Keys.globalUploadSpeedLimitEnabled)
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
@@ -177,14 +241,18 @@ final class AppSettingsStore {
                 globalUploadSpeedLimitKilobytesPerSecond,
                 forKey: Keys.globalUploadSpeedLimitKilobytesPerSecond
             )
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
     var perDownloadUploadSpeedLimitEnabled: Bool {
         didSet {
             userDefaults.set(perDownloadUploadSpeedLimitEnabled, forKey: Keys.perDownloadUploadSpeedLimitEnabled)
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
@@ -194,7 +262,9 @@ final class AppSettingsStore {
                 perDownloadUploadSpeedLimitKilobytesPerSecond,
                 forKey: Keys.perDownloadUploadSpeedLimitKilobytesPerSecond
             )
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
@@ -255,6 +325,17 @@ final class AppSettingsStore {
         }
         self.preventSleepWhileDownloading = userDefaults.bool(forKey: Keys.preventSleepWhileDownloading)
         self.startAtLogin = resolvedLoginItemController.status == .enabled
+
+        if let storedTrafficMode = userDefaults.string(forKey: Keys.trafficMode)
+            .flatMap(TrafficMode.init(rawValue:)) {
+            self.trafficMode = storedTrafficMode
+        } else {
+            let hasLegacyLimits = userDefaults.bool(forKey: Keys.globalSpeedLimitEnabled)
+                || userDefaults.bool(forKey: Keys.perDownloadSpeedLimitEnabled)
+                || userDefaults.bool(forKey: Keys.globalUploadSpeedLimitEnabled)
+                || userDefaults.bool(forKey: Keys.perDownloadUploadSpeedLimitEnabled)
+            self.trafficMode = hasLegacyLimits ? .custom : .unlimited
+        }
 
         self.globalSpeedLimitEnabled = userDefaults.bool(forKey: Keys.globalSpeedLimitEnabled)
         self.globalSpeedLimitKilobytesPerSecond = Self.clamped(
@@ -331,7 +412,7 @@ final class AppSettingsStore {
     }
 
     var transferSettings: DownloadTransferSettings {
-        DownloadTransferSettings(
+        let customSettings = DownloadTransferSettings(
             maxConcurrentDownloads: Self.clamped(maxConcurrentDownloads, to: Self.maxConcurrentDownloadsRange),
             globalSpeedLimitBytesPerSecond: speedLimitBytesPerSecond(
                 isEnabled: globalSpeedLimitEnabled,
@@ -354,6 +435,8 @@ final class AppSettingsStore {
                 to: Self.perDownloadConnectionCountRange
             )
         )
+
+        return trafficMode.applying(to: customSettings)
     }
 
     static func clampedSpeedLimitKilobytes(_ value: Int) -> Int {
@@ -414,6 +497,16 @@ final class AppSettingsStore {
 
     private func notifyTransferSettingsChanged() {
         transferSettingsDidChange?(transferSettings)
+    }
+
+    @discardableResult
+    private func activateCustomTrafficMode() -> Bool {
+        guard trafficMode != .custom else {
+            return false
+        }
+
+        trafficMode = .custom
+        return true
     }
 
     private func loginItemStatusMessage(_ status: LoginItemStatus) -> String {

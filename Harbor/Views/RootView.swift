@@ -220,25 +220,11 @@ private struct DownloadToolbarContent: ToolbarContent {
 
         ToolbarItem(placement: .primaryAction) {
             Menu {
-                Toggle("Limit Downloads", isOn: $settings.globalSpeedLimitEnabled)
-
-                Text(
-                    settings.globalSpeedLimitEnabled
-                        ? DownloadFormatting.speedString(Double(settings.globalSpeedLimitKilobytesPerSecond) * 1_024)
-                        : String(localized: "Unlimited")
-                )
-                .foregroundStyle(.secondary)
-
-                Divider()
-
-                Toggle("Limit Uploads", isOn: $settings.globalUploadSpeedLimitEnabled)
-
-                Text(
-                    settings.globalUploadSpeedLimitEnabled
-                        ? DownloadFormatting.speedString(Double(settings.globalUploadSpeedLimitKilobytesPerSecond) * 1_024)
-                        : String(localized: "Unlimited")
-                )
-                .foregroundStyle(.secondary)
+                Picker("Traffic Mode", selection: $settings.trafficMode) {
+                    ForEach(TrafficMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
 
                 Divider()
 
@@ -246,8 +232,10 @@ private struct DownloadToolbarContent: ToolbarContent {
                     Label("Edit Limits…", systemImage: "gearshape")
                 }
             } label: {
-                Label("Speed Limits", systemImage: "speedometer")
+                Label(settings.trafficMode.title, systemImage: "speedometer")
+                    .labelStyle(.titleAndIcon)
             }
+            .help("Traffic Mode")
         }
 
         ToolbarItem(placement: .primaryAction) {
