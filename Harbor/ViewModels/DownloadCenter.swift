@@ -2563,6 +2563,19 @@ final class DownloadCenter {
                 return
             }
 
+            if DownloadedPayloadClassifier.isTorrent(
+                sourceURL: item.sourceURL,
+                suggestedFilename: suggestedFilename,
+                responseMimeType: responseMimeType,
+                statusCode: statusCode
+            ) {
+                beginDownloadedTorrentHandoff(
+                    for: item,
+                    temporaryURL: temporaryURL
+                )
+                return
+            }
+
             do {
                 try finalizeFileDownload(
                     for: item,
@@ -2620,6 +2633,19 @@ final class DownloadCenter {
 
         case let .finished(id, temporaryURL, suggestedFilename, responseMimeType, statusCode, expectedBytes):
             guard let item = item(for: id) else {
+                return
+            }
+
+            if DownloadedPayloadClassifier.isTorrent(
+                sourceURL: item.sourceURL,
+                suggestedFilename: suggestedFilename,
+                responseMimeType: responseMimeType,
+                statusCode: statusCode
+            ) {
+                beginDownloadedTorrentHandoff(
+                    for: item,
+                    temporaryURL: temporaryURL
+                )
                 return
             }
 
@@ -2826,6 +2852,122 @@ final class DownloadCenter {
         item.lastError = nil
         item.resumeData = nil
         transitionStatus(for: item, to: .completed)
+    }
+
+    private func beginDownloadedTorrentHandoff(
+        for item: DownloadItem,
+        temporaryURL: URL
+    ) {
+        Self.configureDownloadedTorrentHandoff(
+            item,
+            shouldSeedAfterDownload: settings.seedNewTorrents
+        )
+        schedulePersist()
+
+        torrentStartTasks[item.id] = Task { @MainActor [weak self] in
+            await self?.completeDownloadedTorrentHandoff(
+                id: item.id,
+                temporaryURL: temporaryURL
+            )
+        }
+    }
+
+    static func configureDownloadedTorrentHandoff(
+        _ item: DownloadItem,
+        shouldSeedAfterDownload: Bool
+    ) {
+        item.sourceKind = .torrentFile
+        item.backend = .aria2
+        item.preferredFilename = nil
+        item.fileLocationPath = nil
+        item.progress = 0
+        item.bytesWritten = 0
+        item.expectedBytes = 0
+        item.speedBytesPerSecond = 0
+        item.uploadBytesPerSecond = 0
+        item.finishedAt = nil
+        item.lastError = nil
+        item.resumeData = nil
+        item.taskIdentifier = nil
+        item.backendIdentifier = nil
+        item.shouldSeedAfterDownload = shouldSeedAfterDownload
+        item.completionNotificationDelivered = false
+        item.updatedAt = .now
+
+        // Keep the original Started activity. This is one download changing engines, not a second download.
+        item.status = .preparing
+    }
+
+    private func completeDownloadedTorrentHandoff(
+        id: UUID,
+        temporaryURL: URL
+    ) async {
+        defer {
+            try? FileManager.default.removeItem(at: temporaryURL)
+            torrentStartTasks.removeValue(forKey: id)
+        }
+
+        guard let currentItem = item(for: id),
+              currentItem.sourceKind == .torrentFile,
+              currentItem.backend == .aria2 else {
+            return
+        }
+
+        do {
+            let managedSource = try await managedTorrentSourceStore.prepareLocalTorrent(
+                at: temporaryURL,
+                originalURL: currentItem.sourceURL
+            )
+
+            guard let refreshedItem = item(for: id) else {
+                return
+            }
+
+            refreshedItem.torrentFingerprint = managedSource.fingerprint
+            refreshedItem.torrentSourceFingerprint = managedSource.sourceFingerprint
+            refreshedItem.managedTorrentSourcePath = managedSource.managedURL.path
+            refreshedItem.updatedAt = .now
+            schedulePersist()
+
+            guard refreshedItem.status == .preparing,
+                  isShuttingDown == false else {
+                return
+            }
+
+            if let existingItem = downloads.first(where: {
+                $0.id != id && Self.torrentIdentity(for: $0) == managedSource.fingerprint
+            }) {
+                downloads.removeAll { $0.id == id }
+                selectedDownloadIDs.remove(id)
+                selectDownload(existingItem.id)
+                activeAlert = UserAlert(
+                    title: String(localized: "Torrent Already Added"),
+                    message: String(localized: "This torrent is already in Harbor.")
+                )
+                schedulePersist()
+                startNextQueuedDownloadsIfNeeded()
+                return
+            }
+
+            await startTorrentDownload(id: id)
+        } catch {
+            guard let refreshedItem = item(for: id),
+                  refreshedItem.status == .preparing else {
+                return
+            }
+
+            refreshedItem.lastError = error.localizedDescription
+            refreshedItem.speedBytesPerSecond = 0
+            refreshedItem.uploadBytesPerSecond = 0
+            refreshedItem.updatedAt = .now
+            transitionStatus(for: refreshedItem, to: .failed)
+            activeAlert = UserAlert(
+                title: String(localized: "Couldn’t Import Torrent"),
+                message: error.localizedDescription
+            )
+            schedulePersist()
+            startNextQueuedDownloadsIfNeeded()
+        }
     }
 
     private func markBrowserSessionRequired(_ item: DownloadItem, message: String) {

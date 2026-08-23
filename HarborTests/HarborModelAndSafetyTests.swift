@@ -4,6 +4,97 @@ import XCTest
 
 @MainActor
 final class HarborModelAndSafetyTests: XCTestCase {
+    func testDownloadedPayloadClassifierDetectsTorrentResponses() {
+        let extensionlessURL = URL(string: "https://example.com/download?id=42")!
+
+        XCTAssertTrue(
+            DownloadedPayloadClassifier.isTorrent(
+                sourceURL: extensionlessURL,
+                suggestedFilename: nil,
+                responseMimeType: "application/x-bittorrent"
+            )
+        )
+        XCTAssertTrue(
+            DownloadedPayloadClassifier.isTorrent(
+                sourceURL: extensionlessURL,
+                suggestedFilename: "Linux.torrent",
+                responseMimeType: "application/octet-stream"
+            )
+        )
+        XCTAssertTrue(
+            DownloadedPayloadClassifier.isTorrent(
+                sourceURL: URL(string: "https://example.com/linux.torrent")!,
+                suggestedFilename: nil,
+                responseMimeType: nil
+            )
+        )
+        XCTAssertFalse(
+            DownloadedPayloadClassifier.isTorrent(
+                sourceURL: extensionlessURL,
+                suggestedFilename: "archive.zip",
+                responseMimeType: "application/octet-stream"
+            )
+        )
+        XCTAssertFalse(
+            DownloadedPayloadClassifier.isTorrent(
+                sourceURL: extensionlessURL,
+                suggestedFilename: "error.torrent",
+                responseMimeType: "application/x-bittorrent",
+                statusCode: 404
+            )
+        )
+    }
+
+    func testDownloadedTorrentHandoffReusesTheDirectDownloadRow() {
+        let sourceURL = URL(string: "https://example.com/download?id=42")!
+        let item = DownloadItem(
+            sourceURL: sourceURL,
+            sourceKind: .directURL,
+            backend: .urlSession,
+            preferredFilename: "metadata.torrent",
+            destinationFolderPath: "/tmp",
+            fileLocationPath: "/tmp/metadata.torrent",
+            status: .downloading,
+            progress: 1,
+            bytesWritten: 512,
+            expectedBytes: 512,
+            finishedAt: .now,
+            resumeData: Data([0x01]),
+            taskIdentifier: 7,
+            backendIdentifier: "old-backend",
+            completionNotificationDelivered: true,
+            activityEvents: [
+                DownloadActivityEvent(kind: .added),
+                DownloadActivityEvent(kind: .started)
+            ]
+        )
+        let originalID = item.id
+        let originalActivity = item.activityEvents
+
+        DownloadCenter.configureDownloadedTorrentHandoff(
+            item,
+            shouldSeedAfterDownload: true
+        )
+
+        XCTAssertEqual(item.id, originalID)
+        XCTAssertEqual(item.sourceURL, sourceURL)
+        XCTAssertEqual(item.sourceKind, .torrentFile)
+        XCTAssertEqual(item.backend, .aria2)
+        XCTAssertEqual(item.status, .preparing)
+        XCTAssertEqual(item.activityEvents, originalActivity)
+        XCTAssertNil(item.preferredFilename)
+        XCTAssertNil(item.fileLocationPath)
+        XCTAssertNil(item.resumeData)
+        XCTAssertNil(item.taskIdentifier)
+        XCTAssertNil(item.backendIdentifier)
+        XCTAssertEqual(item.progress, 0)
+        XCTAssertEqual(item.bytesWritten, 0)
+        XCTAssertEqual(item.expectedBytes, 0)
+        XCTAssertNil(item.finishedAt)
+        XCTAssertTrue(item.shouldSeedAfterDownload)
+        XCTAssertFalse(item.completionNotificationDelivered)
+    }
+
     func testTransferLimitOverrideResolution() {
         XCTAssertEqual(
             TransferLimitOverride.inherit.resolvedBytesPerSecond(inheriting: 4_096),
