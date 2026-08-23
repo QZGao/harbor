@@ -465,6 +465,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             "downloadLimitOverride",
             "uploadLimitOverride",
             "torrentFingerprint",
+            "torrentSourceFingerprint",
             "managedTorrentSourcePath",
             "torrentPayloadPaths",
             "shouldSeedAfterDownload",

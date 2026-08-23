@@ -184,6 +184,7 @@ final class DownloadCenter {
 
             downloads = restoredItems
             selectDownload(downloads.first?.id)
+            await backfillLegacyTorrentFingerprints()
             await reconcileRestoredTorrentSession()
             configureTorrentWatchFolder()
 
@@ -770,7 +771,9 @@ final class DownloadCenter {
             metadataName: request.mediaMetadata?.title,
             mediaMetadata: request.mediaMetadata,
             mediaFormatPreference: request.mediaFormatPreference,
-            torrentFingerprint: managedTorrentSource?.fingerprint,
+            torrentFingerprint: managedTorrentSource?.fingerprint
+                ?? Self.normalizedMagnetInfoHash(for: request),
+            torrentSourceFingerprint: managedTorrentSource?.sourceFingerprint,
             managedTorrentSourcePath: managedTorrentSource?.managedURL.path,
             shouldSeedAfterDownload: backend == .aria2 ? settings.seedNewTorrents : false
         )
@@ -814,7 +817,7 @@ final class DownloadCenter {
             }
 
             if let existingItem = downloads.first(where: {
-                $0.torrentFingerprint == managedSource.fingerprint
+                Self.torrentIdentity(for: $0) == managedSource.fingerprint
                     || ($0.torrentFingerprint == nil
                         && $0.sourceURL.isFileURL
                         && $0.sourceURL.standardizedFileURL == request.sourceURL.standardizedFileURL)
@@ -824,6 +827,14 @@ final class DownloadCenter {
                     activeAlert = UserAlert(
                         title: String(localized: "Torrent Already Added"),
                         message: String(localized: "This torrent is already in Harbor.")
+                    )
+                } else if existingItem.finishedAt != nil,
+                          Self.hasExistingTorrentPayload(existingItem) == false {
+                    activeAlert = UserAlert(
+                        title: String(localized: "Torrent Already Added"),
+                        message: String(
+                            localized: "Harbor kept the existing download history, but its completed files could not be found. No duplicate download was started."
+                        )
                     )
                 }
                 return
@@ -844,23 +855,66 @@ final class DownloadCenter {
     private func backfillLegacyTorrentFingerprints() async {
         var didMutate = false
 
-        for item in downloads where item.sourceKind == .torrentFile && item.torrentFingerprint == nil {
+        for item in downloads where item.sourceKind == .torrentFile {
             let candidateURL = item.managedTorrentSourcePath
                 .map(URL.init(fileURLWithPath:))
                 ?? item.sourceURL
             guard candidateURL.isFileURL,
                   FileManager.default.fileExists(atPath: candidateURL.path),
-                  let fingerprint = try? await managedTorrentSourceStore.fingerprint(forTorrentAt: candidateURL) else {
+                  let data = try? Data(contentsOf: candidateURL, options: .mappedIfSafe) else {
                 continue
             }
 
-            item.torrentFingerprint = fingerprint
-            didMutate = true
+            let fingerprint = ManagedTorrentSourceStore.fingerprint(for: data)
+            if item.torrentFingerprint != fingerprint {
+                item.torrentFingerprint = fingerprint
+                didMutate = true
+            }
+            let sourceFingerprint = ManagedTorrentSourceStore.sourceFingerprint(for: data)
+            if item.torrentSourceFingerprint != sourceFingerprint {
+                item.torrentSourceFingerprint = sourceFingerprint
+                didMutate = true
+            }
         }
 
         if didMutate {
             schedulePersist()
         }
+    }
+
+    private static func normalizedMagnetInfoHash(
+        for request: AddDownloadRequest
+    ) -> String? {
+        guard request.sourceKind == .magnetLink else {
+            return nil
+        }
+
+        return ManagedTorrentSourceStore.normalizedInfoHash(
+            MagnetLinkMetadata(url: request.sourceURL).infoHash
+        )
+    }
+
+    private static func torrentIdentity(for item: DownloadItem) -> String? {
+        if let torrentFingerprint = item.torrentFingerprint {
+            return torrentFingerprint.lowercased()
+        }
+
+        guard item.sourceKind == .magnetLink else {
+            return nil
+        }
+
+        return ManagedTorrentSourceStore.normalizedInfoHash(
+            MagnetLinkMetadata(url: item.sourceURL).infoHash
+        )
+    }
+
+    static func hasExistingTorrentPayload(_ item: DownloadItem) -> Bool {
+        let payloadPaths = item.torrentPayloadPaths.isEmpty
+            ? [item.fileLocationPath].compactMap { $0 }
+            : item.torrentPayloadPaths
+
+        return payloadPaths.isEmpty == false
+            && payloadPaths.allSatisfy { FileManager.default.fileExists(atPath: $0) }
     }
 
     private func backend(for sourceKind: DownloadSourceKind) -> DownloadBackend {
@@ -1234,9 +1288,9 @@ final class DownloadCenter {
             }
         }
 
-        guard let expectedFingerprint = item.torrentFingerprint,
+        guard let expectedFingerprint = item.torrentSourceFingerprint,
               let data = try? Data(contentsOf: item.sourceURL, options: .mappedIfSafe),
-              ManagedTorrentSourceStore.fingerprint(for: data) == expectedFingerprint else {
+              ManagedTorrentSourceStore.sourceFingerprint(for: data) == expectedFingerprint else {
             activeAlert = UserAlert(
                 title: String(localized: "Torrent File Was Left in Place"),
                 message: String(localized: "The torrent file changed after Harbor imported it, so Harbor left the current file untouched.")
@@ -1569,6 +1623,7 @@ final class DownloadCenter {
 
             item.sourceURL = managedSource.originalURL
             item.torrentFingerprint = managedSource.fingerprint
+            item.torrentSourceFingerprint = managedSource.sourceFingerprint
             item.managedTorrentSourcePath = managedSource.managedURL.path
             item.shouldSeedAfterDownload = true
             startOrQueueDownload(id: id)
@@ -2300,6 +2355,9 @@ final class DownloadCenter {
         item.speedBytesPerSecond = snapshot.downloadSpeed
         item.uploadBytesPerSecond = snapshot.uploadSpeed
         item.metadataName = snapshot.metadataName ?? item.metadataName
+        if let infoHash = ManagedTorrentSourceStore.normalizedInfoHash(snapshot.infoHash) {
+            item.torrentFingerprint = infoHash
+        }
         item.torrentPayloadPaths = snapshot.filePaths
         item.updatedAt = .now
 

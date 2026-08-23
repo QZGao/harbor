@@ -1,4 +1,5 @@
 import Darwin
+import CryptoKit
 import Foundation
 import XCTest
 @testable import Harbor
@@ -186,6 +187,159 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
             ).count,
             1
         )
+    }
+
+    func testTorrentFingerprintUsesInfoHashAcrossTrackerChanges() async throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborInfoHashTests-\(UUID().uuidString)", isDirectory: true)
+        let managedDirectoryURL = rootURL.appendingPathComponent("Managed", isDirectory: true)
+        try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: rootURL) }
+
+        let firstMetainfo = makeTorrentMetainfo(announceURL: "https://tracker-one.example/announce")
+        let secondMetainfo = makeTorrentMetainfo(announceURL: "https://tracker-two.example/announce")
+        let firstURL = rootURL.appendingPathComponent("first.torrent")
+        let secondURL = rootURL.appendingPathComponent("second.torrent")
+        try firstMetainfo.data.write(to: firstURL)
+        try secondMetainfo.data.write(to: secondURL)
+
+        let store = ManagedTorrentSourceStore(
+            fileManager: fileManager,
+            directoryURL: managedDirectoryURL
+        )
+        let first = try await store.prepareLocalTorrent(at: firstURL)
+        let second = try await store.prepareLocalTorrent(at: secondURL)
+        let expectedInfoHash = Insecure.SHA1.hash(data: firstMetainfo.infoDictionary)
+            .map { String(format: "%02x", $0) }
+            .joined()
+
+        XCTAssertNotEqual(firstMetainfo.data, secondMetainfo.data)
+        XCTAssertEqual(first.fingerprint, expectedInfoHash)
+        XCTAssertEqual(second.fingerprint, expectedInfoHash)
+        XCTAssertNotEqual(first.sourceFingerprint, second.sourceFingerprint)
+        XCTAssertEqual(first.managedURL, second.managedURL)
+        XCTAssertEqual(first.fingerprint.count, 40)
+        XCTAssertEqual(
+            ManagedTorrentSourceStore.normalizedInfoHash(String(repeating: "a", count: 32)),
+            String(repeating: "0", count: 40)
+        )
+    }
+
+    func testWatchedReimportAfterRelaunchPreservesCompletedTorrentRecordAndPayload() async throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborTorrentReimportTests-\(UUID().uuidString)", isDirectory: true)
+        let watchDirectoryURL = rootURL.appendingPathComponent("Watch", isDirectory: true)
+        let managedDirectoryURL = rootURL.appendingPathComponent("Managed", isDirectory: true)
+        let downloadDirectoryURL = rootURL.appendingPathComponent("Downloads", isDirectory: true)
+        try fileManager.createDirectory(at: watchDirectoryURL, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: managedDirectoryURL, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: downloadDirectoryURL, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: rootURL) }
+
+        let originalMetainfo = makeTorrentMetainfo(announceURL: "https://tracker-one.example/announce")
+        let reimportedMetainfo = makeTorrentMetainfo(announceURL: "https://tracker-two.example/announce")
+        let originalSourceURL = watchDirectoryURL.appendingPathComponent("original.torrent")
+        try originalMetainfo.data.write(to: originalSourceURL)
+
+        let legacyFingerprint = String(repeating: "f", count: 64)
+        let legacyManagedURL = managedDirectoryURL.appendingPathComponent("\(legacyFingerprint).torrent")
+        try originalMetainfo.data.write(to: legacyManagedURL)
+
+        let payloadURL = downloadDirectoryURL.appendingPathComponent("payload.bin")
+        let originalPayload = Data("completed payload must remain unchanged".utf8)
+        try originalPayload.write(to: payloadURL)
+
+        let originalID = UUID()
+        let finishedAt = Date.now.addingTimeInterval(-60)
+        let originalItem = DownloadItem(
+            id: originalID,
+            sourceURL: originalSourceURL,
+            sourceKind: .torrentFile,
+            backend: .aria2,
+            preferredFilename: nil,
+            destinationFolderPath: downloadDirectoryURL.path,
+            fileLocationPath: payloadURL.path,
+            status: .seeding,
+            progress: 1,
+            bytesWritten: Int64(originalPayload.count),
+            expectedBytes: Int64(originalPayload.count),
+            finishedAt: finishedAt,
+            metadataName: "Payload",
+            torrentFingerprint: legacyFingerprint,
+            managedTorrentSourcePath: legacyManagedURL.path,
+            torrentPayloadPaths: [payloadURL.path],
+            shouldSeedAfterDownload: true,
+            activityEvents: [
+                DownloadActivityEvent(kind: .added, timestamp: finishedAt.addingTimeInterval(-120)),
+                DownloadActivityEvent(kind: .completed, timestamp: finishedAt),
+                DownloadActivityEvent(kind: .seedingStarted, timestamp: finishedAt)
+            ]
+        )
+        let restoredItem = DownloadItem(record: originalItem.makeRecord())
+        let originalActivity = restoredItem.activityEvents
+
+        try fileManager.removeItem(at: originalSourceURL)
+        let reimportedSourceURL = watchDirectoryURL.appendingPathComponent("reimported.torrent")
+        try reimportedMetainfo.data.write(to: reimportedSourceURL)
+
+        let suiteName = "HarborTests.TorrentReimport.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        settings.startDownloadsAutomatically = true
+        settings.torrentDestinationPath = downloadDirectoryURL.path
+        let store = ManagedTorrentSourceStore(
+            fileManager: fileManager,
+            directoryURL: managedDirectoryURL
+        )
+        let center = DownloadCenter(
+            settings: settings,
+            managedTorrentSourceStore: store
+        )
+        center.downloads = [restoredItem]
+
+        center.receiveWatchedTorrent(reimportedSourceURL)
+
+        for _ in 0 ..< 80 where restoredItem.torrentFingerprint == legacyFingerprint {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+
+        let expectedInfoHash = Insecure.SHA1.hash(data: originalMetainfo.infoDictionary)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        XCTAssertEqual(center.downloads.count, 1)
+        XCTAssertEqual(center.downloads.first?.id, originalID)
+        XCTAssertEqual(restoredItem.torrentFingerprint, expectedInfoHash)
+        XCTAssertEqual(
+            restoredItem.torrentSourceFingerprint,
+            ManagedTorrentSourceStore.sourceFingerprint(for: originalMetainfo.data)
+        )
+        XCTAssertEqual(restoredItem.status, .seeding)
+        XCTAssertEqual(restoredItem.finishedAt, finishedAt)
+        XCTAssertEqual(restoredItem.activityEvents, originalActivity)
+        XCTAssertEqual(restoredItem.torrentPayloadPaths, [payloadURL.path])
+        XCTAssertNil(restoredItem.backendIdentifier)
+        XCTAssertNil(center.activeAlert)
+        XCTAssertEqual(try Data(contentsOf: payloadURL), originalPayload)
+        XCTAssertTrue(DownloadCenter.hasExistingTorrentPayload(restoredItem))
+
+        try fileManager.removeItem(at: payloadURL)
+        center.receiveWatchedTorrent(reimportedSourceURL)
+        for _ in 0 ..< 80 where center.activeAlert == nil {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+
+        XCTAssertEqual(center.downloads.count, 1)
+        XCTAssertEqual(center.downloads.first?.id, originalID)
+        XCTAssertEqual(center.activeAlert?.title, "Torrent Already Added")
+        XCTAssertTrue(center.activeAlert?.message.contains("No duplicate download was started") == true)
+        XCTAssertNil(restoredItem.backendIdentifier)
+        XCTAssertFalse(DownloadCenter.hasExistingTorrentPayload(restoredItem))
+
+        await center.shutdownForTermination()
     }
 
     func testCleanupFingerprintRejectsReplacementAtSamePath() async throws {
@@ -391,5 +545,35 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
                 payloadPaths: []
             )
         )
+    }
+
+    private func makeTorrentMetainfo(announceURL: String) -> (data: Data, infoDictionary: Data) {
+        var infoDictionary = Data([UInt8(ascii: "d")])
+        appendBencodedString("length", to: &infoDictionary)
+        infoDictionary.append(Data("i7e".utf8))
+        appendBencodedString("name", to: &infoDictionary)
+        appendBencodedString("payload.bin", to: &infoDictionary)
+        appendBencodedString("piece length", to: &infoDictionary)
+        infoDictionary.append(Data("i16384e".utf8))
+        appendBencodedString("pieces", to: &infoDictionary)
+        appendBencodedBytes(Data(repeating: 0x11, count: 20), to: &infoDictionary)
+        infoDictionary.append(UInt8(ascii: "e"))
+
+        var metainfo = Data([UInt8(ascii: "d")])
+        appendBencodedString("announce", to: &metainfo)
+        appendBencodedString(announceURL, to: &metainfo)
+        appendBencodedString("info", to: &metainfo)
+        metainfo.append(infoDictionary)
+        metainfo.append(UInt8(ascii: "e"))
+        return (metainfo, infoDictionary)
+    }
+
+    private func appendBencodedString(_ value: String, to data: inout Data) {
+        appendBencodedBytes(Data(value.utf8), to: &data)
+    }
+
+    private func appendBencodedBytes(_ value: Data, to data: inout Data) {
+        data.append(Data("\(value.count):".utf8))
+        data.append(value)
     }
 }

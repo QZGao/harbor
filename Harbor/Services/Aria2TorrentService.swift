@@ -768,6 +768,7 @@ actor Aria2TorrentService {
         if transferOptions?.verifyExistingData == true {
             options["check-integrity"] = "true"
             options["bt-hash-check-seed"] = "true"
+            options["allow-overwrite"] = "false"
             options["auto-file-renaming"] = "false"
         }
 

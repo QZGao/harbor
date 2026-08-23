@@ -127,6 +127,7 @@ struct DownloadRecord: Codable, Sendable {
     let downloadLimitOverride: TransferLimitOverride
     let uploadLimitOverride: TransferLimitOverride
     let torrentFingerprint: String?
+    let torrentSourceFingerprint: String?
     let managedTorrentSourcePath: String?
     let torrentPayloadPaths: [String]
     let shouldSeedAfterDownload: Bool
@@ -159,6 +160,7 @@ struct DownloadRecord: Codable, Sendable {
         case downloadLimitOverride
         case uploadLimitOverride
         case torrentFingerprint
+        case torrentSourceFingerprint
         case managedTorrentSourcePath
         case torrentPayloadPaths
         case shouldSeedAfterDownload
@@ -192,6 +194,7 @@ struct DownloadRecord: Codable, Sendable {
         downloadLimitOverride: TransferLimitOverride = .inherit,
         uploadLimitOverride: TransferLimitOverride = .inherit,
         torrentFingerprint: String? = nil,
+        torrentSourceFingerprint: String? = nil,
         managedTorrentSourcePath: String? = nil,
         torrentPayloadPaths: [String] = [],
         shouldSeedAfterDownload: Bool? = nil,
@@ -223,6 +226,7 @@ struct DownloadRecord: Codable, Sendable {
         self.downloadLimitOverride = downloadLimitOverride
         self.uploadLimitOverride = uploadLimitOverride
         self.torrentFingerprint = torrentFingerprint
+        self.torrentSourceFingerprint = torrentSourceFingerprint
         self.managedTorrentSourcePath = managedTorrentSourcePath
         self.torrentPayloadPaths = torrentPayloadPaths
         self.shouldSeedAfterDownload = shouldSeedAfterDownload
@@ -264,6 +268,7 @@ struct DownloadRecord: Codable, Sendable {
             forKey: .uploadLimitOverride
         ) ?? .inherit
         self.torrentFingerprint = try container.decodeIfPresent(String.self, forKey: .torrentFingerprint)
+        self.torrentSourceFingerprint = try container.decodeIfPresent(String.self, forKey: .torrentSourceFingerprint)
         self.managedTorrentSourcePath = try container.decodeIfPresent(String.self, forKey: .managedTorrentSourcePath)
         self.torrentPayloadPaths = try container.decodeIfPresent([String].self, forKey: .torrentPayloadPaths) ?? []
         self.shouldSeedAfterDownload = try container.decodeIfPresent(
@@ -311,6 +316,7 @@ struct DownloadRecord: Codable, Sendable {
         try container.encode(downloadLimitOverride, forKey: .downloadLimitOverride)
         try container.encode(uploadLimitOverride, forKey: .uploadLimitOverride)
         try container.encode(torrentFingerprint, forKey: .torrentFingerprint)
+        try container.encode(torrentSourceFingerprint, forKey: .torrentSourceFingerprint)
         try container.encode(managedTorrentSourcePath, forKey: .managedTorrentSourcePath)
         try container.encode(torrentPayloadPaths, forKey: .torrentPayloadPaths)
         try container.encode(shouldSeedAfterDownload, forKey: .shouldSeedAfterDownload)
@@ -359,6 +365,7 @@ final class DownloadItem: Identifiable {
     var downloadLimitOverride: TransferLimitOverride
     var uploadLimitOverride: TransferLimitOverride
     var torrentFingerprint: String?
+    var torrentSourceFingerprint: String?
     var managedTorrentSourcePath: String?
     var torrentPayloadPaths: [String]
     var shouldSeedAfterDownload: Bool
@@ -394,6 +401,7 @@ final class DownloadItem: Identifiable {
         downloadLimitOverride: TransferLimitOverride = .inherit,
         uploadLimitOverride: TransferLimitOverride = .inherit,
         torrentFingerprint: String? = nil,
+        torrentSourceFingerprint: String? = nil,
         managedTorrentSourcePath: String? = nil,
         torrentPayloadPaths: [String] = [],
         shouldSeedAfterDownload: Bool? = nil,
@@ -428,6 +436,7 @@ final class DownloadItem: Identifiable {
         self.downloadLimitOverride = downloadLimitOverride
         self.uploadLimitOverride = uploadLimitOverride
         self.torrentFingerprint = torrentFingerprint
+        self.torrentSourceFingerprint = torrentSourceFingerprint
         self.managedTorrentSourcePath = managedTorrentSourcePath
         self.torrentPayloadPaths = torrentPayloadPaths
         self.shouldSeedAfterDownload = shouldSeedAfterDownload
@@ -473,6 +482,7 @@ final class DownloadItem: Identifiable {
             downloadLimitOverride: record.downloadLimitOverride,
             uploadLimitOverride: record.uploadLimitOverride,
             torrentFingerprint: record.torrentFingerprint,
+            torrentSourceFingerprint: record.torrentSourceFingerprint,
             managedTorrentSourcePath: record.managedTorrentSourcePath,
             torrentPayloadPaths: record.torrentPayloadPaths,
             shouldSeedAfterDownload: record.shouldSeedAfterDownload,
@@ -679,6 +689,7 @@ final class DownloadItem: Identifiable {
             downloadLimitOverride: downloadLimitOverride,
             uploadLimitOverride: uploadLimitOverride,
             torrentFingerprint: torrentFingerprint,
+            torrentSourceFingerprint: torrentSourceFingerprint,
             managedTorrentSourcePath: managedTorrentSourcePath,
             torrentPayloadPaths: torrentPayloadPaths,
             shouldSeedAfterDownload: shouldSeedAfterDownload,
