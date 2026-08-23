@@ -30,6 +30,7 @@ struct TorrentStatusSnapshot: Sendable {
     let status: String
     let totalLength: Int64
     let completedLength: Int64
+    let uploadLength: Int64
     let downloadSpeed: Double
     let uploadSpeed: Double
     let isSeeder: Bool
@@ -62,17 +63,20 @@ struct TorrentTransferOptions: Equatable, Sendable {
     let downloadLimitBytesPerSecond: Int64?
     let uploadLimitBytesPerSecond: Int64?
     let shouldSeed: Bool
+    let seedRatioLimit: Double?
     let verifyExistingData: Bool
 
     init(
         downloadLimitBytesPerSecond: Int64?,
         uploadLimitBytesPerSecond: Int64?,
         shouldSeed: Bool,
+        seedRatioLimit: Double? = nil,
         verifyExistingData: Bool = false
     ) {
         self.downloadLimitBytesPerSecond = downloadLimitBytesPerSecond
         self.uploadLimitBytesPerSecond = uploadLimitBytesPerSecond
         self.shouldSeed = shouldSeed
+        self.seedRatioLimit = seedRatioLimit
         self.verifyExistingData = verifyExistingData
     }
 }
@@ -127,6 +131,7 @@ actor Aria2TorrentService {
         let status: String
         let totalLength: String?
         let completedLength: String?
+        let uploadLength: String?
         let downloadSpeed: String?
         let uploadSpeed: String?
         let seeder: String?
@@ -472,6 +477,7 @@ actor Aria2TorrentService {
                         "status",
                         "totalLength",
                         "completedLength",
+                        "uploadLength",
                         "downloadSpeed",
                         "uploadSpeed",
                         "seeder",
@@ -496,6 +502,7 @@ actor Aria2TorrentService {
             status: payload.status,
             totalLength: Int64(payload.totalLength ?? "") ?? 0,
             completedLength: Int64(payload.completedLength ?? "") ?? 0,
+            uploadLength: Int64(payload.uploadLength ?? "") ?? 0,
             downloadSpeed: Double(payload.downloadSpeed ?? "") ?? 0,
             uploadSpeed: Double(payload.uploadSpeed ?? "") ?? 0,
             isSeeder: payload.seeder == "true",
@@ -566,7 +573,8 @@ actor Aria2TorrentService {
             "--save-session-interval=5",
             "--force-save=true",
             "--bt-detach-seed-only=true",
-            // TODO: Replace indefinite seeding with per-torrent ratio/time policies when Harbor exposes those controls.
+            // Per-download options override this unlimited daemon default.
+            // TODO: Add per-torrent ratio overrides if one global preference becomes too limiting.
             "--seed-ratio=0.0",
             "--bt-save-metadata=true",
             "--bt-load-saved-metadata=true",
@@ -807,7 +815,7 @@ actor Aria2TorrentService {
 
         if let transferOptions {
             if transferOptions.shouldSeed {
-                options["seed-ratio"] = "0.0"
+                options["seed-ratio"] = aria2RatioString(transferOptions.seedRatioLimit)
             } else {
                 options["seed-time"] = "0"
             }
@@ -853,6 +861,14 @@ actor Aria2TorrentService {
         }
 
         return "\(max(bytesPerSecond, 0))"
+    }
+
+    nonisolated private static func aria2RatioString(_ ratio: Double?) -> String {
+        guard let ratio, ratio.isFinite, ratio > 0 else {
+            return "0.0"
+        }
+
+        return String(ratio)
     }
 
     private func isMissingGIDError(_ error: Error) -> Bool {

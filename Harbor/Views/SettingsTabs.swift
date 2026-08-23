@@ -82,9 +82,40 @@ struct TorrentsSettingsTab: View {
 
             Section("Seeding") {
                 Toggle("Seed new torrents after downloading", isOn: $settings.seedNewTorrents)
+
+                LabeledContent("Stop at Share Ratio") {
+                    HStack(spacing: 8) {
+                        Toggle("Stop at Share Ratio", isOn: $settings.stopSeedingAtRatioEnabled)
+                            .labelsHidden()
+
+                        TextField(
+                            "Ratio",
+                            value: $settings.stopSeedingRatio,
+                            format: .number.precision(.fractionLength(1...2))
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.trailing)
+                        .monospacedDigit()
+                        .frame(width: 72)
+                        .disabled(!settings.stopSeedingAtRatioEnabled)
+
+                        Text("ratio")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Text("Stops seeding after Harbor uploads the selected multiple of the torrent size.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
+        .onChange(of: settings.stopSeedingRatio) { _, value in
+            let clampedValue = AppSettingsStore.clampedSeedingRatio(value)
+            if clampedValue != value {
+                settings.stopSeedingRatio = clampedValue
+            }
+        }
     }
 }
 

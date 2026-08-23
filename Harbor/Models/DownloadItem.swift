@@ -114,6 +114,7 @@ struct DownloadRecord: Codable, Sendable {
     let progress: Double
     let bytesWritten: Int64
     let expectedBytes: Int64
+    let uploadedBytes: Int64
     let createdAt: Date
     let startedAt: Date?
     let finishedAt: Date?
@@ -147,6 +148,7 @@ struct DownloadRecord: Codable, Sendable {
         case progress
         case bytesWritten
         case expectedBytes
+        case uploadedBytes
         case createdAt
         case startedAt
         case finishedAt
@@ -181,6 +183,7 @@ struct DownloadRecord: Codable, Sendable {
         progress: Double,
         bytesWritten: Int64,
         expectedBytes: Int64,
+        uploadedBytes: Int64 = 0,
         createdAt: Date,
         startedAt: Date?,
         finishedAt: Date?,
@@ -213,6 +216,7 @@ struct DownloadRecord: Codable, Sendable {
         self.progress = progress
         self.bytesWritten = bytesWritten
         self.expectedBytes = expectedBytes
+        self.uploadedBytes = uploadedBytes
         self.createdAt = createdAt
         self.startedAt = startedAt
         self.finishedAt = finishedAt
@@ -249,6 +253,7 @@ struct DownloadRecord: Codable, Sendable {
         self.progress = try container.decodeIfPresent(Double.self, forKey: .progress) ?? 0
         self.bytesWritten = try container.decodeIfPresent(Int64.self, forKey: .bytesWritten) ?? 0
         self.expectedBytes = try container.decodeIfPresent(Int64.self, forKey: .expectedBytes) ?? 0
+        self.uploadedBytes = try container.decodeIfPresent(Int64.self, forKey: .uploadedBytes) ?? 0
         self.createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now
         self.startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt)
         self.finishedAt = try container.decodeIfPresent(Date.self, forKey: .finishedAt)
@@ -303,6 +308,7 @@ struct DownloadRecord: Codable, Sendable {
         try container.encode(progress, forKey: .progress)
         try container.encode(bytesWritten, forKey: .bytesWritten)
         try container.encode(expectedBytes, forKey: .expectedBytes)
+        try container.encode(uploadedBytes, forKey: .uploadedBytes)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(startedAt, forKey: .startedAt)
         try container.encode(finishedAt, forKey: .finishedAt)
@@ -350,6 +356,7 @@ final class DownloadItem: Identifiable {
     var progress: Double
     var bytesWritten: Int64
     var expectedBytes: Int64
+    var uploadedBytes: Int64
     var speedBytesPerSecond: Double
     var uploadBytesPerSecond: Double
     var startedAt: Date?
@@ -386,6 +393,7 @@ final class DownloadItem: Identifiable {
         progress: Double = 0,
         bytesWritten: Int64 = 0,
         expectedBytes: Int64 = 0,
+        uploadedBytes: Int64 = 0,
         speedBytesPerSecond: Double = 0,
         uploadBytesPerSecond: Double = 0,
         startedAt: Date? = nil,
@@ -421,6 +429,7 @@ final class DownloadItem: Identifiable {
         self.progress = progress
         self.bytesWritten = bytesWritten
         self.expectedBytes = expectedBytes
+        self.uploadedBytes = uploadedBytes
         self.speedBytesPerSecond = speedBytesPerSecond
         self.uploadBytesPerSecond = uploadBytesPerSecond
         self.startedAt = startedAt
@@ -467,6 +476,7 @@ final class DownloadItem: Identifiable {
             progress: record.progress,
             bytesWritten: record.bytesWritten,
             expectedBytes: record.expectedBytes,
+            uploadedBytes: record.uploadedBytes,
             speedBytesPerSecond: 0,
             uploadBytesPerSecond: 0,
             startedAt: record.startedAt,
@@ -620,6 +630,22 @@ final class DownloadItem: Identifiable {
         DownloadFormatting.progressString(bytesWritten: bytesWritten, expectedBytes: expectedBytes)
     }
 
+    var shareRatio: Double? {
+        guard isTorrent, expectedBytes > 0 else {
+            return nil
+        }
+
+        return Double(max(uploadedBytes, 0)) / Double(expectedBytes)
+    }
+
+    var shareRatioText: String {
+        DownloadFormatting.ratioString(shareRatio)
+    }
+
+    var uploadedText: String {
+        DownloadFormatting.byteString(uploadedBytes)
+    }
+
     var speedText: String {
         if speedBytesPerSecond > 0 {
             return DownloadFormatting.speedString(speedBytesPerSecond)
@@ -676,6 +702,7 @@ final class DownloadItem: Identifiable {
             progress: progress,
             bytesWritten: bytesWritten,
             expectedBytes: expectedBytes,
+            uploadedBytes: uploadedBytes,
             createdAt: createdAt,
             startedAt: startedAt,
             finishedAt: finishedAt,

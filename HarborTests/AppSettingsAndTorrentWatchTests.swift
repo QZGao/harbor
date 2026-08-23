@@ -19,6 +19,25 @@ final class AppSettingsAndTorrentWatchTests: XCTestCase {
         XCTAssertTrue(restoredSettings.preventSleepWhileDownloading)
     }
 
+    func testSeedingRatioLimitDefaultsOffAndPersists() {
+        let suiteName = "HarborTests.SeedingRatio.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        XCTAssertFalse(settings.stopSeedingAtRatioEnabled)
+        XCTAssertEqual(settings.stopSeedingRatio, 2)
+        XCTAssertNil(settings.seedingRatioLimit)
+
+        settings.stopSeedingRatio = 1.5
+        settings.stopSeedingAtRatioEnabled = true
+
+        let restoredSettings = AppSettingsStore(userDefaults: userDefaults)
+        XCTAssertTrue(restoredSettings.stopSeedingAtRatioEnabled)
+        XCTAssertEqual(restoredSettings.seedingRatioLimit, 1.5)
+    }
+
     func testStartAtLoginReflectsControllerStateAndFailures() {
         let controller = FakeLoginItemController(status: .disabled)
         let settings = AppSettingsStore(loginItemController: controller)
@@ -87,6 +106,9 @@ final class AppSettingsAndTorrentWatchTests: XCTestCase {
         XCTAssertFalse(settings.torrentWatchFolderEnabled)
         XCTAssertEqual(settings.torrentWatchFolderURL.standardizedFileURL, downloadsURL.standardizedFileURL)
         XCTAssertTrue(settings.seedNewTorrents)
+        XCTAssertFalse(settings.stopSeedingAtRatioEnabled)
+        XCTAssertEqual(settings.stopSeedingRatio, 2)
+        XCTAssertNil(settings.seedingRatioLimit)
         XCTAssertEqual(
             settings.torrentDestinationURL.standardizedFileURL,
             regularDestinationURL

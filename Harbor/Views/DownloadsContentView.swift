@@ -263,11 +263,19 @@ private struct DownloadTransferCell: View {
         VStack(alignment: .leading, spacing: 4) {
             progressView
 
-            Text(item.progressText)
+            Text(transferSummary)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
         }
+    }
+
+    private var transferSummary: String {
+        guard item.status == .seeding else {
+            return item.progressText
+        }
+
+        return "↑ \(item.uploadedText) • \(item.shareRatioText) ratio"
     }
 
     @ViewBuilder

@@ -55,6 +55,14 @@ enum DownloadFormatting {
         return String(format: template, byteString(bytesWritten), byteString(expectedBytes))
     }
 
+    static func ratioString(_ ratio: Double?) -> String {
+        guard let ratio, ratio.isFinite else {
+            return "—"
+        }
+
+        return ratio.formatted(.number.precision(.fractionLength(2)))
+    }
+
     static func dateString(_ date: Date?) -> String {
         guard let date else {
             return String(localized: "Not available", comment: "Date fallback status")

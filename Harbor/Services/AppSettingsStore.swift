@@ -31,6 +31,8 @@ final class AppSettingsStore {
         static let torrentWatchFolderPath = "torrentWatchFolderPath"
         static let torrentWatchFolderEnabled = "torrentWatchFolderEnabled"
         static let seedNewTorrents = "seedNewTorrents"
+        static let stopSeedingAtRatioEnabled = "stopSeedingAtRatioEnabled"
+        static let stopSeedingRatio = "stopSeedingRatio"
         static let maxConcurrentDownloads = "maxConcurrentDownloads"
         static let startDownloadsAutomatically = "startDownloadsAutomatically"
         static let notificationsEnabled = "notificationsEnabled"
@@ -49,6 +51,7 @@ final class AppSettingsStore {
     static let maxConcurrentDownloadsRange = 1 ... 16
     static let perDownloadConnectionCountRange = 1 ... 16
     static let speedLimitKilobytesRange = 1 ... 1_048_576
+    static let seedingRatioRange = 0.1 ... 100.0
 
     private let userDefaults: UserDefaults
     @ObservationIgnored private let loginItemController: any LoginItemControlling
@@ -86,6 +89,20 @@ final class AppSettingsStore {
         didSet {
             userDefaults.set(seedNewTorrents, forKey: Keys.seedNewTorrents)
             notifyTorrentAutomationSettingsChanged()
+        }
+    }
+
+    var stopSeedingAtRatioEnabled: Bool {
+        didSet {
+            userDefaults.set(stopSeedingAtRatioEnabled, forKey: Keys.stopSeedingAtRatioEnabled)
+            notifyTransferSettingsChanged()
+        }
+    }
+
+    var stopSeedingRatio: Double {
+        didSet {
+            userDefaults.set(stopSeedingRatio, forKey: Keys.stopSeedingRatio)
+            notifyTransferSettingsChanged()
         }
     }
 
@@ -215,6 +232,9 @@ final class AppSettingsStore {
         } else {
             self.seedNewTorrents = userDefaults.bool(forKey: Keys.seedNewTorrents)
         }
+        self.stopSeedingAtRatioEnabled = userDefaults.bool(forKey: Keys.stopSeedingAtRatioEnabled)
+        let storedSeedingRatio = userDefaults.double(forKey: Keys.stopSeedingRatio)
+        self.stopSeedingRatio = Self.clampedSeedingRatio(storedSeedingRatio == 0 ? 2.0 : storedSeedingRatio)
 
         let storedConcurrency = userDefaults.integer(forKey: Keys.maxConcurrentDownloads)
         self.maxConcurrentDownloads = Self.clamped(
@@ -338,6 +358,18 @@ final class AppSettingsStore {
 
     static func clampedSpeedLimitKilobytes(_ value: Int) -> Int {
         clamped(value, to: speedLimitKilobytesRange)
+    }
+
+    static func clampedSeedingRatio(_ value: Double) -> Double {
+        guard value.isFinite else {
+            return 2.0
+        }
+
+        return min(max(value, seedingRatioRange.lowerBound), seedingRatioRange.upperBound)
+    }
+
+    var seedingRatioLimit: Double? {
+        stopSeedingAtRatioEnabled ? Self.clampedSeedingRatio(stopSeedingRatio) : nil
     }
 
     func chooseDefaultDestination() {

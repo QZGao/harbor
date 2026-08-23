@@ -45,6 +45,27 @@ final class HarborModelAndSafetyTests: XCTestCase {
         )
     }
 
+    func testTorrentShareRatioPersistsWithUploadedBytes() throws {
+        let item = DownloadItem(
+            sourceURL: URL(fileURLWithPath: "/tmp/example.torrent"),
+            sourceKind: .torrentFile,
+            backend: .aria2,
+            preferredFilename: nil,
+            destinationFolderPath: "/tmp",
+            status: .seeding,
+            progress: 1,
+            bytesWritten: 1_000,
+            expectedBytes: 1_000,
+            uploadedBytes: 1_500
+        )
+
+        XCTAssertEqual(item.shareRatio, 1.5)
+
+        let restoredItem = DownloadItem(record: item.makeRecord())
+        XCTAssertEqual(restoredItem.uploadedBytes, 1_500)
+        XCTAssertEqual(restoredItem.shareRatio, 1.5)
+    }
+
     func testDownloadedTorrentHandoffReusesTheDirectDownloadRow() {
         let sourceURL = URL(string: "https://example.com/download?id=42")!
         let item = DownloadItem(
@@ -187,6 +208,17 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertEqual(options["max-connection-per-server"], "6")
         XCTAssertEqual(options["seed-ratio"], "0.0")
         XCTAssertNil(options["seed-time"])
+
+        let ratioLimitedOptions = Aria2TorrentService.perDownloadOptions(
+            settings,
+            transferOptions: TorrentTransferOptions(
+                downloadLimitBytesPerSecond: nil,
+                uploadLimitBytesPerSecond: nil,
+                shouldSeed: true,
+                seedRatioLimit: 2
+            )
+        )
+        XCTAssertEqual(ratioLimitedOptions["seed-ratio"], "2.0")
     }
 
     func testMediaDownloadArgumentsKeepAutomaticAndExactFormatPathsSeparate() throws {
@@ -561,6 +593,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             "torrentSourceFingerprint",
             "managedTorrentSourcePath",
             "torrentPayloadPaths",
+            "uploadedBytes",
             "shouldSeedAfterDownload",
             "removeOriginalTorrentAfterImport",
             "completionNotificationDelivered"

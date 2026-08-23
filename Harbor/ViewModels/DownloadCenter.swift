@@ -2149,6 +2149,7 @@ final class DownloadCenter {
                 inheriting: settings.transferSettings.perDownloadUploadSpeedLimitBytesPerSecond
             ),
             shouldSeed: item.shouldSeedAfterDownload,
+            seedRatioLimit: settings.seedingRatioLimit,
             verifyExistingData: item.finishedAt != nil
         )
     }
@@ -2348,6 +2349,7 @@ final class DownloadCenter {
         }
 
         item.bytesWritten = snapshot.completedLength
+        item.uploadedBytes = max(snapshot.uploadLength, 0)
         item.expectedBytes = max(snapshot.totalLength, 0)
         if snapshot.totalLength > 0 {
             item.progress = Double(snapshot.completedLength) / Double(snapshot.totalLength)
