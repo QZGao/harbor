@@ -82,28 +82,3 @@ enum DownloadFilter: String, CaseIterable, Identifiable, Hashable {
         }
     }
 }
-
-enum DownloadSortMode: String, CaseIterable, Identifiable {
-    case newest
-    case oldest
-    case name
-    case progress
-    case speed
-
-    var id: String { rawValue }
-
-    var title: LocalizedStringResource {
-        switch self {
-        case .newest:
-            LocalizedStringResource("sort.mode.newest", defaultValue: "Newest First")
-        case .oldest:
-            LocalizedStringResource("sort.mode.oldest", defaultValue: "Oldest First")
-        case .name:
-            LocalizedStringResource("sort.mode.name", defaultValue: "Name")
-        case .progress:
-            LocalizedStringResource("sort.mode.progress", defaultValue: "Progress")
-        case .speed:
-            LocalizedStringResource("sort.mode.speed", defaultValue: "Speed")
-        }
-    }
-}

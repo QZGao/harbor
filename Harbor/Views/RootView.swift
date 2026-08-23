@@ -252,19 +252,6 @@ private struct DownloadToolbarContent: ToolbarContent {
             }
             .disabled(center.selectedDownload == nil)
         }
-
-        ToolbarItem(placement: .primaryAction) {
-            Menu {
-                Picker("Sort", selection: $center.sortMode) {
-                    ForEach(DownloadSortMode.allCases) { sortMode in
-                        Text(sortMode.title).tag(sortMode)
-                    }
-                }
-            } label: {
-                Label("Sort", systemImage: "arrow.up.arrow.down.circle")
-            }
-            .disabled(center.downloads.isEmpty)
-        }
     }
 }
 

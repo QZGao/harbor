@@ -17,34 +17,35 @@ struct DownloadsContentView: View {
                 Table(
                     of: DownloadItem.self,
                     selection: $center.selectedDownloadIDs,
+                    sortOrder: $center.sortOrder,
                     columnCustomization: $columnCustomization
                 ) {
-                    TableColumn("Name") { item in
+                    TableColumn("Name", value: \.displayName) { item in
                         DownloadNameCell(item: item)
                     }
                     .customizationID("name")
                     .defaultVisibility(.visible)
                     .disabledCustomizationBehavior(.visibility)
 
-                    TableColumn("Status") { item in
+                    TableColumn("Status", value: \.status.rawValue) { item in
                         DownloadStatusBadge(status: item.status)
                     }
                     .customizationID("status")
                     .defaultVisibility(.visible)
 
-                    TableColumn("Transfer") { item in
+                    TableColumn("Transfer", value: \.progress) { item in
                         DownloadTransferCell(item: item)
                     }
                     .customizationID("transfer")
                     .defaultVisibility(.visible)
 
-                    TableColumn("Source") { item in
+                    TableColumn("Source", value: \.sourceDisplayText) { item in
                         DownloadSourceCell(item: item)
                     }
                     .customizationID("source")
                     .defaultVisibility(.visible)
 
-                    TableColumn("Speed") { item in
+                    TableColumn("Speed", value: \.displayedSpeedBytesPerSecond) { item in
                         Text(
                             item.status == .seeding
                                 ? DownloadFormatting.throughputString(item.uploadBytesPerSecond)
@@ -55,7 +56,7 @@ struct DownloadsContentView: View {
                     .customizationID("speed")
                     .defaultVisibility(.visible)
 
-                    TableColumn("Updated") { item in
+                    TableColumn("Updated", value: \.updatedAt) { item in
                         Text(DownloadFormatting.dateString(item.updatedAt))
                             .font(.caption)
                     }

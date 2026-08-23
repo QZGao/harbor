@@ -52,7 +52,7 @@ final class DownloadCenter {
             pruneSelectionToVisibleDownloads()
         }
     }
-    var sortMode: DownloadSortMode = .newest
+    var sortOrder = [KeyPathComparator(\DownloadItem.updatedAt, order: .reverse)]
     var addSheetDraft: AddDownloadSheetDraft?
     var activeBrowserSession: BrowserDownloadSession?
     var activeAlert: UserAlert?
@@ -283,24 +283,7 @@ final class DownloadCenter {
                 || item.sourceHost.localizedCaseInsensitiveContains(query)
         }
 
-        switch sortMode {
-        case .newest:
-            return filtered.sorted { $0.createdAt > $1.createdAt }
-        case .oldest:
-            return filtered.sorted { $0.createdAt < $1.createdAt }
-        case .name:
-            return filtered.sorted {
-                $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
-            }
-        case .progress:
-            return filtered.sorted { lhs, rhs in
-                (lhs.progressValue ?? 0) > (rhs.progressValue ?? 0)
-            }
-        case .speed:
-            return filtered.sorted { lhs, rhs in
-                lhs.speedBytesPerSecond > rhs.speedBytesPerSecond
-            }
-        }
+        return filtered.sorted(using: sortOrder)
     }
 
     var selectedDownload: DownloadItem? {

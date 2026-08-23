@@ -659,6 +659,10 @@ final class DownloadItem: Identifiable {
         }
     }
 
+    var displayedSpeedBytesPerSecond: Double {
+        status == .seeding ? uploadBytesPerSecond : speedBytesPerSecond
+    }
+
     var etaText: String? {
         DownloadFormatting.etaString(
             bytesRemaining: max(expectedBytes - bytesWritten, 0),
