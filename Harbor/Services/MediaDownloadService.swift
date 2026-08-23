@@ -438,6 +438,7 @@ actor MediaDownloadService {
             "--ignore-config",
             "--no-cache-dir",
             "--newline",
+            "--progress",
             "--continue",
             "--no-overwrites",
             "--socket-timeout",

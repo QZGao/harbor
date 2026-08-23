@@ -220,6 +220,8 @@ final class HarborModelAndSafetyTests: XCTestCase {
 
         let limitIndex = try XCTUnwrap(limitedArguments.firstIndex(of: "--limit-rate"))
         XCTAssertEqual(limitedArguments[limitedArguments.index(after: limitIndex)], "345678")
+        XCTAssertTrue(limitedArguments.contains("--progress"))
+        XCTAssertTrue(unlimitedArguments.contains("--progress"))
         XCTAssertFalse(unlimitedArguments.contains("--limit-rate"))
         XCTAssertFalse(limitedArguments.contains("--format"))
         XCTAssertFalse(unlimitedArguments.contains("--format"))
