@@ -678,9 +678,11 @@ private struct DownloadActionRow: View {
                 Button("Stop Seeding", systemImage: "stop.fill", role: .destructive, action: stopSeeding)
             }
         } label: {
-            Label("More", systemImage: "ellipsis")
+            Image(systemName: "ellipsis")
+                .accessibilityLabel("More actions")
         }
         .buttonStyle(LiquidPillButtonStyle(prominent: false))
+        .help("More actions")
     }
 }
 
