@@ -220,10 +220,18 @@ private struct DownloadToolbarContent: ToolbarContent {
 
         ToolbarItem(placement: .primaryAction) {
             Menu {
-                Picker("Traffic Mode", selection: $settings.trafficMode) {
-                    ForEach(TrafficMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
-                    }
+                ForEach(TrafficMode.allCases) { mode in
+                    Toggle(
+                        mode.title,
+                        isOn: Binding(
+                            get: { settings.trafficMode == mode },
+                            set: { isSelected in
+                                if isSelected {
+                                    settings.trafficMode = mode
+                                }
+                            }
+                        )
+                    )
                 }
 
                 Divider()
