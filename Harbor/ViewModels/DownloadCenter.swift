@@ -518,8 +518,9 @@ final class DownloadCenter {
         }
 
         hasInstalledExternalOpenHandler = true
-        ExternalAddDownloadOpenCoordinator.shared.installHandler { [weak self] urls in
+        ExternalAddDownloadOpenCoordinator.shared.installHandler { [weak self] urls, errorMessages in
             self?.handleOpenedExternalAddSources(urls)
+            self?.handleExternalOpenErrors(errorMessages)
         }
     }
 
@@ -598,6 +599,17 @@ final class DownloadCenter {
 
         pendingExternalAddSheetDrafts.append(contentsOf: drafts)
         presentNextQueuedExternalAddSheetIfNeeded()
+    }
+
+    private func handleExternalOpenErrors(_ errorMessages: [String]) {
+        guard errorMessages.isEmpty == false else {
+            return
+        }
+
+        activeAlert = UserAlert(
+            title: String(localized: "Couldn’t Open Harbor Link"),
+            message: errorMessages.joined(separator: "\n")
+        )
     }
 
     func receiveExternalAddSources(_ urls: [URL]) {
@@ -3107,13 +3119,13 @@ final class DownloadCenter {
             )
         case .torrentFile:
             makeExternalTorrentDraft(for: url)
-        case .directURL:
+        case .directURL, .mediaURL:
             AddDownloadSheetDraft.linkOrMagnet(
                 url,
                 destinationFolderURL: settings.defaultDestinationURL,
                 shouldStartImmediately: settings.startDownloadsAutomatically
             )
-        case .mediaURL, nil:
+        case nil:
             nil
         }
     }

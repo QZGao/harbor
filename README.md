@@ -70,6 +70,22 @@ Or download the latest DMG:
 
 Once installed, Harbor can check for new versions from the app menu and update through its built-in Sparkle updater.
 
+## URL handoff
+
+Browser extensions, command-line tools, and automations can open Harbor with an HTTP or HTTPS download URL:
+
+```text
+harbor://download?url=https%3A%2F%2Fexample.com%2Ffile.zip
+```
+
+Percent-encode the download URL as the `url` query value. On macOS, you can test the handoff with `open`:
+
+```sh
+open 'harbor://download?url=https%3A%2F%2Fexample.com%2Ffile.zip'
+```
+
+Harbor opens its Add Download sheet with the link filled in. The user can confirm the destination and start the download.
+
 ## Philosophy
 
 Harbor is opinionated about being a real macOS app:

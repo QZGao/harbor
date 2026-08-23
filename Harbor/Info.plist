@@ -28,6 +28,16 @@
 				<string>magnet</string>
 			</array>
 		</dict>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLName</key>
+			<string>co.hapy.harbor.handoff</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>harbor</string>
+			</array>
+		</dict>
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>

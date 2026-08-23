@@ -4,6 +4,30 @@ import XCTest
 
 @MainActor
 final class HarborModelAndSafetyTests: XCTestCase {
+    func testHarborURLSchemeIsRegistered() throws {
+        let urlTypes = try XCTUnwrap(
+            Bundle.main.object(forInfoDictionaryKey: "CFBundleURLTypes") as? [[String: Any]]
+        )
+        let schemes = urlTypes
+            .compactMap { $0["CFBundleURLSchemes"] as? [String] }
+            .flatMap { $0 }
+
+        XCTAssertTrue(schemes.contains("harbor"))
+    }
+
+    func testExternalHTTPSourcePrefillsAddSheetWithDefaultDestination() throws {
+        let settings = HarborPreviewFixtures.makeSettings()
+        let center = DownloadCenter(settings: settings)
+        let sourceURL = try XCTUnwrap(URL(string: "https://example.com/file.zip"))
+
+        center.receiveExternalAddSources([sourceURL])
+
+        let draft = try XCTUnwrap(center.addSheetDraft)
+        XCTAssertEqual(draft.entryMode, .linkOrMagnet)
+        XCTAssertEqual(draft.sourceURLText, sourceURL.absoluteString)
+        XCTAssertEqual(draft.destinationFolderURL, settings.defaultDestinationURL)
+    }
+
     func testDownloadedPayloadClassifierDetectsTorrentResponses() {
         let extensionlessURL = URL(string: "https://example.com/download?id=42")!
 
