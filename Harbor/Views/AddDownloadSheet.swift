@@ -3,7 +3,7 @@ import SwiftUI
 
 struct AddDownloadSheet: View {
     private enum Layout {
-        static let groupedFormHorizontalInset: CGFloat = 40
+        static let groupedFormHorizontalExpansion: CGFloat = 20
     }
 
     private enum Field: Hashable {
@@ -115,7 +115,7 @@ struct AddDownloadSheet: View {
                 Toggle("Start immediately", isOn: $shouldStartImmediately)
             }
             .formStyle(.grouped)
-            .padding(.horizontal, -Layout.groupedFormHorizontalInset)
+            .padding(.horizontal, -Layout.groupedFormHorizontalExpansion)
 
             if let validationMessage {
                 Text(validationMessage)
