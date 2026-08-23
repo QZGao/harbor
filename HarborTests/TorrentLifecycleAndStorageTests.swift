@@ -136,6 +136,8 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
             withIntermediateDirectories: true
         )
         try Data("downloaded payload".utf8).write(to: payloadURL)
+        let controlURL = URL(fileURLWithPath: payloadURL.path + ".aria2")
+        try Data("aria2 control data".utf8).write(to: controlURL)
         item.torrentPayloadPaths = [payloadURL.path]
 
         XCTAssertTrue(fileManager.fileExists(atPath: torrentURL.path))
@@ -144,7 +146,140 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
 
         XCTAssertTrue(center.downloads.isEmpty)
         XCTAssertFalse(fileManager.fileExists(atPath: torrentURL.path))
+        XCTAssertFalse(fileManager.fileExists(atPath: controlURL.path))
         XCTAssertTrue(fileManager.fileExists(atPath: payloadURL.path))
+    }
+
+    func testMagnetSidecarsAreHiddenAndRemovedWithoutDeletingPayload() async throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborTorrentSidecarTests-\(UUID().uuidString)", isDirectory: true)
+        let managedDirectoryURL = rootURL.appendingPathComponent("Application Support", isDirectory: true)
+        try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: rootURL) }
+
+        let metainfo = makeTorrentMetainfo(announceURL: "https://tracker.example/announce")
+        let infoHash = Insecure.SHA1.hash(data: metainfo.infoDictionary)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let metadataURL = rootURL.appendingPathComponent("\(infoHash).torrent")
+        try metainfo.data.write(to: metadataURL)
+
+        let payloadURL = rootURL.appendingPathComponent("payload.bin")
+        try Data("downloaded payload".utf8).write(to: payloadURL)
+        let controlURL = URL(fileURLWithPath: payloadURL.path + ".aria2")
+        try Data("aria2 control data".utf8).write(to: controlURL)
+        let multiFileRootURL = rootURL.appendingPathComponent("Movie Folder", isDirectory: true)
+        try fileManager.createDirectory(at: multiFileRootURL, withIntermediateDirectories: true)
+        let firstMoviePartURL = multiFileRootURL.appendingPathComponent("movie.mkv")
+        let subtitleURL = multiFileRootURL.appendingPathComponent("movie.srt")
+        try Data("movie data".utf8).write(to: firstMoviePartURL)
+        try Data("subtitle data".utf8).write(to: subtitleURL)
+        let multiFileControlURL = URL(fileURLWithPath: multiFileRootURL.path + ".aria2")
+        try Data("multi-file aria2 control data".utf8).write(to: multiFileControlURL)
+        let unrelatedURL = rootURL.appendingPathComponent("unrelated.aria2")
+        try Data("keep this file".utf8).write(to: unrelatedURL)
+
+        let service = TorrentSidecarFileService(fileManager: fileManager)
+        let context = TorrentSidecarContext(
+            destinationFolderURL: rootURL,
+            sourceKind: .magnetLink,
+            torrentFingerprint: infoHash,
+            fileLocationURL: multiFileRootURL,
+            payloadURLs: [payloadURL, firstMoviePartURL, subtitleURL]
+        )
+
+        service.hideExistingSidecars(for: context)
+
+        XCTAssertTrue(fileManager.fileExists(atPath: metadataURL.path))
+        XCTAssertTrue(fileManager.fileExists(atPath: controlURL.path))
+        XCTAssertTrue(fileManager.fileExists(atPath: multiFileControlURL.path))
+        XCTAssertEqual(
+            try metadataURL.resourceValues(forKeys: [.isHiddenKey]).isHidden,
+            true
+        )
+        XCTAssertEqual(
+            try controlURL.resourceValues(forKeys: [.isHiddenKey]).isHidden,
+            true
+        )
+        XCTAssertEqual(
+            try multiFileControlURL.resourceValues(forKeys: [.isHiddenKey]).isHidden,
+            true
+        )
+        XCTAssertNotEqual(
+            try unrelatedURL.resourceValues(forKeys: [.isHiddenKey]).isHidden,
+            true
+        )
+
+        let store = ManagedTorrentSourceStore(
+            fileManager: fileManager,
+            directoryURL: managedDirectoryURL
+        )
+        let managedSource = try await store.prepareLocalTorrent(
+            at: metadataURL,
+            originalURL: URL(string: "magnet:?xt=urn:btih:\(infoHash)")!
+        )
+
+        try service.removeExistingSidecars(for: context)
+
+        XCTAssertFalse(fileManager.fileExists(atPath: metadataURL.path))
+        XCTAssertFalse(fileManager.fileExists(atPath: controlURL.path))
+        XCTAssertFalse(fileManager.fileExists(atPath: multiFileControlURL.path))
+        XCTAssertTrue(fileManager.fileExists(atPath: managedSource.managedURL.path))
+        XCTAssertTrue(managedSource.managedURL.path.hasPrefix(managedDirectoryURL.path))
+        XCTAssertTrue(fileManager.fileExists(atPath: payloadURL.path))
+        XCTAssertTrue(fileManager.fileExists(atPath: firstMoviePartURL.path))
+        XCTAssertTrue(fileManager.fileExists(atPath: subtitleURL.path))
+        XCTAssertTrue(fileManager.fileExists(atPath: unrelatedURL.path))
+    }
+
+    func testSidecarCleanupRejectsUnrelatedHashNamedTorrent() throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborUnrelatedTorrentTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: rootURL) }
+
+        let unrelatedFingerprint = String(repeating: "a", count: 40)
+        let unrelatedTorrentURL = rootURL.appendingPathComponent("\(unrelatedFingerprint).torrent")
+        let unrelatedMetainfo = makeTorrentMetainfo(announceURL: "https://unrelated.example/announce")
+        try unrelatedMetainfo.data.write(to: unrelatedTorrentURL)
+
+        let service = TorrentSidecarFileService(fileManager: fileManager)
+        let context = TorrentSidecarContext(
+            destinationFolderURL: rootURL,
+            sourceKind: .magnetLink,
+            torrentFingerprint: unrelatedFingerprint,
+            fileLocationURL: nil,
+            payloadURLs: []
+        )
+
+        service.hideExistingSidecars(for: context)
+        try service.removeExistingSidecars(for: context)
+
+        XCTAssertTrue(fileManager.fileExists(atPath: unrelatedTorrentURL.path))
+        XCTAssertNotEqual(
+            try unrelatedTorrentURL.resourceValues(forKeys: [.isHiddenKey]).isHidden,
+            true
+        )
+    }
+
+    func testExistingDataRecoveryDisablesAutomaticRenaming() {
+        let options = Aria2TorrentService.downloadOptions(
+            destinationFolderPath: "/tmp/HarborExistingDataTest",
+            transferSettings: .default,
+            transferOptions: TorrentTransferOptions(
+                downloadLimitBytesPerSecond: nil,
+                uploadLimitBytesPerSecond: nil,
+                shouldSeed: true,
+                verifyExistingData: true
+            )
+        )
+
+        XCTAssertEqual(options["check-integrity"], "true")
+        XCTAssertEqual(options["bt-hash-check-seed"], "true")
+        XCTAssertEqual(options["allow-overwrite"], "false")
+        XCTAssertEqual(options["auto-file-renaming"], "false")
     }
 
     func testPrepareLocalTorrentCreatesStableDeduplicatedManagedCopy() async throws {
@@ -443,6 +578,32 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
                 persistedStatus: .paused,
                 hasFinishedData: true,
                 shouldSeed: true
+            )
+        )
+        XCTAssertFalse(
+            DownloadCenter.shouldRestartStaleSeeder(
+                persistedStatus: .completed,
+                hasFinishedData: true,
+                shouldSeed: false
+            )
+        )
+
+        XCTAssertTrue(
+            DownloadCenter.shouldHideRestoredTorrentSidecars(
+                backend: .aria2,
+                status: .paused
+            )
+        )
+        XCTAssertTrue(
+            DownloadCenter.shouldHideRestoredTorrentSidecars(
+                backend: .aria2,
+                status: .seeding
+            )
+        )
+        XCTAssertFalse(
+            DownloadCenter.shouldHideRestoredTorrentSidecars(
+                backend: .aria2,
+                status: .completed
             )
         )
     }

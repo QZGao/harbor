@@ -98,6 +98,18 @@ actor ManagedTorrentSourceStore {
         return currentFingerprint == fingerprint
     }
 
+    func containsManagedTorrent(at sourceURL: URL, matching fingerprint: String) -> Bool {
+        let directory = directoryURL.standardizedFileURL
+        let candidate = sourceURL.standardizedFileURL
+        let directoryPath = directory.path.hasSuffix("/") ? directory.path : directory.path + "/"
+
+        guard candidate.path.hasPrefix(directoryPath) else {
+            return false
+        }
+
+        return torrent(at: candidate, matches: fingerprint)
+    }
+
     nonisolated static func fingerprint(for data: Data) -> String {
         if let infoDictionaryRange = TorrentMetainfoParser.infoDictionaryRange(in: data) {
             return Insecure.SHA1.hash(data: data[infoDictionaryRange])

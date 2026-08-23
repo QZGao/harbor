@@ -11,6 +11,7 @@ final class DownloadCenter {
     @ObservationIgnored private let notificationService: DownloadNotificationService
     @ObservationIgnored private let dataRemovalService: DownloadDataRemovalService
     @ObservationIgnored private let managedTorrentSourceStore: ManagedTorrentSourceStore
+    @ObservationIgnored private let torrentSidecarFileService: TorrentSidecarFileService
     @ObservationIgnored private let torrentWatchFolderService: TorrentWatchFolderService
     @ObservationIgnored private let sleepPreventionService: any DownloadSleepPreventing
     @ObservationIgnored private let quickLookPreviewService: any QuickLookPreviewing
@@ -64,6 +65,7 @@ final class DownloadCenter {
         notificationService: DownloadNotificationService = DownloadNotificationService(),
         dataRemovalService: DownloadDataRemovalService = DownloadDataRemovalService(),
         managedTorrentSourceStore: ManagedTorrentSourceStore = ManagedTorrentSourceStore(),
+        torrentSidecarFileService: TorrentSidecarFileService = TorrentSidecarFileService(),
         torrentWatchFolderService: TorrentWatchFolderService? = nil,
         sleepPreventionService: (any DownloadSleepPreventing)? = nil,
         quickLookPreviewService: (any QuickLookPreviewing)? = nil,
@@ -76,6 +78,7 @@ final class DownloadCenter {
         self.notificationService = notificationService
         self.dataRemovalService = dataRemovalService
         self.managedTorrentSourceStore = managedTorrentSourceStore
+        self.torrentSidecarFileService = torrentSidecarFileService
         self.torrentWatchFolderService = torrentWatchFolderService ?? TorrentWatchFolderService()
         self.sleepPreventionService = sleepPreventionService ?? DownloadSleepPreventionService()
         self.quickLookPreviewService = quickLookPreviewService ?? QuickLookPreviewService()
@@ -183,6 +186,12 @@ final class DownloadCenter {
                 }
 
             downloads = restoredItems
+            for item in restoredItems where Self.shouldHideRestoredTorrentSidecars(
+                backend: item.backend,
+                status: item.status
+            ) {
+                torrentSidecarFileService.hideExistingSidecars(for: torrentSidecarContext(for: item))
+            }
             selectDownload(downloads.first?.id)
             await backfillLegacyTorrentFingerprints()
             await reconcileRestoredTorrentSession()
@@ -1229,6 +1238,10 @@ final class DownloadCenter {
             return
         }
 
+        let torrentSidecarContext = item.backend == .aria2
+            ? torrentSidecarContext(for: item)
+            : nil
+
         let shouldWaitForMediaProcess = item.backend == .ytDlp
             && (item.backendIdentifier != nil || mediaStartTasks[id] != nil)
 
@@ -1243,9 +1256,23 @@ final class DownloadCenter {
             }
         case .aria2:
             if let backendIdentifier = item.backendIdentifier {
-                Task {
-                    await torrentService.remove(gid: backendIdentifier)
+                Task { @MainActor [weak self] in
+                    guard let self else {
+                        return
+                    }
+
+                    do {
+                        try await torrentService.removeAndConfirmStopped(gid: backendIdentifier)
+                        removeTorrentSidecars(torrentSidecarContext)
+                    } catch {
+                        activeAlert = UserAlert(
+                            title: String(localized: "Couldn’t Remove Torrent Support Files"),
+                            message: error.localizedDescription
+                        )
+                    }
                 }
+            } else {
+                removeTorrentSidecars(torrentSidecarContext)
             }
         case .ytDlp:
             Task {
@@ -1313,7 +1340,7 @@ final class DownloadCenter {
 
     func clearCompleted() {
         let completedItems = downloads.filter { $0.status == .completed }
-        cleanupBackendIdentifiers(for: completedItems)
+        cleanupBackendArtifacts(for: completedItems)
         completedItems.forEach { moveOriginalTorrentFileToTrashIfNeeded(for: $0) }
         completedItems.forEach { removeManagedTorrentSourceIfNeeded(for: $0) }
         downloads.removeAll { $0.status == .completed }
@@ -1328,7 +1355,7 @@ final class DownloadCenter {
 
     func clearFailed() {
         let failedItems = downloads.filter { $0.status == .failed }
-        cleanupBackendIdentifiers(for: failedItems)
+        cleanupBackendArtifacts(for: failedItems)
         failedItems.forEach { moveOriginalTorrentFileToTrashIfNeeded(for: $0) }
         failedItems.forEach { removeManagedTorrentSourceIfNeeded(for: $0) }
         downloads.removeAll { $0.status == .failed }
@@ -1518,9 +1545,13 @@ final class DownloadCenter {
             return
         }
 
-        let existingManagedSource = item.managedTorrentSourcePath.map(URL.init(fileURLWithPath:))
-        if let existingManagedSource,
-           FileManager.default.fileExists(atPath: existingManagedSource.path) {
+        if existingManagedTorrentSourceURL(for: item) != nil {
+            item.shouldSeedAfterDownload = true
+            startOrQueueDownload(id: id)
+            return
+        }
+
+        if item.sourceKind == .magnetLink {
             item.shouldSeedAfterDownload = true
             startOrQueueDownload(id: id)
             return
@@ -1596,6 +1627,7 @@ final class DownloadCenter {
         item.updatedAt = .now
         item.status = .completed
         item.recordActivity(.seedingStopped)
+        removeTorrentControlFiles(for: item)
         schedulePersist()
         startNextQueuedDownloadsIfNeeded()
     }
@@ -1919,7 +1951,7 @@ final class DownloadCenter {
 
                     refreshedItem.backendIdentifier = nil
                     let replacementIdentifier = try await torrentService.addDownload(
-                        sourceKind: refreshedItem.sourceKind,
+                        sourceKind: torrentEngineSourceKind(for: refreshedItem),
                         sourceURL: torrentEngineSourceURL(for: refreshedItem),
                         destinationFolderPath: refreshedItem.destinationFolderPath,
                         transferOptions: torrentTransferOptions(for: refreshedItem)
@@ -1934,7 +1966,7 @@ final class DownloadCenter {
                 }
             } else {
                 let backendIdentifier = try await torrentService.addDownload(
-                    sourceKind: currentItem.sourceKind,
+                    sourceKind: torrentEngineSourceKind(for: currentItem),
                     sourceURL: torrentEngineSourceURL(for: currentItem),
                     destinationFolderPath: currentItem.destinationFolderPath,
                     transferOptions: torrentTransferOptions(for: currentItem)
@@ -2022,6 +2054,9 @@ final class DownloadCenter {
                 if item.backendIdentifier == backendIdentifier {
                     item.backendIdentifier = nil
                 }
+                if item.status == .completed {
+                    removeTorrentControlFiles(for: item)
+                }
             } catch {
                 item.backendIdentifier = backendIdentifier
                 item.lastError = error.localizedDescription
@@ -2043,11 +2078,20 @@ final class DownloadCenter {
     }
 
     private func torrentEngineSourceURL(for item: DownloadItem) -> URL {
+        existingManagedTorrentSourceURL(for: item) ?? item.sourceURL
+    }
+
+    private func torrentEngineSourceKind(for item: DownloadItem) -> DownloadSourceKind {
+        existingManagedTorrentSourceURL(for: item) == nil ? item.sourceKind : .torrentFile
+    }
+
+    private func existingManagedTorrentSourceURL(for item: DownloadItem) -> URL? {
         guard let managedTorrentSourcePath = item.managedTorrentSourcePath else {
-            return item.sourceURL
+            return nil
         }
 
-        return URL(fileURLWithPath: managedTorrentSourcePath)
+        let managedURL = URL(fileURLWithPath: managedTorrentSourcePath)
+        return FileManager.default.fileExists(atPath: managedURL.path) ? managedURL : nil
     }
 
     private func pauseDownload(id: UUID) {
@@ -2290,6 +2334,21 @@ final class DownloadCenter {
         persistedStatus == .seeding && hasFinishedData && shouldSeed
     }
 
+    nonisolated static func shouldHideRestoredTorrentSidecars(
+        backend: DownloadBackend,
+        status: DownloadStatus
+    ) -> Bool {
+        guard backend == .aria2 else {
+            return false
+        }
+
+        return status == .queued
+            || status == .preparing
+            || status == .downloading
+            || status == .paused
+            || status == .seeding
+    }
+
     nonisolated static func shouldRepairMetadataOnlyMagnetCompletion(
         sourceKind: DownloadSourceKind,
         status: DownloadStatus,
@@ -2326,8 +2385,17 @@ final class DownloadCenter {
             item.speedBytesPerSecond = snapshot.downloadSpeed
             item.uploadBytesPerSecond = snapshot.uploadSpeed
             item.metadataName = snapshot.metadataName ?? item.metadataName
+            if let infoHash = ManagedTorrentSourceStore.normalizedInfoHash(snapshot.infoHash) {
+                item.torrentFingerprint = infoHash
+            }
+            item.torrentPayloadPaths = snapshot.filePaths
+            if let primaryPath = snapshot.primaryPath {
+                item.fileLocationPath = primaryPath
+            }
             item.updatedAt = .now
             item.lastError = nil
+            torrentSidecarFileService.hideExistingSidecars(for: torrentSidecarContext(for: item))
+            await privatizeMagnetMetadataIfNeeded(for: item)
             if item.status != .paused {
                 setStatus(for: item, to: .downloading)
             }
@@ -2361,6 +2429,9 @@ final class DownloadCenter {
         if let primaryPath = snapshot.primaryPath {
             item.fileLocationPath = primaryPath
         }
+
+        torrentSidecarFileService.hideExistingSidecars(for: torrentSidecarContext(for: item))
+        await privatizeMagnetMetadataIfNeeded(for: item)
 
         switch snapshot.status {
         case "active":
@@ -2396,15 +2467,22 @@ final class DownloadCenter {
             item.speedBytesPerSecond = 0
             item.uploadBytesPerSecond = 0
             let gid = lineage.rootGID
-            item.backendIdentifier = nil
             if item.finishedAt != nil {
                 item.shouldSeedAfterDownload = false
+                do {
+                    try await torrentService.removeAndConfirmStopped(gid: gid)
+                    item.backendIdentifier = nil
+                    removeTorrentControlFiles(for: item)
+                } catch {
+                    item.backendIdentifier = gid
+                }
                 setStatus(for: item, to: .completed)
             } else {
+                item.backendIdentifier = nil
                 transitionStatus(for: item, to: .failed)
-            }
-            Task {
-                await torrentService.remove(gid: gid)
+                Task {
+                    await torrentService.remove(gid: gid)
+                }
             }
             startNextQueuedDownloadsIfNeeded()
 
@@ -2446,20 +2524,75 @@ final class DownloadCenter {
             setStatus(for: item, to: .seeding)
         } else {
             item.uploadBytesPerSecond = 0
-            item.backendIdentifier = nil
-            if didCompleteNow {
-                setStatus(for: item, to: .completed)
-            } else {
-                setStatus(for: item, to: .completed)
+            do {
+                try await torrentService.removeAndConfirmStopped(gid: gid)
+                item.backendIdentifier = nil
+                removeTorrentControlFiles(for: item)
+            } catch {
+                item.backendIdentifier = gid
+                item.lastError = error.localizedDescription
             }
-            Task {
-                await torrentService.remove(gid: gid)
-            }
+            setStatus(for: item, to: .completed)
         }
 
         await persistCompletionAndNotifyIfNeeded(item)
 
         startNextQueuedDownloadsIfNeeded()
+    }
+
+    private func privatizeMagnetMetadataIfNeeded(for item: DownloadItem) async {
+        guard item.sourceKind == .magnetLink else {
+            return
+        }
+
+        let context = torrentSidecarContext(for: item)
+        guard let metadataURL = torrentSidecarFileService.magnetMetadataURL(for: context) else {
+            return
+        }
+
+        do {
+            let hasVerifiedManagedSource: Bool
+            if let managedTorrentSourcePath = item.managedTorrentSourcePath,
+               let expectedFingerprint = ManagedTorrentSourceStore.normalizedInfoHash(
+                   item.torrentFingerprint
+               ) {
+                hasVerifiedManagedSource = await managedTorrentSourceStore.containsManagedTorrent(
+                    at: URL(fileURLWithPath: managedTorrentSourcePath),
+                    matching: expectedFingerprint
+                )
+            } else {
+                hasVerifiedManagedSource = false
+            }
+
+            if hasVerifiedManagedSource == false {
+                let managedSource = try await managedTorrentSourceStore.prepareLocalTorrent(
+                    at: metadataURL,
+                    originalURL: item.sourceURL
+                )
+                item.torrentFingerprint = managedSource.fingerprint
+                item.torrentSourceFingerprint = managedSource.sourceFingerprint
+                item.managedTorrentSourcePath = managedSource.managedURL.path
+                item.updatedAt = .now
+                schedulePersist()
+            }
+
+            try torrentSidecarFileService.removeMagnetMetadata(for: context)
+        } catch {
+            // Keep the verified metadata hidden in place if private storage is temporarily unavailable.
+        }
+    }
+
+    private func removeTorrentControlFiles(for item: DownloadItem) {
+        do {
+            try torrentSidecarFileService.removeExistingControlFiles(
+                for: torrentSidecarContext(for: item)
+            )
+        } catch {
+            activeAlert = UserAlert(
+                title: String(localized: "Couldn’t Remove Torrent Support Files"),
+                message: error.localizedDescription
+            )
+        }
     }
 
     private func persistCompletionAndNotifyIfNeeded(_ item: DownloadItem) async {
@@ -3260,27 +3393,62 @@ final class DownloadCenter {
         )
     }
 
-    private func cleanupBackendIdentifiers(for items: [DownloadItem]) {
-        let backendIdentifiers = items
+    private func cleanupBackendArtifacts(for items: [DownloadItem]) {
+        let torrentArtifacts = items
             .filter { $0.backend == .aria2 }
-            .compactMap(\.backendIdentifier)
-
+            .map { (backendIdentifier: $0.backendIdentifier, sidecars: torrentSidecarContext(for: $0)) }
         let mediaIDs = items
             .filter { $0.backend == .ytDlp }
             .map(\.id)
 
-        guard backendIdentifiers.isEmpty == false || mediaIDs.isEmpty == false else {
+        guard torrentArtifacts.isEmpty == false || mediaIDs.isEmpty == false else {
             return
         }
 
-        Task {
-            for backendIdentifier in backendIdentifiers {
-                await torrentService.remove(gid: backendIdentifier)
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+
+            for artifact in torrentArtifacts {
+                if let backendIdentifier = artifact.backendIdentifier {
+                    do {
+                        try await torrentService.removeAndConfirmStopped(gid: backendIdentifier)
+                    } catch {
+                        continue
+                    }
+                }
+                removeTorrentSidecars(artifact.sidecars)
             }
 
             for id in mediaIDs {
                 await mediaService.remove(id: id)
             }
+        }
+    }
+
+    private func torrentSidecarContext(for item: DownloadItem) -> TorrentSidecarContext {
+        TorrentSidecarContext(
+            destinationFolderURL: item.destinationFolderURL,
+            sourceKind: item.sourceKind,
+            torrentFingerprint: item.torrentFingerprint,
+            fileLocationURL: item.fileLocationURL,
+            payloadURLs: item.torrentPayloadPaths.map(URL.init(fileURLWithPath:))
+        )
+    }
+
+    private func removeTorrentSidecars(_ context: TorrentSidecarContext?) {
+        guard let context else {
+            return
+        }
+
+        do {
+            try torrentSidecarFileService.removeExistingSidecars(for: context)
+        } catch {
+            activeAlert = UserAlert(
+                title: String(localized: "Couldn’t Remove Torrent Support Files"),
+                message: error.localizedDescription
+            )
         }
     }
 

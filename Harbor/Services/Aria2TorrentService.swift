@@ -760,13 +760,25 @@ actor Aria2TorrentService {
         destinationFolderPath: String,
         transferOptions: TorrentTransferOptions?
     ) -> [String: String] {
+        Self.downloadOptions(
+            destinationFolderPath: destinationFolderPath,
+            transferSettings: transferSettings,
+            transferOptions: transferOptions
+        )
+    }
+
+    nonisolated static func downloadOptions(
+        destinationFolderPath: String,
+        transferSettings: DownloadTransferSettings,
+        transferOptions: TorrentTransferOptions?
+    ) -> [String: String] {
         var options = [
             "dir": destinationFolderPath,
             "continue": "true",
             "pause": "false"
         ]
 
-        Self.perDownloadOptions(
+        perDownloadOptions(
             transferSettings,
             transferOptions: transferOptions
         ).forEach { key, value in
