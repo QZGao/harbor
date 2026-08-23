@@ -10,9 +10,26 @@ struct GeneralSettingsTab: View {
             Section("Behavior") {
                 Toggle("Start downloads immediately", isOn: $settings.startDownloadsAutomatically)
                 Toggle("Send download notifications", isOn: $settings.notificationsEnabled)
+                Toggle(
+                    "Start at Login",
+                    isOn: Binding(
+                        get: { settings.startAtLogin },
+                        set: { settings.setStartAtLogin($0) }
+                    )
+                )
+                Toggle("Prevent sleep while downloading", isOn: $settings.preventSleepWhileDownloading)
+
+                if let startAtLoginErrorMessage = settings.startAtLoginErrorMessage {
+                    Text(startAtLoginErrorMessage)
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                }
             }
         }
         .formStyle(.grouped)
+        .onAppear {
+            settings.refreshStartAtLoginStatus()
+        }
     }
 }
 

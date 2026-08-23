@@ -4,6 +4,70 @@ import XCTest
 
 @MainActor
 final class AppSettingsAndTorrentWatchTests: XCTestCase {
+    func testPreventSleepDefaultsOffAndPersists() {
+        let suiteName = "HarborTests.PreventSleep.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        XCTAssertFalse(settings.preventSleepWhileDownloading)
+
+        settings.preventSleepWhileDownloading = true
+
+        let restoredSettings = AppSettingsStore(userDefaults: userDefaults)
+        XCTAssertTrue(restoredSettings.preventSleepWhileDownloading)
+    }
+
+    func testStartAtLoginReflectsControllerStateAndFailures() {
+        let controller = FakeLoginItemController(status: .disabled)
+        let settings = AppSettingsStore(loginItemController: controller)
+
+        XCTAssertFalse(settings.startAtLogin)
+
+        settings.setStartAtLogin(true)
+        XCTAssertTrue(settings.startAtLogin)
+        XCTAssertNil(settings.startAtLoginErrorMessage)
+
+        controller.status = .requiresApproval
+        settings.refreshStartAtLoginStatus()
+        XCTAssertFalse(settings.startAtLogin)
+
+        settings.setStartAtLogin(true)
+        XCTAssertFalse(settings.startAtLogin)
+        XCTAssertNotNil(settings.startAtLoginErrorMessage)
+    }
+
+    func testSleepPreventionTracksOnlyActiveDownloads() async {
+        let settings = HarborPreviewFixtures.makeSettings()
+        let sleepPreventionService = FakeSleepPreventionService()
+        let center = DownloadCenter(
+            settings: settings,
+            sleepPreventionService: sleepPreventionService
+        )
+        let item = HarborPreviewFixtures.sampleDownloads()[0]
+
+        settings.preventSleepWhileDownloading = true
+        center.downloads = [item]
+        await Task.yield()
+        await Task.yield()
+        XCTAssertTrue(sleepPreventionService.isPreventingSleep)
+
+        item.status = .seeding
+        await Task.yield()
+        await Task.yield()
+        XCTAssertFalse(sleepPreventionService.isPreventingSleep)
+
+        item.status = .downloading
+        await Task.yield()
+        await Task.yield()
+        XCTAssertTrue(sleepPreventionService.isPreventingSleep)
+
+        await center.shutdownForTermination()
+        XCTAssertFalse(sleepPreventionService.isPreventingSleep)
+        XCTAssertEqual(sleepPreventionService.stopCallCount, 1)
+    }
+
     func testLegacySettingsReceiveTorrentAutomationDefaults() {
         let suiteName = "HarborTests.Settings.\(UUID().uuidString)"
         let userDefaults = UserDefaults(suiteName: suiteName)!
@@ -139,5 +203,36 @@ final class AppSettingsAndTorrentWatchTests: XCTestCase {
 
         try await Task.sleep(for: .milliseconds(150))
         XCTAssertEqual(emittedURLs.count, 1)
+    }
+}
+
+private final class FakeLoginItemController: LoginItemControlling {
+    var status: LoginItemStatus
+
+    init(status: LoginItemStatus) {
+        self.status = status
+    }
+
+    func setEnabled(_ isEnabled: Bool) throws {
+        guard status != .requiresApproval else {
+            return
+        }
+
+        status = isEnabled ? .enabled : .disabled
+    }
+}
+
+@MainActor
+private final class FakeSleepPreventionService: DownloadSleepPreventing {
+    private(set) var isPreventingSleep = false
+    private(set) var stopCallCount = 0
+
+    func update(isEnabled: Bool, hasActiveDownloads: Bool) {
+        isPreventingSleep = isEnabled && hasActiveDownloads
+    }
+
+    func stop() {
+        stopCallCount += 1
+        isPreventingSleep = false
     }
 }

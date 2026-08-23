@@ -34,6 +34,7 @@ final class AppSettingsStore {
         static let maxConcurrentDownloads = "maxConcurrentDownloads"
         static let startDownloadsAutomatically = "startDownloadsAutomatically"
         static let notificationsEnabled = "notificationsEnabled"
+        static let preventSleepWhileDownloading = "preventSleepWhileDownloading"
         static let globalSpeedLimitEnabled = "globalSpeedLimitEnabled"
         static let globalSpeedLimitKilobytesPerSecond = "globalSpeedLimitKilobytesPerSecond"
         static let perDownloadSpeedLimitEnabled = "perDownloadSpeedLimitEnabled"
@@ -50,6 +51,7 @@ final class AppSettingsStore {
     static let speedLimitKilobytesRange = 1 ... 1_048_576
 
     private let userDefaults: UserDefaults
+    @ObservationIgnored private let loginItemController: any LoginItemControlling
     @ObservationIgnored var transferSettingsDidChange: ((DownloadTransferSettings) -> Void)?
     @ObservationIgnored var torrentAutomationSettingsDidChange: (() -> Void)?
 
@@ -107,6 +109,15 @@ final class AppSettingsStore {
             userDefaults.set(notificationsEnabled, forKey: Keys.notificationsEnabled)
         }
     }
+
+    var preventSleepWhileDownloading: Bool {
+        didSet {
+            userDefaults.set(preventSleepWhileDownloading, forKey: Keys.preventSleepWhileDownloading)
+        }
+    }
+
+    private(set) var startAtLogin = false
+    private(set) var startAtLoginErrorMessage: String?
 
     var globalSpeedLimitEnabled: Bool {
         didSet {
@@ -177,8 +188,13 @@ final class AppSettingsStore {
         }
     }
 
-    init(userDefaults: UserDefaults = .standard) {
+    init(
+        userDefaults: UserDefaults = .standard,
+        loginItemController: (any LoginItemControlling)? = nil
+    ) {
         self.userDefaults = userDefaults
+        let resolvedLoginItemController = loginItemController ?? SystemLoginItemController()
+        self.loginItemController = resolvedLoginItemController
 
         let defaultDownloadsPath = FileManager.default.urls(
             for: .downloadsDirectory,
@@ -217,6 +233,8 @@ final class AppSettingsStore {
         } else {
             self.notificationsEnabled = userDefaults.bool(forKey: Keys.notificationsEnabled)
         }
+        self.preventSleepWhileDownloading = userDefaults.bool(forKey: Keys.preventSleepWhileDownloading)
+        self.startAtLogin = resolvedLoginItemController.status == .enabled
 
         self.globalSpeedLimitEnabled = userDefaults.bool(forKey: Keys.globalSpeedLimitEnabled)
         self.globalSpeedLimitKilobytesPerSecond = Self.clamped(
@@ -257,6 +275,27 @@ final class AppSettingsStore {
             storedConnectionCount == 0 ? 4 : storedConnectionCount,
             to: Self.perDownloadConnectionCountRange
         )
+    }
+
+    func refreshStartAtLoginStatus() {
+        startAtLogin = loginItemController.status == .enabled
+    }
+
+    func setStartAtLogin(_ isEnabled: Bool) {
+        startAtLoginErrorMessage = nil
+
+        do {
+            try loginItemController.setEnabled(isEnabled)
+            refreshStartAtLoginStatus()
+
+            guard startAtLogin == isEnabled else {
+                startAtLoginErrorMessage = loginItemStatusMessage(loginItemController.status)
+                return
+            }
+        } catch {
+            refreshStartAtLoginStatus()
+            startAtLoginErrorMessage = error.localizedDescription
+        }
     }
 
     var defaultDestinationURL: URL {
@@ -343,6 +382,19 @@ final class AppSettingsStore {
 
     private func notifyTransferSettingsChanged() {
         transferSettingsDidChange?(transferSettings)
+    }
+
+    private func loginItemStatusMessage(_ status: LoginItemStatus) -> String {
+        switch status {
+        case .requiresApproval:
+            String(
+                localized: "Allow Harbor in System Settings > General > Login Items, then return here."
+            )
+        case .unavailable:
+            String(localized: "Start at Login is not available for this copy of Harbor.")
+        case .disabled, .enabled:
+            String(localized: "Harbor could not update the Start at Login setting.")
+        }
     }
 
     private func notifyTorrentAutomationSettingsChanged() {

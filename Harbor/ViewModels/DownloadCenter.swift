@@ -12,6 +12,7 @@ final class DownloadCenter {
     @ObservationIgnored private let dataRemovalService: DownloadDataRemovalService
     @ObservationIgnored private let managedTorrentSourceStore: ManagedTorrentSourceStore
     @ObservationIgnored private let torrentWatchFolderService: TorrentWatchFolderService
+    @ObservationIgnored private let sleepPreventionService: any DownloadSleepPreventing
     @ObservationIgnored private var coordinator: DownloadCoordinator! = nil
     @ObservationIgnored private var browserCoordinator: BrowserDownloadCoordinator! = nil
     @ObservationIgnored private let torrentService: Aria2TorrentService
@@ -63,6 +64,7 @@ final class DownloadCenter {
         dataRemovalService: DownloadDataRemovalService = DownloadDataRemovalService(),
         managedTorrentSourceStore: ManagedTorrentSourceStore = ManagedTorrentSourceStore(),
         torrentWatchFolderService: TorrentWatchFolderService? = nil,
+        sleepPreventionService: (any DownloadSleepPreventing)? = nil,
         torrentService: Aria2TorrentService? = nil,
         mediaService: MediaDownloadService? = nil
     ) {
@@ -73,6 +75,7 @@ final class DownloadCenter {
         self.dataRemovalService = dataRemovalService
         self.managedTorrentSourceStore = managedTorrentSourceStore
         self.torrentWatchFolderService = torrentWatchFolderService ?? TorrentWatchFolderService()
+        self.sleepPreventionService = sleepPreventionService ?? DownloadSleepPreventionService()
         self.torrentService = torrentService ?? Aria2TorrentService(transferSettings: settings.transferSettings)
         self.mediaService = mediaService ?? MediaDownloadService { [weak self] event in
             Task { @MainActor [weak self] in
@@ -98,6 +101,7 @@ final class DownloadCenter {
         self.torrentWatchFolderService.statusDidChange = { [weak self] status in
             self?.handleTorrentWatchFolderStatus(status)
         }
+        monitorSleepPrevention()
     }
 
     deinit {
@@ -600,6 +604,7 @@ final class DownloadCenter {
 
     func shutdownForTermination() async {
         isShuttingDown = true
+        sleepPreventionService.stop()
         persistTask?.cancel()
         torrentRefreshTask?.cancel()
         torrentWatchFolderService.stop()
@@ -649,6 +654,32 @@ final class DownloadCenter {
         await mediaService.shutdown()
         await torrentService.shutdown()
         try? await persistence.save(downloads.map { $0.makeRecord() })
+    }
+
+    private func monitorSleepPrevention() {
+        withObservationTracking {
+            _ = settings.preventSleepWhileDownloading
+            _ = downloads.map(\.status)
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    return
+                }
+
+                self.updateSleepPrevention()
+                self.monitorSleepPrevention()
+            }
+        }
+
+        updateSleepPrevention()
+    }
+
+    private func updateSleepPrevention() {
+        // TODO: Extend this policy if seeding sleep prevention becomes configurable.
+        sleepPreventionService.update(
+            isEnabled: settings.preventSleepWhileDownloading && isShuttingDown == false,
+            hasActiveDownloads: downloads.contains { $0.status == .downloading }
+        )
     }
 
     func previewMediaDownload(for url: URL) async throws -> MediaDownloadMetadata? {
