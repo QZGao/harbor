@@ -8,7 +8,6 @@ struct AddDownloadSheet: View {
 
     private enum Field: Hashable {
         case sourceURL
-        case filename
     }
 
     let settings: AppSettingsStore
@@ -20,7 +19,6 @@ struct AddDownloadSheet: View {
 
     @State private var entryMode: AddDownloadEntryMode
     @State private var sourceURLText: String
-    @State private var customFilename: String
     @State private var torrentFileURL: URL?
     @State private var destinationPath: String
     @State private var hasCustomizedDestination = false
@@ -46,7 +44,6 @@ struct AddDownloadSheet: View {
         self.onSubmit = onSubmit
         _entryMode = State(initialValue: draft.entryMode)
         _sourceURLText = State(initialValue: draft.sourceURLText)
-        _customFilename = State(initialValue: draft.customFilename)
         _torrentFileURL = State(initialValue: draft.torrentFileURL)
         _destinationPath = State(initialValue: draft.destinationFolderURL.path)
         _shouldStartImmediately = State(initialValue: draft.shouldStartImmediately)
@@ -87,10 +84,6 @@ struct AddDownloadSheet: View {
                     if isBatchEntry {
                         batchSummaryRow
                     } else {
-                        TextField("Optional file name override", text: $customFilename)
-                            .focused($focusedField, equals: Field.filename)
-                            .disabled(mediaPreview != nil)
-
                         mediaPreviewRows
                     }
                 } else {
@@ -720,14 +713,13 @@ struct AddDownloadSheet: View {
         }
 
         let folderURL = URL(fileURLWithPath: destinationPath, isDirectory: true)
-        let trimmedFilename = customFilename.trimmingCharacters(in: .whitespacesAndNewlines)
 
         onSubmit(
             [
                 AddDownloadRequest(
                     sourceKind: sourceKind,
                     sourceURL: sourceURL,
-                    customFilename: sourceKind.supportsCustomFilename && trimmedFilename.isEmpty == false ? trimmedFilename : nil,
+                    customFilename: nil,
                     destinationFolder: folderURL,
                     shouldStartImmediately: shouldStartImmediately,
                     mediaMetadata: requestMediaMetadata,
