@@ -2,21 +2,23 @@ import AppKit
 import SwiftUI
 
 struct AddDownloadSheet: View {
+    private enum Layout {
+        static let groupedFormHorizontalExpansion: CGFloat = 20
+    }
+
     private enum Field: Hashable {
         case sourceURL
-        case filename
     }
 
     let settings: AppSettingsStore
     let mediaPreviewProvider: @MainActor (URL) async throws -> MediaDownloadMetadata?
-    let onSubmit: @MainActor (AddDownloadRequest) -> Void
+    let onSubmit: @MainActor ([AddDownloadRequest]) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @FocusState private var focusedField: Field?
 
     @State private var entryMode: AddDownloadEntryMode
     @State private var sourceURLText: String
-    @State private var customFilename: String
     @State private var torrentFileURL: URL?
     @State private var destinationPath: String
     @State private var hasCustomizedDestination = false
@@ -25,7 +27,7 @@ struct AddDownloadSheet: View {
     @State private var mediaPreview: MediaDownloadMetadata?
     @State private var mediaPreviewError: String?
     @State private var mediaFormatPreference: MediaDownloadFormatPreference = .bestAvailable
-    @State private var hasMediaSavePermission = true // Per #40, before nice rights UI gets added
+    @State private var hasMediaSavePermission = true
     @State private var isResolvingMedia = false
     @State private var isSubmitting = false
     @State private var mediaPreviewTask: Task<Void, Never>?
@@ -35,14 +37,13 @@ struct AddDownloadSheet: View {
         settings: AppSettingsStore,
         draft: AddDownloadSheetDraft,
         mediaPreviewProvider: @escaping @MainActor (URL) async throws -> MediaDownloadMetadata? = { _ in nil },
-        onSubmit: @escaping @MainActor (AddDownloadRequest) -> Void
+        onSubmit: @escaping @MainActor ([AddDownloadRequest]) -> Void
     ) {
         self.settings = settings
         self.mediaPreviewProvider = mediaPreviewProvider
         self.onSubmit = onSubmit
         _entryMode = State(initialValue: draft.entryMode)
         _sourceURLText = State(initialValue: draft.sourceURLText)
-        _customFilename = State(initialValue: draft.customFilename)
         _torrentFileURL = State(initialValue: draft.torrentFileURL)
         _destinationPath = State(initialValue: draft.destinationFolderURL.path)
         _shouldStartImmediately = State(initialValue: draft.shouldStartImmediately)
@@ -53,7 +54,7 @@ struct AddDownloadSheet: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Add Download")
                     .font(.title2.weight(.semibold))
-                Text("Paste a direct URL, media post URL, magnet link, or choose a `.torrent` file.")
+                Text("Paste one or more links, a media post URL, a magnet link, or choose a `.torrent` file. Add several at once by putting one link per line.")
                     .foregroundStyle(.secondary)
             }
 
@@ -66,18 +67,25 @@ struct AddDownloadSheet: View {
                 .pickerStyle(.segmented)
 
                 if entryMode == .linkOrMagnet {
-                    TextField("https://example.com/file.zip, social link, or magnet:?xt=...", text: $sourceURLText)
-                        .focused($focusedField, equals: Field.sourceURL)
-                        .onChange(of: sourceURLText) {
-                            scheduleMediaPreviewRefresh()
-                            updateDestinationForDetectedSourceIfNeeded()
-                        }
+                    TextField(
+                        "Source",
+                        text: $sourceURLText,
+                        prompt: Text("https://example.com/file.zip, social link, or magnet:?xt=..."),
+                        axis: .vertical
+                    )
+                    .labelsHidden()
+                    .lineLimit(1...8)
+                    .focused($focusedField, equals: Field.sourceURL)
+                    .onChange(of: sourceURLText) {
+                        scheduleMediaPreviewRefresh()
+                        updateDestinationForDetectedSourceIfNeeded()
+                    }
 
-                    TextField("Optional file name override", text: $customFilename)
-                        .focused($focusedField, equals: Field.filename)
-                        .disabled(mediaPreview != nil)
-
-                    mediaPreviewRows
+                    if isBatchEntry {
+                        batchSummaryRow
+                    } else {
+                        mediaPreviewRows
+                    }
                 } else {
                     LabeledContent("Torrent File") {
                         HStack(spacing: 8) {
@@ -100,6 +108,7 @@ struct AddDownloadSheet: View {
                 Toggle("Start immediately", isOn: $shouldStartImmediately)
             }
             .formStyle(.grouped)
+            .padding(.horizontal, -Layout.groupedFormHorizontalExpansion)
 
             if let validationMessage {
                 Text(validationMessage)
@@ -121,7 +130,7 @@ struct AddDownloadSheet: View {
                 }
                 .keyboardShortcut(.cancelAction)
 
-                Button(isSubmitting ? "Adding…" : "Add Download") {
+                Button(addButtonTitle) {
                     Task {
                         await submit()
                     }
@@ -380,8 +389,9 @@ struct AddDownloadSheet: View {
         case .torrentFile:
             return settings.torrentDestinationPath
         case .linkOrMagnet:
-            guard let parsedLinkURL,
-                  let sourceKind = DownloadSourceKind.detect(from: parsedLinkURL) else {
+            let sourceURL = isBatchEntry ? parsedBatchURLs.first : parsedLinkURL
+            guard let sourceURL,
+                  let sourceKind = DownloadSourceKind.detect(from: sourceURL) else {
                 return settings.defaultDestinationPath
             }
 
@@ -405,6 +415,10 @@ struct AddDownloadSheet: View {
     private var canSubmit: Bool {
         switch entryMode {
         case .linkOrMagnet:
+            if isBatchEntry {
+                return parsedBatchURLs.isEmpty == false
+            }
+
             let trimmedURL = sourceURLText.trimmingCharacters(in: .whitespacesAndNewlines)
             guard let parsedURL = URL(string: trimmedURL),
                   let detectedKind = DownloadSourceKind.detect(from: parsedURL) else {
@@ -440,8 +454,139 @@ struct AddDownloadSheet: View {
         return URL(string: trimmedURL)
     }
 
+    private var batchEntries: [DownloadSourceImportService.TextEntry] {
+        DownloadSourceImportService.textEntries(from: sourceURLText)
+    }
+
+    // Multiple entered lines switch the sheet to batch mode even when some
+    // lines are invalid or duplicates. This keeps those lines from being
+    // percent-encoded into one bogus URL by Foundation's lenient parser.
+    private var parsedBatchURLs: [URL] {
+        batchEntries.compactMap(\.url)
+    }
+
+    private var isBatchEntry: Bool {
+        entryMode == .linkOrMagnet && batchEntries.count > 1
+    }
+
+    private var skippedBatchLineCount: Int {
+        batchEntries.filter { $0.status != .ready }.count
+    }
+
+    @ViewBuilder
+    private var batchSummaryRow: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Label(batchReadyDescription, systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+
+                if skippedBatchLineCount > 0 {
+                    Text("·")
+                        .foregroundStyle(.secondary)
+                    Label(batchSkippedDescription, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                }
+            }
+            .font(.callout)
+
+            ScrollView {
+                LazyVStack(spacing: 6) {
+                    ForEach(batchEntries) { entry in
+                        HStack(spacing: 8) {
+                            Image(systemName: batchEntrySystemImage(for: entry.status))
+                                .foregroundStyle(batchEntryColor(for: entry.status))
+                            Text(entry.text)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 8)
+                            Text(batchEntryStatusTitle(for: entry.status))
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.caption)
+                    }
+                }
+            }
+            .frame(maxHeight: 140)
+        }
+    }
+
+    private func batchEntrySystemImage(for status: DownloadSourceImportService.TextEntry.Status) -> String {
+        switch status {
+        case .ready:
+            "checkmark.circle.fill"
+        case .duplicate:
+            "doc.on.doc.fill"
+        case .unsupported:
+            "exclamationmark.triangle.fill"
+        }
+    }
+
+    private func batchEntryColor(for status: DownloadSourceImportService.TextEntry.Status) -> Color {
+        switch status {
+        case .ready:
+            .green
+        case .duplicate, .unsupported:
+            .orange
+        }
+    }
+
+    private func batchEntryStatusTitle(for status: DownloadSourceImportService.TextEntry.Status) -> LocalizedStringKey {
+        switch status {
+        case .ready:
+            "Ready"
+        case .duplicate:
+            "Duplicate"
+        case .unsupported:
+            "Skipped"
+        }
+    }
+
+    private var batchReadyDescription: String {
+        let template = String(
+            localized: "add.batch.ready",
+            defaultValue: "%d links ready to add",
+            comment: "Add Download summary showing how many valid links were detected when adding several at once. Parameter is the count."
+        )
+        return String(format: template, parsedBatchURLs.count)
+    }
+
+    private var batchSkippedDescription: String {
+        let template = String(
+            localized: "add.batch.skipped",
+            defaultValue: "%d lines skipped",
+            comment: "Add Download summary showing how many pasted lines could not be read as links. Parameter is the count."
+        )
+        return String(format: template, skippedBatchLineCount)
+    }
+
+    private var addButtonTitle: String {
+        if isSubmitting {
+            return String(
+                localized: "add.button.submitting",
+                defaultValue: "Adding…",
+                comment: "Add Download button title while the download is being queued."
+            )
+        }
+
+        if isBatchEntry {
+            let template = String(
+                localized: "add.button.batch",
+                defaultValue: "Add %d Downloads",
+                comment: "Add Download button title when adding several links at once. Parameter is the count."
+            )
+            return String(format: template, parsedBatchURLs.count)
+        }
+
+        return String(
+            localized: "add.button.single",
+            defaultValue: "Add Download",
+            comment: "Add Download button title when adding a single download."
+        )
+    }
+
     private var canTryAsMedia: Bool {
         guard entryMode == .linkOrMagnet,
+              isBatchEntry == false,
               let url = parsedLinkURL,
               DownloadSourceKind.detect(from: url) == .directURL,
               isKnownMediaHost(url) == false,
@@ -466,6 +611,23 @@ struct AddDownloadSheet: View {
         mediaPreviewTask?.cancel()
         mediaPreviewGeneration += 1
         let generation = mediaPreviewGeneration
+
+        if entryMode == .linkOrMagnet, isBatchEntry {
+            let folderURL = URL(fileURLWithPath: destinationPath, isDirectory: true)
+            let requests = AddDownloadRequest.batch(
+                from: parsedBatchURLs,
+                destinationFolder: folderURL,
+                shouldStartImmediately: shouldStartImmediately
+            )
+
+            guard requests.isEmpty == false else {
+                return
+            }
+
+            onSubmit(requests)
+            dismiss()
+            return
+        }
 
         let sourceURL: URL
         let sourceKind: DownloadSourceKind
@@ -551,18 +713,19 @@ struct AddDownloadSheet: View {
         }
 
         let folderURL = URL(fileURLWithPath: destinationPath, isDirectory: true)
-        let trimmedFilename = customFilename.trimmingCharacters(in: .whitespacesAndNewlines)
 
         onSubmit(
-            AddDownloadRequest(
-                sourceKind: sourceKind,
-                sourceURL: sourceURL,
-                customFilename: sourceKind.supportsCustomFilename && trimmedFilename.isEmpty == false ? trimmedFilename : nil,
-                destinationFolder: folderURL,
-                shouldStartImmediately: shouldStartImmediately,
-                mediaMetadata: requestMediaMetadata,
-                mediaFormatPreference: requestMediaFormatPreference
-            )
+            [
+                AddDownloadRequest(
+                    sourceKind: sourceKind,
+                    sourceURL: sourceURL,
+                    customFilename: nil,
+                    destinationFolder: folderURL,
+                    shouldStartImmediately: shouldStartImmediately,
+                    mediaMetadata: requestMediaMetadata,
+                    mediaFormatPreference: requestMediaFormatPreference
+                )
+            ]
         )
         dismiss()
     }
@@ -846,6 +1009,7 @@ struct AddDownloadSheet: View {
         resetMediaPreview()
 
         guard entryMode == .linkOrMagnet,
+              isBatchEntry == false,
               let url = parsedLinkURL,
               DownloadSourceKind.detect(from: url) == .directURL,
               isKnownMediaHost(url) else {
@@ -941,7 +1105,7 @@ struct AddDownloadSheet: View {
         mediaPreview = nil
         mediaPreviewError = nil
         isResolvingMedia = false
-        hasMediaSavePermission = true // Per #40, before nice rights UI gets added
+        hasMediaSavePermission = true
         mediaFormatPreference = .bestAvailable
     }
 

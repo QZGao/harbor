@@ -4,6 +4,156 @@ import XCTest
 
 @MainActor
 final class AppSettingsAndTorrentWatchTests: XCTestCase {
+    func testPreventSleepDefaultsOffAndPersists() {
+        let suiteName = "HarborTests.PreventSleep.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        XCTAssertFalse(settings.preventSleepWhileDownloading)
+
+        settings.preventSleepWhileDownloading = true
+
+        let restoredSettings = AppSettingsStore(userDefaults: userDefaults)
+        XCTAssertTrue(restoredSettings.preventSleepWhileDownloading)
+    }
+
+    func testSeedingRatioLimitDefaultsOffAndPersists() {
+        let suiteName = "HarborTests.SeedingRatio.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        XCTAssertFalse(settings.stopSeedingAtRatioEnabled)
+        XCTAssertEqual(settings.stopSeedingRatio, 2)
+        XCTAssertNil(settings.seedingRatioLimit)
+
+        settings.stopSeedingRatio = 1.5
+        settings.stopSeedingAtRatioEnabled = true
+
+        let restoredSettings = AppSettingsStore(userDefaults: userDefaults)
+        XCTAssertTrue(restoredSettings.stopSeedingAtRatioEnabled)
+        XCTAssertEqual(restoredSettings.seedingRatioLimit, 1.5)
+    }
+
+    func testTrafficModesOverlayAndPreserveCustomLimits() {
+        let suiteName = "HarborTests.TrafficModes.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        XCTAssertEqual(settings.trafficMode, .unlimited)
+        XCTAssertEqual(settings.transferSettings, .default)
+
+        settings.globalSpeedLimitKilobytesPerSecond = 9_000
+        settings.perDownloadSpeedLimitKilobytesPerSecond = 3_000
+        settings.globalUploadSpeedLimitKilobytesPerSecond = 1_500
+        settings.perDownloadUploadSpeedLimitKilobytesPerSecond = 500
+        settings.globalSpeedLimitEnabled = true
+        settings.perDownloadSpeedLimitEnabled = true
+        settings.globalUploadSpeedLimitEnabled = true
+        settings.perDownloadUploadSpeedLimitEnabled = true
+        XCTAssertEqual(settings.trafficMode, .custom)
+
+        var observedSettings: DownloadTransferSettings?
+        settings.transferSettingsDidChange = { observedSettings = $0 }
+        settings.trafficMode = .balanced
+
+        XCTAssertEqual(observedSettings?.globalSpeedLimitBytesPerSecond, 25 * 1_024 * 1_024)
+        XCTAssertEqual(settings.transferSettings.perDownloadSpeedLimitBytesPerSecond, 5 * 1_024 * 1_024)
+        XCTAssertEqual(settings.transferSettings.globalUploadSpeedLimitBytesPerSecond, 5 * 1_024 * 1_024)
+        XCTAssertEqual(settings.transferSettings.perDownloadUploadSpeedLimitBytesPerSecond, 1_024 * 1_024)
+
+        settings.trafficMode = .quiet
+        XCTAssertEqual(settings.transferSettings.globalSpeedLimitBytesPerSecond, 5 * 1_024 * 1_024)
+        XCTAssertEqual(settings.transferSettings.perDownloadSpeedLimitBytesPerSecond, 1_024 * 1_024)
+        XCTAssertEqual(settings.transferSettings.globalUploadSpeedLimitBytesPerSecond, 512 * 1_024)
+        XCTAssertEqual(settings.transferSettings.perDownloadUploadSpeedLimitBytesPerSecond, 256 * 1_024)
+
+        settings.trafficMode = .unlimited
+        XCTAssertNil(settings.transferSettings.globalSpeedLimitBytesPerSecond)
+        XCTAssertNil(settings.transferSettings.perDownloadSpeedLimitBytesPerSecond)
+        XCTAssertNil(settings.transferSettings.globalUploadSpeedLimitBytesPerSecond)
+        XCTAssertNil(settings.transferSettings.perDownloadUploadSpeedLimitBytesPerSecond)
+
+        settings.trafficMode = .custom
+        XCTAssertEqual(settings.transferSettings.globalSpeedLimitBytesPerSecond, 9_000 * 1_024)
+        XCTAssertEqual(settings.transferSettings.perDownloadSpeedLimitBytesPerSecond, 3_000 * 1_024)
+        XCTAssertEqual(settings.transferSettings.globalUploadSpeedLimitBytesPerSecond, 1_500 * 1_024)
+        XCTAssertEqual(settings.transferSettings.perDownloadUploadSpeedLimitBytesPerSecond, 500 * 1_024)
+
+        let restoredSettings = AppSettingsStore(userDefaults: userDefaults)
+        XCTAssertEqual(restoredSettings.trafficMode, .custom)
+        XCTAssertEqual(restoredSettings.globalSpeedLimitKilobytesPerSecond, 9_000)
+        XCTAssertEqual(restoredSettings.perDownloadUploadSpeedLimitKilobytesPerSecond, 500)
+    }
+
+    func testLegacyEnabledLimitsMigrateToCustomTrafficMode() {
+        let suiteName = "HarborTests.LegacyTrafficMode.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        userDefaults.set(true, forKey: "globalSpeedLimitEnabled")
+        userDefaults.set(7_500, forKey: "globalSpeedLimitKilobytesPerSecond")
+
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        XCTAssertEqual(settings.trafficMode, .custom)
+        XCTAssertEqual(settings.transferSettings.globalSpeedLimitBytesPerSecond, 7_500 * 1_024)
+    }
+
+    func testStartAtLoginReflectsControllerStateAndFailures() {
+        let controller = FakeLoginItemController(status: .disabled)
+        let settings = AppSettingsStore(loginItemController: controller)
+
+        XCTAssertFalse(settings.startAtLogin)
+
+        settings.setStartAtLogin(true)
+        XCTAssertTrue(settings.startAtLogin)
+        XCTAssertNil(settings.startAtLoginErrorMessage)
+
+        controller.status = .requiresApproval
+        settings.refreshStartAtLoginStatus()
+        XCTAssertFalse(settings.startAtLogin)
+
+        settings.setStartAtLogin(true)
+        XCTAssertFalse(settings.startAtLogin)
+        XCTAssertNotNil(settings.startAtLoginErrorMessage)
+    }
+
+    func testSleepPreventionTracksOnlyActiveDownloads() async {
+        let settings = HarborPreviewFixtures.makeSettings()
+        let sleepPreventionService = FakeSleepPreventionService()
+        let center = DownloadCenter(
+            settings: settings,
+            sleepPreventionService: sleepPreventionService
+        )
+        let item = HarborPreviewFixtures.sampleDownloads()[0]
+
+        settings.preventSleepWhileDownloading = true
+        center.downloads = [item]
+        await Task.yield()
+        await Task.yield()
+        XCTAssertTrue(sleepPreventionService.isPreventingSleep)
+
+        item.status = .seeding
+        await Task.yield()
+        await Task.yield()
+        XCTAssertFalse(sleepPreventionService.isPreventingSleep)
+
+        item.status = .downloading
+        await Task.yield()
+        await Task.yield()
+        XCTAssertTrue(sleepPreventionService.isPreventingSleep)
+
+        await center.shutdownForTermination()
+        XCTAssertFalse(sleepPreventionService.isPreventingSleep)
+        XCTAssertEqual(sleepPreventionService.stopCallCount, 1)
+    }
+
     func testLegacySettingsReceiveTorrentAutomationDefaults() {
         let suiteName = "HarborTests.Settings.\(UUID().uuidString)"
         let userDefaults = UserDefaults(suiteName: suiteName)!
@@ -23,6 +173,10 @@ final class AppSettingsAndTorrentWatchTests: XCTestCase {
         XCTAssertFalse(settings.torrentWatchFolderEnabled)
         XCTAssertEqual(settings.torrentWatchFolderURL.standardizedFileURL, downloadsURL.standardizedFileURL)
         XCTAssertTrue(settings.seedNewTorrents)
+        XCTAssertFalse(settings.stopSeedingAtRatioEnabled)
+        XCTAssertEqual(settings.stopSeedingRatio, 2)
+        XCTAssertNil(settings.seedingRatioLimit)
+        XCTAssertEqual(settings.trafficMode, .unlimited)
         XCTAssertEqual(
             settings.torrentDestinationURL.standardizedFileURL,
             regularDestinationURL
@@ -139,5 +293,36 @@ final class AppSettingsAndTorrentWatchTests: XCTestCase {
 
         try await Task.sleep(for: .milliseconds(150))
         XCTAssertEqual(emittedURLs.count, 1)
+    }
+}
+
+private final class FakeLoginItemController: LoginItemControlling {
+    var status: LoginItemStatus
+
+    init(status: LoginItemStatus) {
+        self.status = status
+    }
+
+    func setEnabled(_ isEnabled: Bool) throws {
+        guard status != .requiresApproval else {
+            return
+        }
+
+        status = isEnabled ? .enabled : .disabled
+    }
+}
+
+@MainActor
+private final class FakeSleepPreventionService: DownloadSleepPreventing {
+    private(set) var isPreventingSleep = false
+    private(set) var stopCallCount = 0
+
+    func update(isEnabled: Bool, hasActiveDownloads: Bool) {
+        isPreventingSleep = isEnabled && hasActiveDownloads
+    }
+
+    func stop() {
+        stopCallCount += 1
+        isPreventingSleep = false
     }
 }

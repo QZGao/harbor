@@ -64,6 +64,37 @@ enum DownloadBackend: String, Codable, Sendable {
     case ytDlp
 }
 
+struct DownloadedPayloadClassifier {
+    nonisolated static func isTorrent(
+        sourceURL: URL,
+        suggestedFilename: String?,
+        responseMimeType: String?,
+        statusCode: Int? = nil
+    ) -> Bool {
+        guard statusCode.map({ 200 ... 299 ~= $0 }) != false else {
+            return false
+        }
+
+        let normalizedMimeType = responseMimeType?
+            .split(separator: ";", maxSplits: 1)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        if normalizedMimeType == "application/x-bittorrent"
+            || normalizedMimeType == "application/bittorrent" {
+            return true
+        }
+
+        let suggestedExtension = suggestedFilename.map {
+            URL(fileURLWithPath: $0).pathExtension.lowercased()
+        }
+
+        return suggestedExtension == "torrent"
+            || sourceURL.pathExtension.lowercased() == "torrent"
+    }
+}
+
 struct MagnetLinkMetadata: Sendable {
     let displayName: String?
     let infoHash: String?
