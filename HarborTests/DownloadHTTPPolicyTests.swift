@@ -3,27 +3,6 @@ import XCTest
 @testable import Harbor
 
 extension HarborModelAndSafetyTests {
-    func testDirectDownloadThrottlePreservesLowRateByteDebt() throws {
-        let settings = DownloadTransferSettings(
-            maxConcurrentDownloads: 1,
-            globalSpeedLimitBytesPerSecond: nil,
-            perDownloadSpeedLimitBytesPerSecond: 1_024,
-            globalUploadSpeedLimitBytesPerSecond: nil,
-            perDownloadUploadSpeedLimitBytesPerSecond: nil,
-            perDownloadConnectionCount: 1
-        )
-
-        let delay = try XCTUnwrap(DownloadCoordinator.throttleDelay(
-            deltaBytes: 64 * 1_024,
-            elapsed: 1,
-            activeTransferCount: 1,
-            transferSettings: settings,
-            speedLimitOverride: .inherit
-        ))
-
-        XCTAssertEqual(delay, 63, accuracy: 0.001)
-    }
-
     func testDirectDownloadRetryPolicyUsesBoundedBackoff() {
         XCTAssertEqual(
             (1 ... 5).compactMap { DirectDownloadRetryPolicy.delay(forAttempt: $0)?.components.seconds },
@@ -270,102 +249,6 @@ extension HarborModelAndSafetyTests {
         )
     }
 
-    func testRejectedResumeAttemptRequiresFreshStart() {
-        let failure = DirectDownloadFailure(
-            error: URLError(.cannotDecodeContentData),
-            resumeData: nil,
-            wasResuming: true
-        )
-
-        XCTAssertTrue(failure.isRetryable)
-        XCTAssertTrue(failure.requiresFreshStart)
-        XCTAssertNil(failure.resumeData)
-    }
-
-    func testPostTransferStorageFailureDoesNotScheduleDestructiveResumeRetry() {
-        let failure = DirectDownloadFailure(
-            error: CocoaError(.fileWriteNoPermission),
-            resumeData: nil,
-            wasResuming: true
-        )
-
-        XCTAssertFalse(failure.isRetryable)
-        XCTAssertTrue(failure.requiresFreshStart)
-    }
-
-    func testOwnedPartialFailureRemainsRecoverableWithoutAppleResumeData() {
-        let failure = DirectDownloadFailure(
-            error: URLError(.networkConnectionLost),
-            resumeData: nil,
-            wasResuming: true,
-            recoverableBytes: 4_096
-        )
-
-        XCTAssertTrue(failure.isRetryable)
-        XCTAssertFalse(failure.requiresFreshStart)
-        XCTAssertEqual(failure.recoverableBytes, 4_096)
-    }
-
-    func testOwnedPartialRequestUsesRangeAndStrongValidator() throws {
-        let sourceURL = try XCTUnwrap(URL(string: "https://example.test/archive.bin"))
-        let metadata = DirectDownloadRecoveryMetadata(
-            sourceURL: sourceURL,
-            entityTag: "\"archive-v1\"",
-            lastModified: nil,
-            expectedBytes: 8_192,
-            suggestedFilename: "archive.bin",
-            mimeType: "application/octet-stream"
-        )
-        let recovery = DirectDownloadRecoverySnapshot(
-            bytesWritten: 4_096,
-            metadata: metadata
-        )
-
-        let request = DirectDownloadResponsePolicy.request(
-            sourceURL: sourceURL,
-            recovery: recovery
-        )
-
-        XCTAssertEqual(request.value(forHTTPHeaderField: "Range"), "bytes=4096-")
-        XCTAssertEqual(request.value(forHTTPHeaderField: "If-Range"), "\"archive-v1\"")
-        XCTAssertEqual(request.value(forHTTPHeaderField: "Accept-Encoding"), "identity")
-    }
-
-    func testValidatorlessPartialIsNotReportedAsRecoverable() throws {
-        let fileManager = FileManager.default
-        let recoveryRoot = fileManager.temporaryDirectory
-            .appendingPathComponent("HarborValidatorlessStoreTests-\(UUID().uuidString)", isDirectory: true)
-        defer { try? fileManager.removeItem(at: recoveryRoot) }
-
-        let store = DirectDownloadRecoveryStore(
-            fileManager: fileManager,
-            directoryURL: recoveryRoot
-        )
-        let id = UUID()
-        let sourceURL = try XCTUnwrap(URL(string: "https://example.test/archive.bin"))
-        let handle = try store.openFreshFile(id: id)
-        try handle.write(contentsOf: Data("partial".utf8))
-        try handle.close()
-        try store.saveMetadata(
-            DirectDownloadRecoveryMetadata(
-                sourceURL: sourceURL,
-                entityTag: nil,
-                lastModified: nil,
-                expectedBytes: 10,
-                suggestedFilename: "archive.bin",
-                mimeType: "application/octet-stream"
-            ),
-            id: id
-        )
-
-        XCTAssertNil(store.snapshot(id: id, sourceURL: sourceURL))
-        XCTAssertNil(store.recoveredByteCount(id: id))
-        let preparation = try store.prepareStart(id: id, sourceURL: sourceURL)
-        XCTAssertNil(preparation.snapshot)
-        XCTAssertNil(preparation.resetReason)
-        XCTAssertNil(store.recoveredByteCount(id: id))
-    }
-
     func testTemporarilyUnreadableDirectRecoveryIsPreserved() throws {
         let fileManager = FileManager.default
         let recoveryRoot = fileManager.temporaryDirectory
@@ -495,7 +378,7 @@ extension HarborModelAndSafetyTests {
             onEvent: { _ in }
         )
         directCoordinator.discardOrphanedTemporaryFiles()
-        browserCoordinator.discardOrphanedTemporaryFiles(retaining: [])
+        browserCoordinator.discardOrphanedTemporaryFiles()
 
         XCTAssertFalse(fileManager.fileExists(atPath: directHandoff.path))
         XCTAssertFalse(fileManager.fileExists(atPath: browserHandoff.path))

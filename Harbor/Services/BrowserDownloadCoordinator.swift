@@ -147,7 +147,8 @@ final class BrowserDownloadCoordinator: NSObject {
     }
 
     private let fileManager: FileManager
-    private let recoveryStore: BrowserDownloadRecoveryStore
+    private let temporaryDirectory: URL
+    private let completedHandoffStore: CompletedDownloadHandoffStore
     private let onEvent: @MainActor (BrowserDownloadEvent) -> Void
     private let resumeDownload: ResumeDownload
     private let cancelUnownedDownload: CancelUnownedDownload
@@ -190,11 +191,8 @@ final class BrowserDownloadCoordinator: NSObject {
                 directoryURL: temporaryDirectory
             )
         self.fileManager = fileManager
-        self.recoveryStore = BrowserDownloadRecoveryStore(
-            fileManager: fileManager,
-            directoryURL: resolvedTemporaryDirectory,
-            completedHandoffStore: resolvedHandoffStore
-        )
+        self.temporaryDirectory = resolvedTemporaryDirectory
+        self.completedHandoffStore = resolvedHandoffStore
         self.resumeDownload = resumeDownload
         self.cancelUnownedDownload = cancelUnownedDownload
         self.onEvent = onEvent
@@ -525,27 +523,8 @@ final class BrowserDownloadCoordinator: NSObject {
         resumableWebViews.removeValue(forKey: id)
         completedActiveStopResults.removeValue(forKey: id)
         completionPublicationFailures.removeValue(forKey: id)
-        try recoveryStore.discardRecoveryData(downloadID: id)
-    }
-
-    func recoverCompletedTemporaryFiles(
-        downloadID: UUID? = nil
-    ) async throws -> [UUID: String] {
-        let recoveryStore = recoveryStore
-        let failures = try await Task.detached(priority: .utility) {
-            try recoveryStore.recoverCompletedPayloads(downloadID: downloadID)
-        }.value
-        if let downloadID {
-            if failures[downloadID] == nil {
-                completionPublicationFailures.removeValue(forKey: downloadID)
-            }
-        } else {
-            for id in Array(completionPublicationFailures.keys)
-            where failures[id] == nil {
-                completionPublicationFailures.removeValue(forKey: id)
-            }
-        }
-        return failures
+        try discardPartialFiles(downloadID: id)
+        try completedHandoffStore.discardThrowing(downloadID: id)
     }
 
     func discardPartialRecoveryData(id: UUID) {
@@ -556,11 +535,52 @@ final class BrowserDownloadCoordinator: NSObject {
         pendingNavigationStops.removeValue(forKey: id)
         resumableWebViews.removeValue(forKey: id)
         completedActiveStopResults.removeValue(forKey: id)
-        try? recoveryStore.discardPartialFiles(downloadID: id)
+        try? discardPartialFiles(downloadID: id)
     }
 
-    func discardOrphanedTemporaryFiles(retaining retainedIDs: Set<UUID>) {
-        recoveryStore.discardOrphans(retaining: retainedIDs)
+    func discardOrphanedTemporaryFiles() {
+        completedHandoffStore.discardLegacyUnvalidatedFiles(in: temporaryDirectory)
+        guard let contents = try? fileManager.contentsOfDirectory(
+            at: temporaryDirectory,
+            includingPropertiesForKeys: nil
+        ) else {
+            return
+        }
+        for url in contents where url.pathExtension == "part" {
+            try? fileManager.removeItem(at: url)
+        }
+    }
+
+    private func discardPartialFiles(downloadID: UUID) throws {
+        guard try DurableFileSystem.itemExists(at: temporaryDirectory) else {
+            return
+        }
+        let legacyURL = temporaryDirectory
+            .appendingPathComponent(downloadID.uuidString)
+            .appendingPathExtension("download")
+        if try DurableFileSystem.itemExists(at: legacyURL) {
+            try fileManager.removeItem(at: legacyURL)
+        }
+        let prefix = downloadID.uuidString + "-"
+        let contents = try fileManager.contentsOfDirectory(
+            at: temporaryDirectory,
+            includingPropertiesForKeys: nil
+        )
+        for url in contents where url.pathExtension == "part"
+            && url.deletingPathExtension().lastPathComponent.hasPrefix(prefix) {
+            try fileManager.removeItem(at: url)
+        }
+    }
+
+    private func freshPayloadURL(downloadID: UUID, attemptIdentifier: UUID) throws -> URL {
+        try fileManager.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+        let url = temporaryDirectory
+            .appendingPathComponent("\(downloadID.uuidString)-\(attemptIdentifier.uuidString)")
+            .appendingPathExtension("part")
+        if fileManager.fileExists(atPath: url.path) {
+            try fileManager.removeItem(at: url)
+        }
+        return url
     }
 
     private func track(
@@ -1310,7 +1330,7 @@ extension BrowserDownloadCoordinator: WKDownloadDelegate {
                 throw URLError(.badServerResponse)
             }
 
-            let temporaryURL = try recoveryStore.freshPayloadURL(
+            let temporaryURL = try freshPayloadURL(
                 downloadID: context.downloadID,
                 attemptIdentifier: context.attemptIdentifier
             )
@@ -1402,7 +1422,7 @@ extension BrowserDownloadCoordinator: WKDownloadDelegate {
             : (stopWaiters.removeValue(forKey: context.downloadID) ?? [])
         resumableWebViews.removeValue(forKey: context.downloadID)
 
-        var hasDurableCompletionMarker = false
+        var claimedCompletion = false
         do {
             let values = try temporaryURL.resourceValues(
                 forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey]
@@ -1432,7 +1452,7 @@ extension BrowserDownloadCoordinator: WKDownloadDelegate {
                 }
                 expectedBytes = actualBytes
             }
-            let claimingManifest = CompletedDownloadHandoffManifest(
+            let manifest = CompletedDownloadHandoffManifest(
                 downloadID: context.downloadID,
                 attemptIdentifier: context.attemptIdentifier,
                 owner: .browser,
@@ -1441,32 +1461,29 @@ extension BrowserDownloadCoordinator: WKDownloadDelegate {
                 mimeType: context.responseMimeType,
                 suggestedFilename: context.suggestedFilename,
                 actualBytes: actualBytes,
-                expectedBytes: expectedBytes,
-                phase: .claiming
+                expectedBytes: expectedBytes
             )
-            let recordedCompletion = try recoveryStore.recordCompletedPayload(
-                claimingManifest,
-                at: temporaryURL
+            let claim = try completedHandoffStore.claim(
+                payloadAt: temporaryURL,
+                manifest: manifest
             )
-            hasDurableCompletionMarker = true
-            let recoveryStore = recoveryStore
+            claimedCompletion = true
+            let completedHandoffStore = completedHandoffStore
             let wasResuming = context.isResumeAttempt
             let statusCode = context.statusCode
             let publicationTask = Task.detached(priority: .utility) {
                 () -> BrowserDownloadEvent in
                 do {
-                    let handoff = try recoveryStore.publishRecordedCompletion(
-                        recordedCompletion
-                    )
+                    let handoff = try completedHandoffStore.finalize(claim)
                     return BrowserDownloadEvent.finished(
-                        id: claimingManifest.downloadID,
-                        attemptIdentifier: claimingManifest.attemptIdentifier,
+                        id: manifest.downloadID,
+                        attemptIdentifier: manifest.attemptIdentifier,
                         handoff: handoff
                     )
                 } catch {
                     return .failed(
-                        id: claimingManifest.downloadID,
-                        attemptIdentifier: claimingManifest.attemptIdentifier,
+                        id: manifest.downloadID,
+                        attemptIdentifier: manifest.attemptIdentifier,
                         failure: DirectDownloadFailure(
                             error: error,
                             resumeData: nil,
@@ -1492,10 +1509,8 @@ extension BrowserDownloadCoordinator: WKDownloadDelegate {
                 pendingStopWaiters.forEach { $0(result) }
             }
         } catch {
-            if hasDurableCompletionMarker == false {
-                // Validation proved the payload unusable, or its ownership
-                // marker could not be committed. It is not recoverable state.
-                recoveryStore.discardUnrecoverablePayload(at: temporaryURL)
+            if claimedCompletion == false {
+                try? fileManager.removeItem(at: temporaryURL)
             }
             onEvent(
                 .failed(

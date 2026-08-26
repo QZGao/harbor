@@ -28,9 +28,9 @@ nonisolated struct CompletedDownloadHandoffManifest: Codable, Equatable, Sendabl
     let actualBytes: Int64
     let expectedBytes: Int64
     let payloadSHA256: String
-    let phase: CompletedDownloadHandoffPhase
-    let destinationPath: String?
-    let placementStagingPath: String?
+    private(set) var phase: CompletedDownloadHandoffPhase
+    private(set) var destinationPath: String?
+    private(set) var placementStagingPath: String?
 
     init(
         downloadID: UUID,
@@ -65,61 +65,15 @@ nonisolated struct CompletedDownloadHandoffManifest: Codable, Equatable, Sendabl
         self.placementStagingPath = placementStagingPath
     }
 
-    private init(
-        version: Int,
-        downloadID: UUID,
-        attemptIdentifier: UUID,
-        createdAt: Date,
-        owner: CompletedDownloadHandoffOwner,
-        sourceURL: URL,
-        statusCode: Int?,
-        mimeType: String?,
-        suggestedFilename: String?,
-        actualBytes: Int64,
-        expectedBytes: Int64,
-        payloadSHA256: String,
-        phase: CompletedDownloadHandoffPhase,
-        destinationPath: String?,
-        placementStagingPath: String?
-    ) {
-        self.version = version
-        self.downloadID = downloadID
-        self.attemptIdentifier = attemptIdentifier
-        self.createdAt = createdAt
-        self.owner = owner
-        self.sourceURL = sourceURL
-        self.statusCode = statusCode
-        self.mimeType = mimeType
-        self.suggestedFilename = suggestedFilename
-        self.actualBytes = actualBytes
-        self.expectedBytes = expectedBytes
-        self.payloadSHA256 = payloadSHA256
-        self.phase = phase
-        self.destinationPath = destinationPath
-        self.placementStagingPath = placementStagingPath
-    }
-
     func recordingDestination(
         _ destinationURL: URL,
         placementStagingURL: URL
     ) -> Self {
-        Self(
-            version: version,
-            downloadID: downloadID,
-            attemptIdentifier: attemptIdentifier,
-            createdAt: createdAt,
-            owner: owner,
-            sourceURL: sourceURL,
-            statusCode: statusCode,
-            mimeType: mimeType,
-            suggestedFilename: suggestedFilename,
-            actualBytes: actualBytes,
-            expectedBytes: expectedBytes,
-            payloadSHA256: payloadSHA256,
-            phase: .destinationRecorded,
-            destinationPath: destinationURL.standardizedFileURL.path,
-            placementStagingPath: placementStagingURL.standardizedFileURL.path
-        )
+        var copy = self
+        copy.phase = .destinationRecorded
+        copy.destinationPath = destinationURL.standardizedFileURL.path
+        copy.placementStagingPath = placementStagingURL.standardizedFileURL.path
+        return copy
     }
 
     func matchesClaim(_ claim: Self, actualBytes: Int64) -> Bool {
@@ -190,11 +144,6 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
         let sha256: String
     }
 
-    private final class DownloadLockEntry {
-        let lock = NSLock()
-        var users = 0
-    }
-
     private static let packageExtension = "handoff"
     private static let stagingExtension = "staging"
     private static let manifestFilename = "manifest.json"
@@ -204,7 +153,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
     private let directoryURL: URL
     private let payloadHashOperation: PayloadHashOperation
     private let registryLock = NSLock()
-    private var downloadLocks: [UUID: DownloadLockEntry] = [:]
+    private var downloadLocks: [UUID: NSLock] = [:]
 
     init(
         fileManager: FileManager = .default,
@@ -1347,34 +1296,15 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
         attemptIdentifier _: UUID,
         _ work: () throws -> T
     ) rethrows -> T {
-        // Every attempt belonging to one record shares a lock. This lets
-        // unrelated downloads validate concurrently while preventing an
-        // all-attempt discard from racing a new claim for the same record.
-        let entry = registryLock.withLock {
-            let entry: DownloadLockEntry
+        let downloadLock = registryLock.withLock {
             if let existing = downloadLocks[downloadID] {
-                entry = existing
-            } else {
-                entry = DownloadLockEntry()
-                downloadLocks[downloadID] = entry
+                return existing
             }
-            entry.users += 1
-            return entry
+            let created = NSLock()
+            downloadLocks[downloadID] = created
+            return created
         }
-        entry.lock.lock()
-        defer {
-            entry.lock.unlock()
-            registryLock.withLock {
-                guard downloadLocks[downloadID] === entry else {
-                    return
-                }
-                entry.users -= 1
-                if entry.users == 0 {
-                    downloadLocks.removeValue(forKey: downloadID)
-                }
-            }
-        }
-        return try work()
+        return try downloadLock.withLock(work)
     }
 
     private func withRegistryLock<T>(_ work: () throws -> T) rethrows -> T {

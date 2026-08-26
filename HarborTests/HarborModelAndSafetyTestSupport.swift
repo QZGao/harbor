@@ -42,7 +42,6 @@ final class ConcurrentMoveResults: @unchecked Sendable {
         )
     }
 }
-
 actor AsyncTestGate {
     private var isReleased = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -64,7 +63,6 @@ actor AsyncTestGate {
         pendingWaiters.forEach { $0.resume() }
     }
 }
-
 actor AsyncTestCounter {
     private var value = 0
 
@@ -77,7 +75,6 @@ actor AsyncTestCounter {
         value
     }
 }
-
 nonisolated final class LockedTestFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var storage = false
@@ -206,11 +203,6 @@ nonisolated final class DirectDownloadTestEventState: @unchecked Sendable {
         lock.unlock()
     }
 
-    func recordCompletion(_ url: URL) {
-        lock.lock()
-        storedCompletedURL = url
-        lock.unlock()
-    }
 
     func recordCompletion(_ handoff: CompletedDownloadHandoff) {
         lock.lock()
@@ -221,19 +213,7 @@ nonisolated final class DirectDownloadTestEventState: @unchecked Sendable {
         lock.unlock()
     }
 
-    func recordCompletion(
-        _ url: URL,
-        suggestedFilename: String?,
-        responseMimeType: String?,
-        statusCode: Int?
-    ) {
-        lock.lock()
-        storedCompletedURL = url
-        storedCompletedSuggestedFilename = suggestedFilename
-        storedCompletedResponseMimeType = responseMimeType
-        storedCompletedStatusCode = statusCode
-        lock.unlock()
-    }
+
 }
 
 nonisolated final class KnownZeroOverflowURLProtocol: URLProtocol, @unchecked Sendable {
@@ -333,15 +313,10 @@ nonisolated final class InterruptingRangeURLProtocol: URLProtocol, @unchecked Se
     private static let stateLock = NSLock()
     private static var headers: [CapturedHeaders] = []
     private static var shouldRejectFirstResume = false
-    private static var shouldShortenFirstResume = false
     private static var shouldOverrunFirstResume = false
-    private static var shouldUseUnknownTotalForFirstResume = false
     private static var shouldOmitValidator = false
-    private static var shouldOmitValidatorOnFirstResume = false
     private static var shouldChangeValidatorOnFirstResume = false
-    private static var shouldChangeTotalOnFirstResume = false
     private static var shouldFallbackToFullResponseOnFirstResume = false
-    private static var shouldContradictSavedTotalOnFirstResume = false
     private static var shouldCompletePartialWithHTML416 = false
     private static var shouldCompletePartialWithoutValidator416 = false
 
@@ -353,30 +328,20 @@ nonisolated final class InterruptingRangeURLProtocol: URLProtocol, @unchecked Se
 
     static func reset(
         rejectFirstResume: Bool = false,
-        shortFirstResume: Bool = false,
         overlongFirstResume: Bool = false,
-        unknownTotalFirstResume: Bool = false,
         omitValidator: Bool = false,
-        omitValidatorOnFirstResume: Bool = false,
         changeValidatorOnFirstResume: Bool = false,
-        changeTotalOnFirstResume: Bool = false,
         fallbackToFullResponseOnFirstResume: Bool = false,
-        contradictSavedTotalOnFirstResume: Bool = false,
         completePartialWithHTML416: Bool = false,
         completePartialWithoutValidator416: Bool = false
     ) {
         stateLock.lock()
         headers = []
         shouldRejectFirstResume = rejectFirstResume
-        shouldShortenFirstResume = shortFirstResume
         shouldOverrunFirstResume = overlongFirstResume
-        shouldUseUnknownTotalForFirstResume = unknownTotalFirstResume
         shouldOmitValidator = omitValidator
-        shouldOmitValidatorOnFirstResume = omitValidatorOnFirstResume
         shouldChangeValidatorOnFirstResume = changeValidatorOnFirstResume
-        shouldChangeTotalOnFirstResume = changeTotalOnFirstResume
         shouldFallbackToFullResponseOnFirstResume = fallbackToFullResponseOnFirstResume
-        shouldContradictSavedTotalOnFirstResume = contradictSavedTotalOnFirstResume
         shouldCompletePartialWithHTML416 = completePartialWithHTML416
         shouldCompletePartialWithoutValidator416 = completePartialWithoutValidator416
         stateLock.unlock()
@@ -397,15 +362,10 @@ nonisolated final class InterruptingRangeURLProtocol: URLProtocol, @unchecked Se
         Self.headers.append(CapturedHeaders(range: range, ifRange: ifRange))
         let requestNumber = Self.headers.count
         let rejectFirstResume = Self.shouldRejectFirstResume
-        let shortenFirstResume = Self.shouldShortenFirstResume
         let overrunFirstResume = Self.shouldOverrunFirstResume
-        let useUnknownTotalForFirstResume = Self.shouldUseUnknownTotalForFirstResume
         let omitValidator = Self.shouldOmitValidator
-        let omitValidatorOnFirstResume = Self.shouldOmitValidatorOnFirstResume
         let changeValidatorOnFirstResume = Self.shouldChangeValidatorOnFirstResume
-        let changeTotalOnFirstResume = Self.shouldChangeTotalOnFirstResume
         let fallbackToFullResponseOnFirstResume = Self.shouldFallbackToFullResponseOnFirstResume
-        let contradictSavedTotalOnFirstResume = Self.shouldContradictSavedTotalOnFirstResume
         let completePartialWithHTML416 = Self.shouldCompletePartialWithHTML416
         let completePartialWithoutValidator416 = Self.shouldCompletePartialWithoutValidator416
         Self.stateLock.unlock()
@@ -464,7 +424,7 @@ nonisolated final class InterruptingRangeURLProtocol: URLProtocol, @unchecked Se
             return
         }
 
-        if (overrunFirstResume || useUnknownTotalForFirstResume),
+        if overrunFirstResume,
            range == nil,
            requestNumber == 3 {
             let response = HTTPURLResponse(
@@ -500,56 +460,8 @@ nonisolated final class InterruptingRangeURLProtocol: URLProtocol, @unchecked Se
             return
         }
 
-        if omitValidatorOnFirstResume, range == nil, requestNumber == 3 {
-            let response = HTTPURLResponse(
-                url: url,
-                statusCode: 200,
-                httpVersion: "HTTP/1.1",
-                headerFields: [
-                    "Content-Length": "10",
-                    "Content-Type": "application/octet-stream",
-                    "ETag": "\"replacement-etag\""
-                ]
-            )!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: Data("klmnopqrst".utf8))
-            client?.urlProtocolDidFinishLoading(self)
-            return
-        }
 
-        if changeTotalOnFirstResume, range == nil, requestNumber == 3 {
-            let response = HTTPURLResponse(
-                url: url,
-                statusCode: 200,
-                httpVersion: "HTTP/1.1",
-                headerFields: [
-                    "Content-Length": "8",
-                    "Content-Type": "application/octet-stream",
-                    "ETag": "\"replacement-etag\""
-                ]
-            )!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: Data("uvwxyz12".utf8))
-            client?.urlProtocolDidFinishLoading(self)
-            return
-        }
 
-        if contradictSavedTotalOnFirstResume, range == nil, requestNumber == 3 {
-            let response = HTTPURLResponse(
-                url: url,
-                statusCode: 200,
-                httpVersion: "HTTP/1.1",
-                headerFields: [
-                    "Content-Length": "5",
-                    "Content-Type": "application/octet-stream",
-                    "ETag": "\"replacement-etag\""
-                ]
-            )!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: Data("uvwxy".utf8))
-            client?.urlProtocolDidFinishLoading(self)
-            return
-        }
 
         if overrunFirstResume,
            requestNumber == 3,
@@ -627,40 +539,7 @@ nonisolated final class InterruptingRangeURLProtocol: URLProtocol, @unchecked Se
             return
         }
 
-        if omitValidatorOnFirstResume, requestNumber == 2 {
-            let response = HTTPURLResponse(
-                url: url,
-                statusCode: 206,
-                httpVersion: "HTTP/1.1",
-                headerFields: [
-                    "Content-Length": "5",
-                    "Content-Range": "bytes 5-9/10",
-                    "Content-Type": "application/octet-stream"
-                ]
-            )!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: Data("pqrst".utf8))
-            client?.urlProtocolDidFinishLoading(self)
-            return
-        }
 
-        if changeTotalOnFirstResume, requestNumber == 2 {
-            let response = HTTPURLResponse(
-                url: url,
-                statusCode: 206,
-                httpVersion: "HTTP/1.1",
-                headerFields: [
-                    "Content-Length": "3",
-                    "Content-Range": "bytes 5-7/8",
-                    "Content-Type": "application/octet-stream",
-                    "ETag": "\"test-etag\""
-                ]
-            )!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: Data("fgh".utf8))
-            client?.urlProtocolDidFinishLoading(self)
-            return
-        }
 
         if fallbackToFullResponseOnFirstResume, requestNumber == 2 {
             let response = HTTPURLResponse(
@@ -678,21 +557,6 @@ nonisolated final class InterruptingRangeURLProtocol: URLProtocol, @unchecked Se
             return
         }
 
-        if contradictSavedTotalOnFirstResume, requestNumber == 2 {
-            let response = HTTPURLResponse(
-                url: url,
-                statusCode: 416,
-                httpVersion: "HTTP/1.1",
-                headerFields: [
-                    "Content-Range": "bytes */5",
-                    "Content-Type": "application/octet-stream",
-                    "ETag": "\"test-etag\""
-                ]
-            )!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocolDidFinishLoading(self)
-            return
-        }
 
         if rejectFirstResume, requestNumber == 2 {
             let response = HTTPURLResponse(
@@ -715,22 +579,6 @@ nonisolated final class InterruptingRangeURLProtocol: URLProtocol, @unchecked Se
             return
         }
 
-        if shortenFirstResume, requestNumber == 2 {
-            let response = HTTPURLResponse(
-                url: url,
-                statusCode: 206,
-                httpVersion: "HTTP/1.1",
-                headerFields: [
-                    "Content-Range": "bytes 5-7/10",
-                    "Content-Type": "application/octet-stream",
-                    "ETag": "\"test-etag\""
-                ]
-            )!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: Data("fgh".utf8))
-            client?.urlProtocolDidFinishLoading(self)
-            return
-        }
 
         if overrunFirstResume, requestNumber == 2 {
             let response = HTTPURLResponse(
@@ -750,23 +598,6 @@ nonisolated final class InterruptingRangeURLProtocol: URLProtocol, @unchecked Se
             return
         }
 
-        if useUnknownTotalForFirstResume, requestNumber == 2 {
-            let response = HTTPURLResponse(
-                url: url,
-                statusCode: 206,
-                httpVersion: "HTTP/1.1",
-                headerFields: [
-                    "Content-Length": "3",
-                    "Content-Range": "bytes 5-7/*",
-                    "Content-Type": "application/octet-stream",
-                    "ETag": "\"test-etag\""
-                ]
-            )!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: Data("fgh".utf8))
-            client?.urlProtocolDidFinishLoading(self)
-            return
-        }
 
         let response = HTTPURLResponse(
             url: url,
@@ -785,13 +616,4 @@ nonisolated final class InterruptingRangeURLProtocol: URLProtocol, @unchecked Se
     }
 
     override func stopLoading() {}
-}
-
-@MainActor
-final class FakeQuickLookPreviewService: QuickLookPreviewing {
-    private(set) var previewedURLs: [URL] = []
-
-    func preview(urls: [URL]) {
-        previewedURLs = urls
-    }
 }

@@ -67,7 +67,6 @@ final class DownloadCenter {
     ) async throws -> Void
     typealias TorrentStartOperation = @Sendable (
         Aria2TorrentService,
-        UUID,
         DownloadSourceKind,
         URL,
         String,
@@ -109,7 +108,6 @@ final class DownloadCenter {
     @ObservationIgnored private let browserQuiescenceOperation: BrowserQuiescenceOperation
     @ObservationIgnored private let urlSessionCleanupOperation: URLSessionCleanupOperation
     @ObservationIgnored private let completedHandoffStore: CompletedDownloadHandoffStore
-    @ObservationIgnored private let pendingDataRemovalStore: PendingDownloadDataRemovalStore
     @ObservationIgnored private let sleepPreventionService: any DownloadSleepPreventing
     @ObservationIgnored private let quickLookPreviewService: any QuickLookPreviewing
     @ObservationIgnored private var coordinator: DownloadCoordinator! = nil
@@ -134,9 +132,6 @@ final class DownloadCenter {
     @ObservationIgnored private var pendingTorrentPauseIDs: Set<UUID> = []
     @ObservationIgnored private var pendingTorrentSeedingRestartIDs: Set<UUID> = []
     @ObservationIgnored private var orphanedTorrentCleanupTasks: [String: Task<Void, Never>] = [:]
-    @ObservationIgnored private var pendingRemovalReconciliationTask: Task<Void, Never>?
-    @ObservationIgnored private var pendingRemovalReservedIDs: Set<UUID> = []
-    @ObservationIgnored private var pendingRemovalQuarantinedIDs: Set<UUID> = []
     @ObservationIgnored private var directRetryTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private var directRetryAttempts: [UUID: Int] = [:]
     @ObservationIgnored private var readyDirectRetries: [UUID: Bool] = [:]
@@ -203,7 +198,6 @@ final class DownloadCenter {
         directRecoveryDirectoryURL: URL? = nil,
         completedHandoffDirectoryURL: URL? = nil,
         browserRecoveryDirectoryURL: URL? = nil,
-        pendingDataRemovalDirectoryURL: URL? = nil,
         destinationResolver: DownloadDestinationResolver = DownloadDestinationResolver(),
         notificationService: DownloadNotificationService = DownloadNotificationService(),
         dataRemovalService: DownloadDataRemovalService = DownloadDataRemovalService(),
@@ -227,9 +221,8 @@ final class DownloadCenter {
             try await service.pause(gid: gid)
         },
         torrentStartOperation: @escaping TorrentStartOperation = {
-            service, ownerDownloadID, sourceKind, sourceURL, destinationFolderPath, transferOptions in
+            service, sourceKind, sourceURL, destinationFolderPath, transferOptions in
             try await service.addDownload(
-                ownerDownloadID: ownerDownloadID,
                 sourceKind: sourceKind,
                 sourceURL: sourceURL,
                 destinationFolderPath: destinationFolderPath,
@@ -256,9 +249,6 @@ final class DownloadCenter {
         let completedHandoffStore = CompletedDownloadHandoffStore(
             directoryURL: completedHandoffDirectoryURL
         )
-        let pendingDataRemovalStore = PendingDownloadDataRemovalStore(
-            directoryURL: pendingDataRemovalDirectoryURL
-        )
         self.settings = settings
         self.recordStore = DownloadRecordStore(
             persistence: persistence,
@@ -283,7 +273,6 @@ final class DownloadCenter {
         self.browserQuiescenceOperation = browserQuiescenceOperation
         self.urlSessionCleanupOperation = urlSessionCleanupOperation
         self.completedHandoffStore = completedHandoffStore
-        self.pendingDataRemovalStore = pendingDataRemovalStore
         self.mediaService = mediaService ?? MediaDownloadService { [weak self] attemptIdentifier, event in
             Task { @MainActor [weak self] in
                 self?.handle(event, attemptIdentifier: attemptIdentifier)
@@ -322,7 +311,6 @@ final class DownloadCenter {
         torrentRefreshTask?.cancel()
         directRetryTasks.values.forEach { $0.cancel() }
         orphanedTorrentCleanupTasks.values.forEach { $0.cancel() }
-        pendingRemovalReconciliationTask?.cancel()
         Task { @MainActor [torrentWatchFolderService] in
             torrentWatchFolderService.stop()
         }
@@ -419,40 +407,7 @@ final class DownloadCenter {
                 }
 
             downloads = restoredItems
-            let pendingRemovalNeedsRetry = try await reconcilePendingDataRemovals()
             try await reconcileCompletedMediaDownloads()
-            let browserCompletionRecoveryFailures: [UUID: String]
-            do {
-                browserCompletionRecoveryFailures = try await browserCoordinator
-                    .recoverCompletedTemporaryFiles()
-            } catch {
-                browserCompletionRecoveryFailures = [:]
-                let message = completedHandoffUnavailableMessage(
-                    error.localizedDescription
-                )
-                for item in downloads
-                where item.backend == .urlSession && item.status.isTerminal == false {
-                    item.taskIdentifier = nil
-                    item.speedBytesPerSecond = 0
-                    item.uploadBytesPerSecond = 0
-                    item.lastError = message
-                    setStatus(for: item, to: .failed)
-                    item.updatedAt = .now
-                }
-            }
-            for (id, message) in browserCompletionRecoveryFailures {
-                guard let item = item(for: id),
-                      item.backend == .urlSession,
-                      item.status.isTerminal == false else {
-                    continue
-                }
-                item.taskIdentifier = nil
-                item.speedBytesPerSecond = 0
-                item.uploadBytesPerSecond = 0
-                item.lastError = completedHandoffUnavailableMessage(message)
-                setStatus(for: item, to: .failed)
-                item.updatedAt = .now
-            }
             try await reconcileCompletedHandoffs()
             let directDownloadIDs = Set(
                 downloads
@@ -571,9 +526,7 @@ final class DownloadCenter {
             }
             coordinator.discardOrphanedTemporaryFiles()
             let retainedCompletionIDs = Set(downloads.map(\.id))
-            browserCoordinator.discardOrphanedTemporaryFiles(
-                retaining: retainedCompletionIDs
-            )
+            browserCoordinator.discardOrphanedTemporaryFiles()
             let completedHandoffStore = completedHandoffStore
             await Task.detached(priority: .utility) {
                 completedHandoffStore.discardOrphans(
@@ -602,9 +555,6 @@ final class DownloadCenter {
             initializationState = .loaded
             initializationFailureMessage = nil
             presentNextQueuedExternalAddSheetIfNeeded()
-            if pendingRemovalNeedsRetry {
-                schedulePendingRemovalReconciliation()
-            }
             configureTorrentWatchFolder()
 
             if settings.startDownloadsAutomatically {
@@ -660,10 +610,6 @@ final class DownloadCenter {
 
         for invalidPackage in invalidPackages {
             if let id = invalidPackage.id,
-               pendingRemovalReservedIDs.contains(id) {
-                continue
-            }
-            if let id = invalidPackage.id,
                validHandoffsByID[id]?.isEmpty == false {
                 // A valid package is authoritative for this download. An
                 // incomplete or corrupt sibling must never downgrade the item
@@ -712,7 +658,6 @@ final class DownloadCenter {
 
         for unavailablePackage in unavailablePackages {
             guard let id = unavailablePackage.id,
-                  pendingRemovalReservedIDs.contains(id) == false,
                   validHandoffsByID[id]?.isEmpty != false,
                   let item = item(for: id),
                   item.backend == .urlSession,
@@ -756,9 +701,6 @@ final class DownloadCenter {
         }
 
         for (id, candidates) in validHandoffsByID {
-            guard pendingRemovalReservedIDs.contains(id) == false else {
-                continue
-            }
             guard let item = item(for: id),
                   item.backend == .urlSession,
                   item.status != .cancelled else {
@@ -799,9 +741,6 @@ final class DownloadCenter {
         for entry in entries {
             switch entry {
             case let .valid(manifest):
-                guard pendingRemovalReservedIDs.contains(manifest.downloadID) == false else {
-                    continue
-                }
                 guard let item = item(for: manifest.downloadID),
                       mediaCompletion(manifest, belongsTo: item),
                       item.status != .cancelled else {
@@ -811,9 +750,6 @@ final class DownloadCenter {
                 _ = await commitMediaCompletion(manifest, to: item)
 
             case let .invalid(downloadID, message):
-                guard pendingRemovalReservedIDs.contains(downloadID) == false else {
-                    continue
-                }
                 guard let item = item(for: downloadID),
                       item.backend == .ytDlp,
                       item.status != .cancelled,
@@ -831,9 +767,6 @@ final class DownloadCenter {
                 }
 
             case let .unavailable(downloadID, message):
-                guard pendingRemovalReservedIDs.contains(downloadID) == false else {
-                    continue
-                }
                 guard let item = item(for: downloadID),
                       item.backend == .ytDlp,
                       item.status != .cancelled,
@@ -1030,248 +963,6 @@ final class DownloadCenter {
         }
     }
 
-    private func reconcilePendingDataRemovals() async throws -> Bool {
-        let pendingDataRemovalStore = pendingDataRemovalStore
-        let entries = try await Task.detached(priority: .utility) {
-            try pendingDataRemovalStore.recoveryEntries()
-        }.value
-        let manifests: [PendingDownloadDataRemovalManifest] = entries.compactMap { entry in
-            guard case let .valid(manifest) = entry else {
-                return nil
-            }
-            return manifest
-        }
-        let unavailableMessages = entries.compactMap { entry -> String? in
-            switch entry {
-            case .valid:
-                nil
-            case let .invalid(downloadID, message),
-                 let .unavailable(downloadID, message):
-                if let downloadID {
-                    "\(downloadID.uuidString): \(message)"
-                } else {
-                    message
-                }
-            }
-        }
-        pendingRemovalReservedIDs = Set(entries.compactMap(\.downloadID))
-        let quarantinedIDs = Set(
-            entries.compactMap { entry -> UUID? in
-                switch entry {
-                case .valid:
-                    nil
-                case let .invalid(downloadID, _),
-                     let .unavailable(downloadID, _):
-                    downloadID
-                }
-            }
-        )
-        pendingRemovalQuarantinedIDs = quarantinedIDs
-        var didQuarantineTrackedItem = false
-        for id in quarantinedIDs {
-            guard let item = item(for: id),
-                  item.status != .completed,
-                  item.status != .cancelled else {
-                continue
-            }
-            let message = pendingRemovalQuarantineMessage
-            if item.status != .failed || item.lastError != message {
-                item.taskIdentifier = nil
-                item.backendIdentifier = nil
-                item.speedBytesPerSecond = 0
-                item.uploadBytesPerSecond = 0
-                item.lastError = message
-                item.updatedAt = .now
-                setStatus(for: item, to: .failed)
-                didQuarantineTrackedItem = true
-            }
-        }
-        if didQuarantineTrackedItem {
-            try await saveRecordsNow()
-        }
-
-        for originalManifest in manifests.sorted(by: { $0.createdAt < $1.createdAt }) {
-            var manifest = originalManifest
-            let record = manifest.record
-
-            if manifest.phase == .payloadPending {
-                manifest = try pendingDataRemovalStore.markPayloadDeletionStarted(
-                    downloadID: record.id
-                )
-                let result = dataRemovalService.movePayloadDataToTrash(
-                    destinationFolderPath: record.destinationFolderPath,
-                    payloadPaths: Self.payloadPaths(for: record)
-                )
-                if result.failures.isEmpty == false {
-                    let trackedItem = trackedItemRestoringIfNeeded(from: record)
-                    applyPartialDataRemovalResult(result, to: trackedItem)
-                    try await saveRecordsNow()
-                    try? acknowledgePendingDataRemoval(downloadID: record.id)
-                    continue
-                }
-                manifest = try pendingDataRemovalStore.markBackendCleanup(
-                    downloadID: record.id
-                )
-            } else if manifest.phase == .payloadDeletionStarted {
-                let inspection = dataRemovalService.inspectPayloadData(
-                    destinationFolderPath: record.destinationFolderPath,
-                    payloadPaths: Self.payloadPaths(for: record)
-                )
-                if inspection.existingPaths.isEmpty == false
-                    || inspection.failures.isEmpty == false {
-                    // A crash may have happened immediately before or after a
-                    // Trash operation. An extant pathname can now name a
-                    // replacement file, so preserve it and restore the record
-                    // instead of replaying a destructive path-only intent.
-                    let trackedItem = trackedItemRestoringIfNeeded(from: record)
-                    applyInterruptedDataRemovalInspection(inspection, to: trackedItem)
-                    try await saveRecordsNow()
-                    try acknowledgePendingDataRemoval(downloadID: record.id)
-                    activeAlert = UserAlert(
-                        title: String(localized: "Download Data Was Left in Place"),
-                        message: trackedItem.lastError ?? ""
-                    )
-                    continue
-                }
-                manifest = try pendingDataRemovalStore.markBackendCleanup(
-                    downloadID: record.id
-                )
-            }
-
-            guard manifest.phase == .backendCleanup else {
-                throw CocoaError(.fileReadCorruptFile)
-            }
-            downloads.removeAll { $0.id == record.id }
-            try await saveRecordsNow()
-
-            let cleanupItem = DownloadItem(record: record)
-            do {
-                try await discardBackendRecovery(
-                    for: cleanupItem,
-                    backendIdentifier: record.backendIdentifier
-                )
-                moveOriginalTorrentFileToTrashIfNeeded(for: cleanupItem)
-                removeManagedTorrentSourceIfNeeded(for: cleanupItem)
-                try? acknowledgePendingDataRemoval(downloadID: record.id)
-            } catch {
-                // This phase contains no payload mutation. Retaining it is
-                // safe even if a different file later appears at the old path.
-                activeAlert = UserAlert(
-                    title: String(localized: "Download Removed; Backend Cleanup Pending"),
-                    message: error.localizedDescription
-                )
-            }
-        }
-
-        if unavailableMessages.isEmpty == false, activeAlert == nil {
-            activeAlert = UserAlert(
-                title: String(localized: "Download Cleanup Needs Attention"),
-                message: unavailableMessages.joined(separator: "\n")
-            )
-        }
-
-        // Invalid journals need user intervention and must not create an
-        // endless retry loop. Valid or temporarily unavailable journals remain
-        // replayable, including a valid entry whose final acknowledgement was
-        // interrupted.
-        let remainingEntries = try pendingDataRemovalStore.recoveryEntries()
-        pendingRemovalReservedIDs = Set(remainingEntries.compactMap(\.downloadID))
-        pendingRemovalQuarantinedIDs = Set(
-            remainingEntries.compactMap { entry -> UUID? in
-                switch entry {
-                case .valid:
-                    nil
-                case let .invalid(downloadID, _),
-                     let .unavailable(downloadID, _):
-                    downloadID
-                }
-            }
-        )
-        return remainingEntries.contains { entry in
-            switch entry {
-            case .valid, .unavailable:
-                true
-            case .invalid:
-                false
-            }
-        }
-    }
-
-    private func trackedItemRestoringIfNeeded(
-        from record: DownloadRecord
-    ) -> DownloadItem {
-        if let existing = item(for: record.id) {
-            return existing
-        }
-        let restored = DownloadItem(record: record)
-        downloads.append(restored)
-        return restored
-    }
-
-    private func acknowledgePendingDataRemoval(downloadID: UUID) throws {
-        try pendingDataRemovalStore.acknowledgeOrThrow(downloadID: downloadID)
-        pendingRemovalReservedIDs.remove(downloadID)
-        pendingRemovalQuarantinedIDs.remove(downloadID)
-    }
-
-    private var pendingRemovalQuarantineMessage: String {
-        String(
-            localized: "download.cleanupJournal.quarantined",
-            defaultValue: "Harbor found an unreadable cleanup journal for this download. Its data was left untouched.",
-            comment: "Failure shown when one download is quarantined because its durable cleanup journal cannot be verified."
-        )
-    }
-
-    private func schedulePendingRemovalReconciliation() {
-        guard pendingRemovalReconciliationTask == nil,
-              initializationState == .loaded,
-              isShuttingDown == false else {
-            return
-        }
-        pendingRemovalReconciliationTask = Task { @MainActor [weak self] in
-            guard let self else {
-                return
-            }
-            defer { self.pendingRemovalReconciliationTask = nil }
-            let delays = [
-                Duration.seconds(2),
-                .seconds(10),
-                .seconds(30),
-                .seconds(60)
-            ]
-            var retryIndex = 0
-            while true {
-                do {
-                    let delay = delays[min(retryIndex, delays.count - 1)]
-                    try await Task.sleep(for: delay)
-                    guard self.isShuttingDown == false else {
-                        return
-                    }
-                    let needsRetry = try await self.reconcilePendingDataRemovals()
-                    if needsRetry == false {
-                        return
-                    }
-                    retryIndex += 1
-                } catch is CancellationError {
-                    return
-                } catch {
-                    self.activeAlert = UserAlert(
-                        title: String(localized: "Download Cleanup Still Pending"),
-                        message: error.localizedDescription
-                    )
-                    retryIndex += 1
-                }
-            }
-        }
-    }
-
-    private nonisolated static func payloadPaths(for record: DownloadRecord) -> [String] {
-        if record.torrentPayloadPaths.isEmpty == false {
-            return record.torrentPayloadPaths
-        }
-        return record.fileLocationPath.map { [$0] } ?? []
-    }
-
     private func applyPartialDataRemovalResult(
         _ result: DownloadDataRemovalResult,
         to item: DownloadItem
@@ -1286,40 +977,6 @@ final class DownloadCenter {
         item.lastError = result.failures
             .map { "\($0.path): \($0.message)" }
             .joined(separator: "\n")
-        item.updatedAt = .now
-    }
-
-    private func applyInterruptedDataRemovalInspection(
-        _ inspection: DownloadPayloadInspection,
-        to item: DownloadItem
-    ) {
-        let retainedPaths = Array(
-            Set(inspection.existingPaths + inspection.failures.map(\.path))
-        ).sorted()
-        item.torrentPayloadPaths = retainedPaths
-        if let currentPath = item.fileLocationPath,
-           retainedPaths.contains(currentPath) {
-            item.fileLocationPath = currentPath
-        } else {
-            item.fileLocationPath = retainedPaths.first
-        }
-        item.taskIdentifier = nil
-        item.speedBytesPerSecond = 0
-        item.uploadBytesPerSecond = 0
-        item.shouldSeedAfterDownload = false
-        item.status = item.finishedAt == nil ? .cancelled : .completed
-        item.lastError = String(
-            localized: "download.removeData.interrupted",
-            defaultValue: "Harbor could not prove that the files remaining at the original paths still belong to this download after an interrupted removal, so it left them in place. Already removed paths were retired from this record.",
-            comment: "Safety message shown when an interrupted removal could otherwise delete replacement files."
-        )
-        if inspection.failures.isEmpty == false {
-            item.lastError = ([item.lastError] + inspection.failures.map {
-                "\($0.path): \($0.message)"
-            })
-            .compactMap { $0 }
-            .joined(separator: "\n")
-        }
         item.updatedAt = .now
     }
 
@@ -1814,199 +1471,11 @@ final class DownloadCenter {
         item.lastError = error.localizedDescription
     }
 
-    private func reconcileRestoredTorrentSession(
-        knownEngineGIDs: Set<String>? = nil,
-        stopsAfterReservationAdoption: Bool = false
-    ) async {
-        let reservations: [TorrentSubmissionReservation]
-        let pendingRemovalIDs: Set<UUID>
+    private func reconcileRestoredTorrentSession() async {
         var engineGIDs: Set<String>
         do {
-            reservations = try await torrentService.pendingSubmissionReservations()
-            let pendingDataRemovalStore = pendingDataRemovalStore
-            pendingRemovalIDs = try await Task.detached(priority: .utility) {
-                Set(
-                    try pendingDataRemovalStore.recoveryEntries()
-                        .compactMap(\.downloadID)
-                )
-            }.value
+            engineGIDs = try await torrentService.allKnownGIDs()
         } catch {
-            // Reservation enumeration is part of ownership recovery. If it is
-            // unreadable, orphan deletion must fail closed: one of those GIDs
-            // may belong to a record whose save was interrupted.
-            activeAlert = UserAlert(
-                title: String(localized: "Couldn’t Restore Torrent Ownership"),
-                message: error.localizedDescription
-            )
-            return
-        }
-        if let knownEngineGIDs {
-            engineGIDs = knownEngineGIDs
-        } else {
-            do {
-                engineGIDs = try await torrentService.allKnownGIDs()
-            } catch {
-                // Preserve the previous best-effort behavior when there is no
-                // unresolved reservation ownership. In particular, do not
-                // replace a more actionable startup alert from another
-                // recovery subsystem merely because aria2 is unavailable.
-                if reservations.isEmpty == false {
-                    activeAlert = UserAlert(
-                        title: String(localized: "Couldn’t Restore Torrent Ownership"),
-                        message: error.localizedDescription
-                    )
-                }
-                return
-            }
-        }
-
-        var didAdoptReservation = false
-        var reservationsToAcknowledge: [TorrentSubmissionReservation] = []
-        var pendingRemovalReservationGIDs: Set<String> = []
-        for reservation in reservations {
-            if pendingRemovalIDs.contains(reservation.ownerDownloadID) {
-                do {
-                    if engineGIDs.contains(reservation.gid) {
-                        try await torrentRemoveOperation(torrentService, reservation.gid)
-                        engineGIDs.remove(reservation.gid)
-                    }
-                    try await torrentService.acknowledgeSubmission(
-                        ownerDownloadID: reservation.ownerDownloadID,
-                        gid: reservation.gid
-                    )
-                } catch {
-                    // A durable removal journal supersedes reconstruction.
-                    // Keep the reservation out of normal adoption/orphan
-                    // handling and let confirmed cleanup retry it instead.
-                    pendingRemovalReservationGIDs.insert(reservation.gid)
-                    scheduleOrphanedTorrentCleanup(gid: reservation.gid)
-                    activeAlert = UserAlert(
-                        title: String(localized: "Download Removed; Backend Cleanup Pending"),
-                        message: error.localizedDescription
-                    )
-                }
-                continue
-            }
-
-            let sourceKind = reservation.sourceKind
-                ?? (reservation.sourceURL.scheme?.lowercased() == "magnet"
-                    ? .magnetLink
-                    : .torrentFile)
-            guard sourceKind == .magnetLink || sourceKind == .torrentFile else {
-                activeAlert = UserAlert(
-                    title: String(localized: "Couldn’t Restore Torrent Ownership"),
-                    message: "A pending torrent reservation has an invalid source type."
-                )
-                return
-            }
-
-            if let item = item(for: reservation.ownerDownloadID) {
-                guard torrentReservation(
-                    reservation,
-                    matches: item,
-                    sourceKind: sourceKind
-                ) else {
-                    if engineGIDs.contains(reservation.gid) {
-                        activeAlert = UserAlert(
-                            title: String(localized: "Couldn’t Restore Torrent Ownership"),
-                            message: "A live torrent reservation conflicts with its saved download record."
-                        )
-                        return
-                    }
-                    reservationsToAcknowledge.append(reservation)
-                    continue
-                }
-
-                if let persistedGID = item.backendIdentifier,
-                   persistedGID != reservation.gid {
-                    if engineGIDs.contains(reservation.gid) {
-                        activeAlert = UserAlert(
-                            title: String(localized: "Couldn’t Restore Torrent Ownership"),
-                            message: "Two torrent identifiers claim the same saved download."
-                        )
-                        return
-                    }
-                    reservationsToAcknowledge.append(reservation)
-                    continue
-                }
-
-                let isTerminalCleanup = item.status == .cancelled
-                    || (item.status == .completed && item.shouldSeedAfterDownload == false)
-                if engineGIDs.contains(reservation.gid) {
-                    if item.backendIdentifier == nil {
-                        item.backendIdentifier = reservation.gid
-                        item.updatedAt = .now
-                        didAdoptReservation = true
-                    }
-                    if isTerminalCleanup == false {
-                        reservationsToAcknowledge.append(reservation)
-                    }
-                } else if isTerminalCleanup {
-                    reservationsToAcknowledge.append(reservation)
-                }
-                continue
-            }
-
-            let item = DownloadItem(
-                id: reservation.ownerDownloadID,
-                createdAt: reservation.createdAt,
-                sourceURL: reservation.sourceURL,
-                sourceKind: sourceKind,
-                backend: .aria2,
-                preferredFilename: nil,
-                destinationFolderPath: reservation.destinationFolderPath,
-                status: settings.startDownloadsAutomatically ? .queued : .paused,
-                backendIdentifier: engineGIDs.contains(reservation.gid)
-                    ? reservation.gid
-                    : nil,
-                metadataName: sourceKind == .magnetLink
-                    ? MagnetLinkMetadata(url: reservation.sourceURL).displayName
-                    : nil,
-                managedTorrentSourcePath: sourceKind == .torrentFile
-                    && reservation.sourceURL.isFileURL
-                    ? reservation.sourceURL.path
-                    : nil,
-                shouldSeedAfterDownload: reservation.shouldSeedAfterDownload
-                    ?? settings.seedNewTorrents
-            )
-            downloads.append(item)
-            didAdoptReservation = true
-            if engineGIDs.contains(reservation.gid) {
-                reservationsToAcknowledge.append(reservation)
-            }
-        }
-
-        if didAdoptReservation {
-            downloads.sort { $0.createdAt > $1.createdAt }
-            do {
-                try await saveRecordsNow()
-            } catch {
-                activeAlert = UserAlert(
-                    title: String(localized: "Couldn’t Save Torrent Ownership"),
-                    message: error.localizedDescription
-                )
-                return
-            }
-        }
-
-        for reservation in reservationsToAcknowledge {
-            do {
-                try await torrentService.acknowledgeSubmission(
-                    ownerDownloadID: reservation.ownerDownloadID,
-                    gid: reservation.gid
-                )
-            } catch {
-                // Ownership is already durable (or the reservation was proven
-                // absent from aria2). Leaving the reservation in place is safe
-                // and lets a later launch retry acknowledgement.
-                activeAlert = UserAlert(
-                    title: String(localized: "Torrent Ownership Cleanup Pending"),
-                    message: error.localizedDescription
-                )
-            }
-        }
-
-        if stopsAfterReservationAdoption {
             return
         }
 
@@ -2040,26 +1509,7 @@ final class DownloadCenter {
                 )
                 return
             }
-            for reservation in reservations {
-                guard let item = item(for: reservation.ownerDownloadID),
-                      item.backendIdentifier == nil,
-                      item.status == .cancelled
-                        || (item.status == .completed
-                            && item.shouldSeedAfterDownload == false) else {
-                    continue
-                }
-                do {
-                    try await torrentService.acknowledgeSubmission(
-                        ownerDownloadID: reservation.ownerDownloadID,
-                        gid: reservation.gid
-                    )
-                } catch {
-                    activeAlert = UserAlert(
-                        title: String(localized: "Torrent Ownership Cleanup Pending"),
-                        message: error.localizedDescription
-                    )
-                }
-            }
+
         }
 
         let persistedTorrentItems = downloads.filter {
@@ -2067,7 +1517,6 @@ final class DownloadCenter {
         }
         let persistedGIDs = Set(persistedTorrentItems.compactMap(\.backendIdentifier))
         var retainedEngineGIDs = persistedGIDs
-        retainedEngineGIDs.formUnion(pendingRemovalReservationGIDs)
         var completedOwnershipExpansion = true
 
         for item in persistedTorrentItems {
@@ -2131,26 +1580,6 @@ final class DownloadCenter {
                 }
             }
         }
-    }
-
-    private func torrentReservation(
-        _ reservation: TorrentSubmissionReservation,
-        matches item: DownloadItem,
-        sourceKind: DownloadSourceKind
-    ) -> Bool {
-        guard item.backend == .aria2,
-              item.sourceKind == sourceKind,
-              URL(fileURLWithPath: item.destinationFolderPath).standardizedFileURL.path
-                == URL(fileURLWithPath: reservation.destinationFolderPath).standardizedFileURL.path else {
-            return false
-        }
-
-        let itemSource = torrentEngineSourceURL(for: item)
-        if itemSource.isFileURL || reservation.sourceURL.isFileURL {
-            return itemSource.standardizedFileURL.path
-                == reservation.sourceURL.standardizedFileURL.path
-        }
-        return itemSource.absoluteString == reservation.sourceURL.absoluteString
     }
 
     static func retainedMediaRecoveryIDs(in items: [DownloadItem]) -> Set<UUID> {
@@ -2524,9 +1953,6 @@ final class DownloadCenter {
         guard initializationState == .loaded else {
             return await shutdownWithoutAuthoritativeRecords()
         }
-        let pendingRemovalReconciliation = pendingRemovalReconciliationTask
-        pendingRemovalReconciliationTask = nil
-        pendingRemovalReconciliation?.cancel()
         await cancelPendingPersistenceAndWait()
         let pendingTorrentRefresh = torrentRefreshTask
         torrentRefreshTask = nil
@@ -2539,7 +1965,6 @@ final class DownloadCenter {
         torrentWatchFolderService.stop()
 
         await pendingTorrentRefresh?.value
-        await pendingRemovalReconciliation?.value
         await cancelOrphanedTorrentCleanupTasksAndWait()
 
         await waitForTasks(
@@ -2782,9 +2207,6 @@ final class DownloadCenter {
     }
 
     private func shutdownWithoutAuthoritativeRecords() async -> Bool {
-        let pendingRemovalReconciliation = pendingRemovalReconciliationTask
-        pendingRemovalReconciliationTask = nil
-        pendingRemovalReconciliation?.cancel()
         let pendingTorrentRefresh = torrentRefreshTask
         torrentRefreshTask = nil
         pendingTorrentRefresh?.cancel()
@@ -2795,7 +2217,6 @@ final class DownloadCenter {
         readyDirectRetries.removeAll()
         torrentWatchFolderService.stop()
         await cancelPendingPersistenceAndWait()
-        await pendingRemovalReconciliation?.value
         await pendingTorrentRefresh?.value
 
         await waitForTasks(
@@ -3220,9 +2641,6 @@ final class DownloadCenter {
     func retryDownload(id: UUID) {
         guard isShuttingDown == false,
               let item = item(for: id) else {
-            return
-        }
-        guard isStartBlockedByPendingRemoval(for: item) == false else {
             return
         }
 
@@ -3810,9 +3228,6 @@ final class DownloadCenter {
                 }
                 storeBrowserPauseResult(quiescence.resumeData, for: item)
                 if let message = quiescence.completionUnavailableMessage {
-                    _ = try await browserCoordinator.recoverCompletedTemporaryFiles(
-                        downloadID: id
-                    )
                     if await completedHandoff(
                         downloadID: id,
                         attemptIdentifier: quiescence.attemptIdentifier
@@ -3880,9 +3295,6 @@ final class DownloadCenter {
             if let backendIdentifier {
                 try await torrentRemoveOperation(torrentService, backendIdentifier)
             }
-            try await torrentService.discardPendingSubmission(
-                ownerDownloadID: item.id
-            )
             removeTorrentSidecars(torrentSidecarContext(for: item))
         case .ytDlp:
             try await mediaCleanupOperation(mediaService, item.id)
@@ -4126,71 +3538,7 @@ final class DownloadCenter {
         let rollbackStatus = item.status
         let backendIdentifier = item.backendIdentifier ?? backendIdentifierBeforeQuiescence
 
-        let removalManifest: PendingDownloadDataRemovalManifest
-        do {
-            removalManifest = try pendingDataRemovalStore.publish(
-                record: item.makeRecord(),
-                removingData: removingData
-            )
-            pendingRemovalReservedIDs.insert(id)
-            pendingRemovalQuarantinedIDs.remove(id)
-        } catch {
-            item.status = durableMutationFailureStatus(from: rollbackStatus)
-            item.lastError = error.localizedDescription
-            item.updatedAt = .now
-            directAttemptStates.removeValue(forKey: id)
-            activeAlert = UserAlert(
-                title: removingData
-                    ? String(localized: "Couldn’t Prepare Download Data Removal")
-                    : String(localized: "Couldn’t Prepare Download Removal"),
-                message: error.localizedDescription
-            )
-            return
-        }
-
-        if removalManifest.removesPayload,
-           removalManifest.phase == .payloadDeletionStarted {
-            let inspection = dataRemovalService.inspectPayloadData(
-                destinationFolderPath: removalManifest.record.destinationFolderPath,
-                payloadPaths: Self.payloadPaths(for: removalManifest.record)
-            )
-            if inspection.existingPaths.isEmpty == false
-                || inspection.failures.isEmpty == false {
-                applyInterruptedDataRemovalInspection(inspection, to: item)
-                do {
-                    try await saveRecordsNow()
-                    try acknowledgePendingDataRemoval(downloadID: id)
-                } catch {
-                    item.lastError = [item.lastError, error.localizedDescription]
-                        .compactMap { $0 }
-                        .joined(separator: "\n")
-                    schedulePendingRemovalReconciliation()
-                }
-                activeAlert = UserAlert(
-                    title: String(localized: "Download Data Was Left in Place"),
-                    message: item.lastError ?? ""
-                )
-                directAttemptStates.removeValue(forKey: id)
-                return
-            }
-        }
-
-        if removalManifest.removesPayload,
-           removalManifest.phase == .payloadPending {
-            do {
-                _ = try pendingDataRemovalStore.markPayloadDeletionStarted(downloadID: id)
-            } catch {
-                item.status = durableMutationFailureStatus(from: rollbackStatus)
-                item.lastError = error.localizedDescription
-                item.updatedAt = .now
-                directAttemptStates.removeValue(forKey: id)
-                activeAlert = UserAlert(
-                    title: String(localized: "Couldn’t Prepare Download Data Removal"),
-                    message: error.localizedDescription
-                )
-                schedulePendingRemovalReconciliation()
-                return
-            }
+        if removingData {
             let result = dataRemovalService.movePayloadDataToTrash(
                 destinationFolderPath: item.destinationFolderPath,
                 payloadPaths: payloadPaths(for: item)
@@ -4199,12 +3547,10 @@ final class DownloadCenter {
                 applyPartialDataRemovalResult(result, to: item)
                 do {
                     try await saveRecordsNow()
-                    try acknowledgePendingDataRemoval(downloadID: id)
                 } catch {
                     item.lastError = [item.lastError, error.localizedDescription]
                         .compactMap { $0 }
                         .joined(separator: "\n")
-                    schedulePendingRemovalReconciliation()
                 }
                 activeAlert = UserAlert(
                     title: String(localized: "Some Download Data Couldn’t Be Moved to Trash"),
@@ -4215,25 +3561,7 @@ final class DownloadCenter {
             }
         }
 
-        if removalManifest.removesPayload,
-           removalManifest.phase != .backendCleanup {
-            do {
-                _ = try pendingDataRemovalStore.markBackendCleanup(downloadID: id)
-            } catch {
-                item.status = durableMutationFailureStatus(from: rollbackStatus)
-                item.lastError = error.localizedDescription
-                item.updatedAt = .now
-                directAttemptStates.removeValue(forKey: id)
-                activeAlert = UserAlert(
-                    title: String(localized: "Download Data Removed; Record Cleanup Pending"),
-                    message: error.localizedDescription
-                )
-                schedulePendingRemovalReconciliation()
-                return
-            }
-        }
-
-        var shouldContinueBackendCleanup = false
+        var didPersistRemoval = false
         await performSerializedDurableMutation { [weak self, weak item] in
             guard let self,
                   let item,
@@ -4251,53 +3579,37 @@ final class DownloadCenter {
 
             do {
                 try await self.saveRecordsNow()
-                shouldContinueBackendCleanup = true
+                didPersistRemoval = true
             } catch {
-                self.directAttemptStates.removeValue(forKey: id)
-                if removalManifest.removesPayload {
-                    self.activeAlert = UserAlert(
-                        title: String(localized: "Download Data Removed; Record Cleanup Pending"),
-                        message: error.localizedDescription
-                    )
-                    self.schedulePendingRemovalReconciliation()
+                self.downloads.insert(item, at: min(originalIndex, self.downloads.endIndex))
+                self.restoreSelection(
+                    selectedIDs: previousSelectedIDs,
+                    selectedID: previousSelectedID
+                )
+                if removingData {
+                    item.fileLocationPath = nil
+                    item.torrentPayloadPaths = []
+                    item.shouldSeedAfterDownload = false
+                    item.status = item.finishedAt == nil ? .cancelled : .completed
                 } else {
-                    do {
-                        try self.acknowledgePendingDataRemoval(downloadID: id)
-                        self.downloads.insert(
-                            item,
-                            at: min(originalIndex, self.downloads.endIndex)
-                        )
-                        self.restoreSelection(
-                            selectedIDs: previousSelectedIDs,
-                            selectedID: previousSelectedID
-                        )
-                        item.status = self.durableMutationFailureStatus(from: rollbackStatus)
-                        item.lastError = error.localizedDescription
-                        item.updatedAt = .now
-                        self.activeAlert = UserAlert(
-                            title: String(localized: "Couldn’t Remove Download"),
-                            message: error.localizedDescription
-                        )
-                    } catch let journalError {
-                        self.activeAlert = UserAlert(
-                            title: String(localized: "Download Removal Pending"),
-                            message: [error.localizedDescription, journalError.localizedDescription]
-                                .joined(separator: "\n")
-                        )
-                        self.schedulePendingRemovalReconciliation()
-                    }
+                    item.status = self.durableMutationFailureStatus(from: rollbackStatus)
                 }
+                item.lastError = error.localizedDescription
+                item.updatedAt = .now
+                self.activeAlert = UserAlert(
+                    title: String(localized: "Couldn’t Remove Download"),
+                    message: error.localizedDescription
+                )
             }
         }
 
-        guard shouldContinueBackendCleanup else {
+        guard didPersistRemoval else {
+            directAttemptStates.removeValue(forKey: id)
             return
         }
 
-        var didCompleteBackendCleanup = false
         do {
             try await discardBackendRecovery(for: item, backendIdentifier: backendIdentifier)
-            didCompleteBackendCleanup = true
         } catch {
             if let backendIdentifier, item.backend == .aria2 {
                 scheduleOrphanedTorrentCleanup(gid: backendIdentifier)
@@ -4306,23 +3618,11 @@ final class DownloadCenter {
                 title: String(localized: "Download Removed; Backend Cleanup Pending"),
                 message: error.localizedDescription
             )
-            schedulePendingRemovalReconciliation()
         }
         directAttemptStates.removeValue(forKey: id)
         activeMediaAttemptIdentifiers.removeValue(forKey: id)
         moveOriginalTorrentFileToTrashIfNeeded(for: item)
         removeManagedTorrentSourceIfNeeded(for: item)
-        if didCompleteBackendCleanup {
-            do {
-                try acknowledgePendingDataRemoval(downloadID: id)
-            } catch {
-                activeAlert = UserAlert(
-                    title: String(localized: "Download Removed; Backend Cleanup Pending"),
-                    message: error.localizedDescription
-                )
-                schedulePendingRemovalReconciliation()
-            }
-        }
     }
 
     private func restoreSelection(selectedIDs: Set<UUID>, selectedID: UUID?) {
@@ -4579,9 +3879,6 @@ final class DownloadCenter {
     }
 
     private func resumeDownload(_ item: DownloadItem) {
-        guard isStartBlockedByPendingRemoval(for: item) == false else {
-            return
-        }
         guard directPauseTasks[item.id] == nil else {
             return
         }
@@ -4602,9 +3899,6 @@ final class DownloadCenter {
         guard let item = item(for: id),
               item.backend == .aria2,
               item.finishedAt != nil else {
-            return
-        }
-        guard isStartBlockedByPendingRemoval(for: item) == false else {
             return
         }
 
@@ -4852,9 +4146,6 @@ final class DownloadCenter {
         guard let item = item(for: id) else {
             return
         }
-        guard isStartBlockedByPendingRemoval(for: item) == false else {
-            return
-        }
         guard item.sourceKind == .directURL,
               item.status == .browserSessionRequired || item.browserResumeData != nil,
               browserCancellationTasks[id] == nil,
@@ -4987,9 +4278,6 @@ final class DownloadCenter {
             return
         }
 
-        guard isStartBlockedByPendingRemoval(for: item) == false else {
-            return
-        }
 
         if item.backend == .aria2,
            let gid = item.backendIdentifier,
@@ -5116,23 +4404,6 @@ final class DownloadCenter {
                 )
             }
         }
-    }
-
-    private func isStartBlockedByPendingRemoval(for item: DownloadItem) -> Bool {
-        guard pendingRemovalReservedIDs.contains(item.id) else {
-            return false
-        }
-        if pendingRemovalQuarantinedIDs.contains(item.id) {
-            item.taskIdentifier = nil
-            item.backendIdentifier = nil
-            item.lastError = pendingRemovalQuarantineMessage
-            item.speedBytesPerSecond = 0
-            item.uploadBytesPerSecond = 0
-            item.updatedAt = .now
-            setStatus(for: item, to: .failed)
-            schedulePersist()
-        }
-        return true
     }
 
     private func startDirectDownload(
@@ -5778,13 +5049,11 @@ final class DownloadCenter {
                     }
 
                     refreshedItem.backendIdentifier = nil
-                    // Persist the owner record before the reservation store
-                    // permits a new non-idempotent add. A crash after aria2
-                    // commits can then reattach that reservation to this ID.
+                    // Persist the cleared stale identifier before submitting a
+                    // replacement transfer.
                     try await saveRecordsNow()
                     let replacementIdentifier = try await torrentStartOperation(
                         torrentService,
-                        id,
                         torrentEngineSourceKind(for: refreshedItem),
                         torrentEngineSourceURL(for: refreshedItem),
                         refreshedItem.destinationFolderPath,
@@ -5792,8 +5061,8 @@ final class DownloadCenter {
                     )
 
                     guard item(for: id) != nil else {
-                        try? await torrentService.discardPendingSubmission(
-                            ownerDownloadID: id
+                        try? await torrentService.removeAndConfirmStopped(
+                            gid: replacementIdentifier
                         )
                         return
                     }
@@ -5801,20 +5070,18 @@ final class DownloadCenter {
                     activeBackendIdentifier = replacementIdentifier
                 }
             } else {
-                // The preparing record must predate the durable submission
-                // reservation and RPC side effect.
+                // Persist the preparing record before the RPC side effect.
                 try await saveRecordsNow()
                 let backendIdentifier = try await torrentStartOperation(
                     torrentService,
-                    id,
                     torrentEngineSourceKind(for: currentItem),
                     torrentEngineSourceURL(for: currentItem),
                     currentItem.destinationFolderPath,
                     torrentTransferOptions(for: currentItem)
                 )
                 guard item(for: id) != nil else {
-                    try? await torrentService.discardPendingSubmission(
-                        ownerDownloadID: id
+                    try? await torrentService.removeAndConfirmStopped(
+                        gid: backendIdentifier
                     )
                     return
                 }
@@ -5847,14 +5114,7 @@ final class DownloadCenter {
             refreshedItem.updatedAt = .now
             do {
                 try await saveRecordsNow()
-                try await torrentService.acknowledgeSubmission(
-                    ownerDownloadID: id,
-                    gid: activeBackendIdentifier
-                )
             } catch {
-                // Keep both the active GID and its durable reservation. A
-                // retry/relaunch can reconcile the same transfer without
-                // submitting a duplicate add request.
                 refreshedItem.lastError = error.localizedDescription
                 refreshedItem.updatedAt = .now
                 activeAlert = UserAlert(
@@ -6519,7 +5779,6 @@ final class DownloadCenter {
             .filter {
                 cancellationTasks[$0.id] == nil
                     && removalTasks[$0.id] == nil
-                    && pendingRemovalReservedIDs.contains($0.id) == false
                     && (
                         $0.status == .queued
                             || ($0.status == .waitingToRetry && readyDirectRetries[$0.id] != nil)
@@ -7446,26 +6705,13 @@ final class DownloadCenter {
                 self.completionLookupTasks.removeValue(forKey: id)
                 self.startNextQueuedDownloadsIfNeeded()
             }
-            let browserRecoveryFailures: [UUID: String]
-            do {
-                browserRecoveryFailures = try await self.browserCoordinator
-                    .recoverCompletedTemporaryFiles(downloadID: id)
-            } catch {
-                browserRecoveryFailures = [id: error.localizedDescription]
-            }
-            var lookup = await Task.detached(priority: .utility) {
+            let lookup = await Task.detached(priority: .utility) {
                 Self.lookupCompletedHandoff(
                     in: completedHandoffStore,
                     downloadID: id,
                     sourceURL: sourceURL
                 )
             }.value
-            if case .none = lookup,
-               let recoveryFailure = browserRecoveryFailures[id] {
-                lookup = .unavailable(
-                    self.completedHandoffUnavailableMessage(recoveryFailure)
-                )
-            }
             guard let item,
                   self.isShuttingDown == false,
                   self.item(for: id) === item,

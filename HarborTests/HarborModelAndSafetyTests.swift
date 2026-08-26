@@ -4,6 +4,703 @@ import XCTest
 
 @MainActor
 final class HarborModelAndSafetyTests: XCTestCase {
+    func testHarborURLSchemeIsRegistered() throws {
+        let urlTypes = try XCTUnwrap(
+            Bundle.main.object(forInfoDictionaryKey: "CFBundleURLTypes") as? [[String: Any]]
+        )
+        let schemes = urlTypes
+            .compactMap { $0["CFBundleURLSchemes"] as? [String] }
+            .flatMap { $0 }
+
+        XCTAssertTrue(schemes.contains("harbor"))
+    }
+
+    func testExternalHTTPSourcePrefillsAddSheetWithDefaultDestination() async throws {
+        let fileManager = FileManager.default
+        let testRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborExternalSourceTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: testRoot) }
+
+        let settings = HarborPreviewFixtures.makeSettings()
+        let center = DownloadCenter(
+            settings: settings,
+            persistence: DownloadPersistence(
+                directoryURL: testRoot.appendingPathComponent("Persistence", isDirectory: true)
+            ),
+            directRecoveryDirectoryURL: testRoot.appendingPathComponent("DirectRecovery", isDirectory: true),
+            completedHandoffDirectoryURL: testRoot.appendingPathComponent("Handoffs", isDirectory: true),
+            browserRecoveryDirectoryURL: testRoot.appendingPathComponent("BrowserRecovery", isDirectory: true),
+            managedTorrentSourceStore: ManagedTorrentSourceStore(
+                fileManager: fileManager,
+                directoryURL: testRoot.appendingPathComponent("ManagedTorrents", isDirectory: true)
+            ),
+            mediaService: MediaDownloadService(
+                eventHandler: { _, _ in },
+                fileManager: fileManager,
+                temporaryRoot: testRoot.appendingPathComponent("MediaRecovery", isDirectory: true)
+            )
+        )
+        let sourceURL = try XCTUnwrap(URL(string: "https://example.com/file.zip"))
+
+        center.receiveExternalAddSources([sourceURL])
+        await center.initializeIfNeeded()
+
+        let draft = try XCTUnwrap(center.addSheetDraft)
+        XCTAssertEqual(draft.entryMode, .linkOrMagnet)
+        XCTAssertEqual(draft.sourceURLText, sourceURL.absoluteString)
+        XCTAssertEqual(draft.destinationFolderURL, settings.defaultDestinationURL)
+        await center.shutdownForTermination()
+    }
+
+    func testDownloadedPayloadClassifierDetectsTorrentResponses() {
+        let extensionlessURL = URL(string: "https://example.com/download?id=42")!
+
+        XCTAssertTrue(
+            DownloadedPayloadClassifier.isTorrent(
+                sourceURL: extensionlessURL,
+                suggestedFilename: nil,
+                responseMimeType: "application/x-bittorrent"
+            )
+        )
+        XCTAssertTrue(
+            DownloadedPayloadClassifier.isTorrent(
+                sourceURL: extensionlessURL,
+                suggestedFilename: "Linux.torrent",
+                responseMimeType: "application/octet-stream"
+            )
+        )
+        XCTAssertTrue(
+            DownloadedPayloadClassifier.isTorrent(
+                sourceURL: URL(string: "https://example.com/linux.torrent")!,
+                suggestedFilename: nil,
+                responseMimeType: nil
+            )
+        )
+        XCTAssertFalse(
+            DownloadedPayloadClassifier.isTorrent(
+                sourceURL: extensionlessURL,
+                suggestedFilename: "archive.zip",
+                responseMimeType: "application/octet-stream"
+            )
+        )
+        XCTAssertFalse(
+            DownloadedPayloadClassifier.isTorrent(
+                sourceURL: extensionlessURL,
+                suggestedFilename: "error.torrent",
+                responseMimeType: "application/x-bittorrent",
+                statusCode: 404
+            )
+        )
+    }
+
+    func testTorrentShareRatioPersistsWithUploadedBytes() throws {
+        let item = DownloadItem(
+            sourceURL: URL(fileURLWithPath: "/tmp/example.torrent"),
+            sourceKind: .torrentFile,
+            backend: .aria2,
+            preferredFilename: nil,
+            destinationFolderPath: "/tmp",
+            status: .seeding,
+            progress: 1,
+            bytesWritten: 1_000,
+            expectedBytes: 1_000,
+            uploadedBytes: 1_500
+        )
+
+        XCTAssertEqual(item.shareRatio, 1.5)
+
+        let restoredItem = DownloadItem(record: item.makeRecord())
+        XCTAssertEqual(restoredItem.uploadedBytes, 1_500)
+        XCTAssertEqual(restoredItem.shareRatio, 1.5)
+    }
+
+    func testDownloadedTorrentHandoffReusesTheDirectDownloadRow() {
+        let sourceURL = URL(string: "https://example.com/download?id=42")!
+        let item = DownloadItem(
+            sourceURL: sourceURL,
+            sourceKind: .directURL,
+            backend: .urlSession,
+            preferredFilename: "metadata.torrent",
+            destinationFolderPath: "/tmp",
+            fileLocationPath: "/tmp/metadata.torrent",
+            status: .downloading,
+            progress: 1,
+            bytesWritten: 512,
+            expectedBytes: 512,
+            finishedAt: .now,
+            resumeData: Data([0x01]),
+            taskIdentifier: 7,
+            backendIdentifier: "old-backend",
+            completionNotificationDelivered: true,
+            activityEvents: [
+                DownloadActivityEvent(kind: .added),
+                DownloadActivityEvent(kind: .started)
+            ]
+        )
+        let originalID = item.id
+        let originalActivity = item.activityEvents
+
+        DownloadCenter.configureDownloadedTorrentHandoff(
+            item,
+            shouldSeedAfterDownload: true
+        )
+
+        XCTAssertEqual(item.id, originalID)
+        XCTAssertEqual(item.sourceURL, sourceURL)
+        XCTAssertEqual(item.sourceKind, .torrentFile)
+        XCTAssertEqual(item.backend, .aria2)
+        XCTAssertEqual(item.status, .preparing)
+        XCTAssertEqual(item.activityEvents, originalActivity)
+        XCTAssertNil(item.preferredFilename)
+        XCTAssertNil(item.fileLocationPath)
+        XCTAssertNil(item.resumeData)
+        XCTAssertNil(item.taskIdentifier)
+        XCTAssertNil(item.backendIdentifier)
+        XCTAssertEqual(item.progress, 0)
+        XCTAssertEqual(item.bytesWritten, 0)
+        XCTAssertEqual(item.expectedBytes, 0)
+        XCTAssertNil(item.finishedAt)
+        XCTAssertTrue(item.shouldSeedAfterDownload)
+        XCTAssertFalse(item.completionNotificationDelivered)
+    }
+
+    func testTransferLimitOverrideResolution() {
+        XCTAssertEqual(
+            TransferLimitOverride.inherit.resolvedBytesPerSecond(inheriting: 4_096),
+            4_096
+        )
+        XCTAssertNil(
+            TransferLimitOverride.unlimited.resolvedBytesPerSecond(inheriting: 4_096)
+        )
+        XCTAssertEqual(
+            TransferLimitOverride.limited(kilobytesPerSecond: 500)
+                .resolvedBytesPerSecond(inheriting: nil),
+            512_000
+        )
+        XCTAssertEqual(
+            TransferLimitOverride.limited(kilobytesPerSecond: 0)
+                .resolvedBytesPerSecond(inheriting: nil),
+            1_024
+        )
+    }
+
+    func testDirectDownloadLimitPrecedenceKeepsGlobalCapForUnlimitedItem() {
+        let settings = DownloadTransferSettings(
+            maxConcurrentDownloads: 3,
+            globalSpeedLimitBytesPerSecond: 900_000,
+            perDownloadSpeedLimitBytesPerSecond: 500_000,
+            globalUploadSpeedLimitBytesPerSecond: nil,
+            perDownloadUploadSpeedLimitBytesPerSecond: nil,
+            perDownloadConnectionCount: 4
+        )
+
+        XCTAssertEqual(
+            DownloadCoordinator.effectiveSpeedLimit(
+                activeTransferCount: 3,
+                transferSettings: settings,
+                speedLimitOverride: .unlimited
+            ),
+            300_000
+        )
+        XCTAssertEqual(
+            DownloadCoordinator.effectiveSpeedLimit(
+                activeTransferCount: 1,
+                transferSettings: settings,
+                speedLimitOverride: .limited(kilobytesPerSecond: 200)
+            ),
+            200 * 1_024
+        )
+    }
+
+    func testDirectDownloadThrottlePreservesLowRateByteDebt() throws {
+        let settings = DownloadTransferSettings(
+            maxConcurrentDownloads: 1,
+            globalSpeedLimitBytesPerSecond: nil,
+            perDownloadSpeedLimitBytesPerSecond: 1_024,
+            globalUploadSpeedLimitBytesPerSecond: nil,
+            perDownloadUploadSpeedLimitBytesPerSecond: nil,
+            perDownloadConnectionCount: 1
+        )
+
+        let delay = try XCTUnwrap(DownloadCoordinator.throttleDelay(
+            deltaBytes: 64 * 1_024,
+            elapsed: 1,
+            activeTransferCount: 1,
+            transferSettings: settings,
+            speedLimitOverride: .inherit
+        ))
+
+        XCTAssertEqual(delay, 63, accuracy: 0.001)
+    }
+
+    func testAriaPerTorrentOptionsUseAuthoritativeItemLimits() {
+        let settings = DownloadTransferSettings(
+            maxConcurrentDownloads: 3,
+            globalSpeedLimitBytesPerSecond: 900_000,
+            perDownloadSpeedLimitBytesPerSecond: 500_000,
+            globalUploadSpeedLimitBytesPerSecond: 300_000,
+            perDownloadUploadSpeedLimitBytesPerSecond: 200_000,
+            perDownloadConnectionCount: 6
+        )
+        let options = Aria2TorrentService.perDownloadOptions(
+            settings,
+            transferOptions: TorrentTransferOptions(
+                downloadLimitBytesPerSecond: nil,
+                uploadLimitBytesPerSecond: 75_000,
+                shouldSeed: true
+            )
+        )
+
+        XCTAssertEqual(options["max-download-limit"], "0")
+        XCTAssertEqual(options["max-upload-limit"], "75000")
+        XCTAssertEqual(options["max-connection-per-server"], "6")
+        XCTAssertEqual(options["seed-ratio"], "0.0")
+        XCTAssertNil(options["seed-time"])
+
+        let ratioLimitedOptions = Aria2TorrentService.perDownloadOptions(
+            settings,
+            transferOptions: TorrentTransferOptions(
+                downloadLimitBytesPerSecond: nil,
+                uploadLimitBytesPerSecond: nil,
+                shouldSeed: true,
+                seedRatioLimit: 2
+            )
+        )
+        XCTAssertEqual(ratioLimitedOptions["seed-ratio"], "2.0")
+    }
+
+    func testMediaDownloadArgumentsKeepAutomaticAndExactFormatPathsSeparate() throws {
+        let runtime = MediaRuntimeResolution(
+            ytDlpURL: URL(fileURLWithPath: "/tmp/yt-dlp"),
+            ffmpegURL: URL(fileURLWithPath: "/tmp/ffmpeg"),
+            ffprobeURL: URL(fileURLWithPath: "/tmp/ffprobe")
+        )
+        let sourceURL = try XCTUnwrap(URL(string: "https://example.com/video"))
+        let destinationURL = URL(fileURLWithPath: "/tmp/downloads", isDirectory: true)
+        let temporaryURL = URL(fileURLWithPath: "/tmp/media", isDirectory: true)
+        let completionReceiptURL = URL(
+            fileURLWithPath: "/tmp/media%owned/final-paths.jsonl"
+        )
+
+        let limitedArguments = try MediaDownloadService.downloadArguments(
+            runtime: runtime,
+            sourceURL: sourceURL,
+            destinationFolder: destinationURL,
+            temporaryFolder: temporaryURL,
+            metadata: nil,
+            formatPreference: .bestAvailable,
+            completionReceiptURL: completionReceiptURL,
+            speedLimitBytesPerSecond: 345_678
+        )
+        let unlimitedArguments = try MediaDownloadService.downloadArguments(
+            runtime: runtime,
+            sourceURL: sourceURL,
+            destinationFolder: destinationURL,
+            temporaryFolder: temporaryURL,
+            metadata: nil,
+            formatPreference: .bestAvailable,
+            completionReceiptURL: completionReceiptURL,
+            speedLimitBytesPerSecond: nil
+        )
+        let outputConflictIdentifier = UUID()
+        let collisionSafeArguments = try MediaDownloadService.downloadArguments(
+            runtime: runtime,
+            sourceURL: sourceURL,
+            destinationFolder: destinationURL,
+            temporaryFolder: temporaryURL,
+            metadata: nil,
+            formatPreference: .bestAvailable,
+            outputConflictIdentifier: outputConflictIdentifier,
+            completionReceiptURL: completionReceiptURL,
+            speedLimitBytesPerSecond: nil
+        )
+
+        let limitIndex = try XCTUnwrap(limitedArguments.firstIndex(of: "--limit-rate"))
+        XCTAssertEqual(limitedArguments[limitedArguments.index(after: limitIndex)], "345678")
+        XCTAssertTrue(limitedArguments.contains("--progress"))
+        XCTAssertTrue(unlimitedArguments.contains("--progress"))
+        XCTAssertFalse(unlimitedArguments.contains("--limit-rate"))
+        XCTAssertFalse(limitedArguments.contains("--format"))
+        XCTAssertFalse(unlimitedArguments.contains("--format"))
+        let collisionOutputIndex = try XCTUnwrap(
+            collisionSafeArguments.firstIndex(of: "--output")
+        )
+        XCTAssertEqual(
+            collisionSafeArguments[collisionSafeArguments.index(after: collisionOutputIndex)],
+            "%(title).180B [%(id)s] [Harbor \(outputConflictIdentifier.uuidString)].%(ext)s"
+        )
+        let concurrentDownloadID = UUID()
+        XCTAssertNil(
+            MediaDownloadService.outputIdentifier(
+                requested: nil,
+                downloadID: concurrentDownloadID,
+                hasCompetingDestination: false
+            )
+        )
+        XCTAssertEqual(
+            MediaDownloadService.outputIdentifier(
+                requested: nil,
+                downloadID: concurrentDownloadID,
+                hasCompetingDestination: true
+            ),
+            concurrentDownloadID
+        )
+        XCTAssertEqual(
+            MediaDownloadService.outputIdentifier(
+                requested: outputConflictIdentifier,
+                downloadID: concurrentDownloadID,
+                hasCompetingDestination: true
+            ),
+            outputConflictIdentifier
+        )
+
+        let retryValues = zip(limitedArguments, limitedArguments.dropFirst())
+            .filter { $0.0 == "--retry-sleep" }
+            .map(\.1)
+        XCTAssertEqual(
+            retryValues,
+            [
+                "http:exp=2:60",
+                "fragment:exp=2:60",
+                "file_access:exp=2:60",
+                "extractor:exp=2:60"
+            ]
+        )
+        func value(after option: String) -> String? {
+            guard let optionIndex = limitedArguments.firstIndex(of: option) else {
+                return nil
+            }
+
+            let valueIndex = limitedArguments.index(after: optionIndex)
+            return limitedArguments.indices.contains(valueIndex)
+                ? limitedArguments[valueIndex]
+                : nil
+        }
+        XCTAssertEqual(value(after: "--retries"), "10")
+        XCTAssertEqual(value(after: "--fragment-retries"), "10")
+        XCTAssertEqual(value(after: "--file-access-retries"), "3")
+        XCTAssertEqual(value(after: "--extractor-retries"), "3")
+        let printToFileIndex = try XCTUnwrap(
+            limitedArguments.firstIndex(of: "--print-to-file")
+        )
+        XCTAssertFalse(limitedArguments.contains("--print"))
+        XCTAssertEqual(
+            limitedArguments[limitedArguments.index(after: printToFileIndex)],
+            "after_move:harbor-file:%(filepath)j"
+        )
+        let receiptPathIndex = limitedArguments.index(
+            printToFileIndex,
+            offsetBy: 2
+        )
+        XCTAssertEqual(
+            limitedArguments[receiptPathIndex],
+            "/tmp/media%%owned/final-paths.jsonl"
+        )
+
+        let videoFormat = MediaDownloadFormatOption(
+            formatID: "137",
+            container: "mp4",
+            videoCodec: "avc1.640028",
+            audioCodec: nil,
+            width: 1_920,
+            height: 1_080,
+            framesPerSecond: 30,
+            dynamicRange: "SDR",
+            bitrateKbps: 4_500,
+            estimatedBytes: 9_000_000
+        )
+        let audioFormat = MediaDownloadFormatOption(
+            formatID: "140",
+            container: "m4a",
+            videoCodec: nil,
+            audioCodec: "mp4a.40.2",
+            width: nil,
+            height: nil,
+            framesPerSecond: nil,
+            dynamicRange: nil,
+            bitrateKbps: 128,
+            estimatedBytes: 1_000_000,
+            language: "en",
+            formatNote: "English (Original)",
+            audioChannels: 2,
+            languagePreference: 10
+        )
+        let metadata = MediaDownloadMetadata(
+            title: "Video",
+            platform: "Test",
+            extractorKey: "Test",
+            thumbnailURL: nil,
+            webpageURL: sourceURL,
+            expectedBytes: 10_000_000,
+            mediaType: .video,
+            entryCount: 1,
+            capabilities: MediaDownloadCapabilities(
+                formatOptions: [videoFormat, audioFormat]
+            )
+        )
+        let selection = MediaDownloadFormatSelection(
+            format: videoFormat,
+            audioFormat: audioFormat
+        )
+        let selectedArguments = try MediaDownloadService.downloadArguments(
+            runtime: runtime,
+            sourceURL: sourceURL,
+            destinationFolder: destinationURL,
+            temporaryFolder: temporaryURL,
+            metadata: metadata.persistenceSnapshot,
+            formatPreference: .specific(selection),
+            completionReceiptURL: temporaryURL.appendingPathComponent("final-paths.jsonl"),
+            speedLimitBytesPerSecond: 345_678
+        )
+
+        let formatIndex = try XCTUnwrap(selectedArguments.firstIndex(of: "--format"))
+        XCTAssertEqual(selectedArguments[selectedArguments.index(after: formatIndex)], "137+140")
+        let mergeIndex = try XCTUnwrap(selectedArguments.firstIndex(of: "--merge-output-format"))
+        XCTAssertEqual(selectedArguments[selectedArguments.index(after: mergeIndex)], "mp4")
+        let selectedLimitIndex = try XCTUnwrap(selectedArguments.firstIndex(of: "--limit-rate"))
+        XCTAssertEqual(
+            selectedArguments[selectedArguments.index(after: selectedLimitIndex)],
+            "345678"
+        )
+
+        XCTAssertEqual(
+            selection.displaySummary,
+            "1080p • MP4 • AVC1 + English (Original)"
+        )
+        XCTAssertEqual(
+            MediaDownloadFormatPreference.specific(selection)
+                .initialExpectedBytes(metadataEstimate: 243_768_398),
+            selection.estimatedBytes
+        )
+        XCTAssertEqual(
+            MediaDownloadFormatPreference.bestAvailable
+                .initialExpectedBytes(metadataEstimate: 243_768_398),
+            243_768_398
+        )
+    }
+
+    func testMediaRecordPersistsSelectionWithoutFormatCatalog() throws {
+        let sourceURL = try XCTUnwrap(URL(string: "https://example.com/video"))
+        let videoFormat = MediaDownloadFormatOption(
+            formatID: "137",
+            container: "mp4",
+            videoCodec: "avc1.640028",
+            audioCodec: nil,
+            width: 1_920,
+            height: 1_080,
+            framesPerSecond: 30,
+            dynamicRange: "SDR",
+            bitrateKbps: 4_500,
+            estimatedBytes: 9_000_000
+        )
+        let audioFormat = MediaDownloadFormatOption(
+            formatID: "140",
+            container: "m4a",
+            videoCodec: nil,
+            audioCodec: "mp4a.40.2",
+            width: nil,
+            height: nil,
+            framesPerSecond: nil,
+            dynamicRange: nil,
+            bitrateKbps: 128,
+            estimatedBytes: 1_000_000,
+            language: "en",
+            formatNote: "English (Original)",
+            audioChannels: 2,
+            languagePreference: 10
+        )
+        let metadata = MediaDownloadMetadata(
+            title: "Video",
+            platform: "Test",
+            extractorKey: "Test",
+            thumbnailURL: nil,
+            webpageURL: sourceURL,
+            expectedBytes: 10_000_000,
+            mediaType: .video,
+            entryCount: 1,
+            capabilities: MediaDownloadCapabilities(
+                formatOptions: [videoFormat, audioFormat]
+            )
+        )
+        let selection = MediaDownloadFormatSelection(
+            format: videoFormat,
+            audioFormat: audioFormat
+        )
+        let item = DownloadItem(
+            sourceURL: sourceURL,
+            sourceKind: .mediaURL,
+            backend: .ytDlp,
+            preferredFilename: nil,
+            destinationFolderPath: "/tmp/downloads",
+            status: .paused,
+            mediaMetadata: metadata,
+            mediaFormatPreference: .specific(selection)
+        )
+
+        let record = item.makeRecord()
+
+        XCTAssertEqual(record.mediaMetadata?.capabilities, .unavailable)
+        XCTAssertEqual(record.mediaFormatPreference, .specific(selection))
+        XCTAssertEqual(
+            item.mediaMetadata?.capabilities.formatOptions,
+            [videoFormat, audioFormat]
+        )
+
+        let encodedRecord = try JSONEncoder().encode(record)
+        XCTAssertFalse(String(decoding: encodedRecord, as: UTF8.self).contains("formatOptions"))
+    }
+
+    func testUnavailableExactMediaFormatHasDedicatedError() {
+        XCTAssertEqual(
+            MediaDownloadErrorClassifier.message(
+                from: "ERROR: [youtube] Requested format is not available"
+            ),
+            MediaDownloadErrorClassifier.selectedFormatUnavailableMessage
+        )
+    }
+
+    func testQuickLookRequiresCompletedExistingLocalFiles() throws {
+        let suiteName = "HarborTests.QuickLook.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Harbor-Quick-Look-\(UUID().uuidString).txt")
+        try Data("Preview".utf8).write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let previewService = FakeQuickLookPreviewService()
+        let center = DownloadCenter(
+            settings: AppSettingsStore(userDefaults: userDefaults),
+            quickLookPreviewService: previewService
+        )
+        let item = makeTorrentItem(
+            sourceURL: URL(fileURLWithPath: "/tmp/preview.torrent"),
+            sourceKind: .torrentFile,
+            fileLocationPath: fileURL.path
+        )
+        center.downloads = [item]
+        center.selectedDownloadID = item.id
+
+        XCTAssertTrue(center.canQuickLookSelectedDownloads)
+
+        center.quickLookSelectedDownloads()
+
+        XCTAssertEqual(previewService.previewedURLs, [fileURL])
+        XCTAssertEqual(item.status, .completed)
+
+        item.status = .paused
+        XCTAssertFalse(center.canQuickLookSelectedDownloads)
+
+        item.status = .completed
+        try FileManager.default.removeItem(at: fileURL)
+        XCTAssertFalse(center.canQuickLookSelectedDownloads)
+
+        center.quickLookSelectedDownloads()
+        XCTAssertEqual(center.activeAlert?.title, "Quick Look Unavailable")
+    }
+
+    func testLegacyCompletedTorrentDoesNotSeed() throws {
+        let record = try legacyTorrentRecord(status: .completed)
+
+        XCTAssertFalse(record.shouldSeedAfterDownload)
+        XCTAssertFalse(record.removeOriginalTorrentAfterImport)
+        XCTAssertTrue(record.completionNotificationDelivered)
+        XCTAssertEqual(record.downloadLimitOverride, .inherit)
+        XCTAssertEqual(record.uploadLimitOverride, .inherit)
+        XCTAssertTrue(record.torrentPayloadPaths.isEmpty)
+    }
+
+    func testLegacyUnfinishedTorrentSeeds() throws {
+        let record = try legacyTorrentRecord(status: .downloading)
+
+        XCTAssertTrue(record.shouldSeedAfterDownload)
+    }
+
+    func testTorrentDisplayNamePrefersSemanticMetadata() {
+        let item = makeTorrentItem(
+            sourceURL: URL(fileURLWithPath: "/tmp/ubuntu.torrent"),
+            sourceKind: .torrentFile,
+            metadataName: "Ubuntu 26.04",
+            fileLocationPath: "/tmp/download.html"
+        )
+
+        XCTAssertEqual(item.displayName, "Ubuntu 26.04")
+    }
+
+    func testTorrentDisplayNameUsesTorrentFilenameBeforePayloadFilename() {
+        let item = makeTorrentItem(
+            sourceURL: URL(fileURLWithPath: "/tmp/ubuntu-desktop.torrent"),
+            sourceKind: .torrentFile,
+            fileLocationPath: "/tmp/download.html"
+        )
+
+        XCTAssertEqual(item.displayName, "ubuntu-desktop")
+    }
+
+    func testMagnetDisplayNameWinsOverPayloadFilename() throws {
+        let sourceURL = try XCTUnwrap(
+            URL(string: "magnet:?xt=urn:btih:ABC123&dn=Ubuntu%2026.04")
+        )
+        let item = makeTorrentItem(
+            sourceURL: sourceURL,
+            sourceKind: .magnetLink,
+            fileLocationPath: "/tmp/download.html"
+        )
+
+        XCTAssertEqual(item.displayName, "Ubuntu 26.04")
+    }
+
+    func testSeedingStatusIsActiveButDoesNotConsumeDownloadConcurrency() {
+        let item = makeTorrentItem(
+            sourceURL: URL(fileURLWithPath: "/tmp/ubuntu.torrent"),
+            sourceKind: .torrentFile,
+            status: .seeding
+        )
+
+        XCTAssertFalse(DownloadStatus.seeding.isTerminal)
+        XCTAssertFalse(DownloadStatus.seeding.isRunning)
+        XCTAssertTrue(DownloadStatus.allCases.contains(.seeding))
+        XCTAssertTrue(DownloadFilter.active.includes(item))
+        XCTAssertTrue(item.canPause)
+    }
+
+    func testPayloadResolutionRejectsRootAndTraversalAndKeepsExactPayloadPaths() throws {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let destinationURL = rootURL.appendingPathComponent("destination", isDirectory: true)
+        let outsideURL = rootURL.appendingPathComponent("outside.bin")
+        try fileManager.createDirectory(at: destinationURL, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: rootURL) }
+
+        let resolution = DownloadDataRemovalService().resolvePayloadURLs(
+            destinationFolderPath: destinationURL.path,
+            payloadPaths: [
+                "Collection/one.bin",
+                "Collection/two.bin",
+                destinationURL.appendingPathComponent("single.iso").path,
+                destinationURL.path,
+                "../outside.bin",
+                outsideURL.path
+            ]
+        )
+
+        XCTAssertEqual(
+            resolution.safeURLs.map(\.path),
+            [
+                destinationURL.appendingPathComponent("Collection/one.bin").path,
+                destinationURL.appendingPathComponent("Collection/two.bin").path,
+                destinationURL.appendingPathComponent("single.iso").path
+            ]
+        )
+        XCTAssertEqual(
+            Set(resolution.rejectedPaths),
+            Set([destinationURL.path, "../outside.bin", outsideURL.path])
+        )
+    }
+
     struct ChildMediaAttemptReceipt: Encodable {
         let version: Int
         let downloadID: UUID
@@ -90,7 +787,6 @@ final class HarborModelAndSafetyTests: XCTestCase {
         )
     }
 
-
     func legacyTorrentRecord(status: DownloadStatus) throws -> DownloadRecord {
         let record = DownloadRecord(
             id: UUID(),
@@ -151,5 +847,13 @@ final class HarborModelAndSafetyTests: XCTestCase {
             status: status,
             metadataName: metadataName
         )
+    }
+}
+@MainActor
+private final class FakeQuickLookPreviewService: QuickLookPreviewing {
+    private(set) var previewedURLs: [URL] = []
+
+    func preview(urls: [URL]) {
+        previewedURLs = urls
     }
 }

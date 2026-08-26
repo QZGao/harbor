@@ -446,7 +446,6 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
             directRecoveryDirectoryURL: rootURL.appendingPathComponent("DirectRecovery", isDirectory: true),
             completedHandoffDirectoryURL: rootURL.appendingPathComponent("Handoffs", isDirectory: true),
             browserRecoveryDirectoryURL: rootURL.appendingPathComponent("BrowserRecovery", isDirectory: true),
-            pendingDataRemovalDirectoryURL: rootURL.appendingPathComponent("PendingRemoval", isDirectory: true),
             managedTorrentSourceStore: store
         )
         await center.initializeIfNeeded()

@@ -247,17 +247,12 @@ actor Aria2TorrentService {
     private let startupLogBuffer = TorrentEngineLogBuffer()
     private var transferSettings: DownloadTransferSettings
     private var isRetryingAfterSessionRecovery = false
-    private let submissionReservations: TorrentSubmissionReservationStore
 
     init(
         transferSettings: DownloadTransferSettings = .default,
-        submissionReservationDirectoryURL: URL? = nil,
         daemonStartupOperation: DaemonStartupOperation? = nil
     ) {
         self.transferSettings = transferSettings
-        self.submissionReservations = TorrentSubmissionReservationStore(
-            directoryURL: submissionReservationDirectoryURL
-        )
         self.daemonStartupOperation = daemonStartupOperation ?? { service in
             try await service.startDaemonUntilReady()
         }
@@ -403,7 +398,6 @@ actor Aria2TorrentService {
     }
 
     func addDownload(
-        ownerDownloadID: UUID,
         sourceKind: DownloadSourceKind,
         sourceURL: URL,
         destinationFolderPath: String,
@@ -419,50 +413,32 @@ actor Aria2TorrentService {
         case .directURL, .mediaURL:
             throw TorrentEngineError.invalidSource
         }
-        let reservation = try submissionReservations.reserve(
-            ownerDownloadID: ownerDownloadID,
-            sourceURL: sourceURL,
-            destinationFolderPath: destinationFolderPath,
-            sourceKind: sourceKind,
-            shouldSeedAfterDownload: transferOptions?.shouldSeed
-        )
+        let gid = Self.makeSubmissionGID()
         try await ensureDaemonRunning()
-
-        if try await reservedGIDExists(reservation.gid) {
-            do {
-                try await saveSession()
-            } catch {
-                throw TorrentSubmissionUncertainError(
-                    gid: reservation.gid,
-                    underlyingError: error
-                )
-            }
-            return reservation.gid
-        }
 
         var options = downloadOptions(
             destinationFolderPath: destinationFolderPath,
             transferOptions: transferOptions
         )
-        options["gid"] = reservation.gid
+        options["gid"] = gid
 
         let returnedGID: String
         switch sourceKind {
         case .magnetLink:
-            returnedGID = try await submitReservedDownload(
+            returnedGID = try await submitDownload(
                 method: "aria2.addUri",
                 params: [
                     authorizedToken(),
                     [sourceURL.absoluteString],
                     options
                 ],
-                reservation: reservation
+                gid: gid
             )
         case .torrentFile:
             guard let torrentData else {
                 throw TorrentEngineError.invalidSource
             }
-            returnedGID = try await submitReservedDownload(
+            returnedGID = try await submitDownload(
                 method: "aria2.addTorrent",
                 params: [
                     authorizedToken(),
@@ -470,24 +446,23 @@ actor Aria2TorrentService {
                     [],
                     options
                 ],
-                reservation: reservation
+                gid: gid
             )
         case .directURL, .mediaURL:
             throw TorrentEngineError.invalidSource
         }
-        guard returnedGID == reservation.gid else {
+        guard returnedGID == gid else {
             // The add request may still have committed under the caller-owned
             // reserved GID. Treat a contradictory response as uncertain
             // ownership so the model keeps that GID slot-occupying instead of
             // declaring failure while aria2 may be writing in the background.
             throw TorrentSubmissionUncertainError(
-                gid: reservation.gid,
+                gid: gid,
                 underlyingError: TorrentEngineError.invalidResponse
             )
         }
         // A successful add is not handed to the model until aria confirms the
-        // session file contains it. The reservation remains durable until the
-        // model synchronously saves the returned GID and acknowledges it.
+        // session file contains it.
         do {
             try await saveSession()
         } catch {
@@ -498,36 +473,6 @@ actor Aria2TorrentService {
         }
         logger.info("aria2 accepted torrent with reserved gid \(returnedGID, privacy: .public)")
         return returnedGID
-    }
-
-    func acknowledgeSubmission(ownerDownloadID: UUID, gid: String) throws {
-        try submissionReservations.acknowledge(
-            ownerDownloadID: ownerDownloadID,
-            gid: gid
-        )
-    }
-
-    func pendingSubmissionReservations() throws -> [TorrentSubmissionReservation] {
-        try submissionReservations.reservations()
-    }
-
-    func discardPendingSubmission(ownerDownloadID: UUID) async throws {
-        guard let reservation = try submissionReservations.reservation(
-            ownerDownloadID: ownerDownloadID
-        ) else {
-            return
-        }
-        do {
-            try await removeAndConfirmStopped(gid: reservation.gid)
-        } catch {
-            guard isMissingGIDError(error) else {
-                throw error
-            }
-        }
-        try submissionReservations.acknowledge(
-            ownerDownloadID: ownerDownloadID,
-            gid: reservation.gid
-        )
     }
 
     func pause(gid: String) async throws {
@@ -1230,10 +1175,10 @@ actor Aria2TorrentService {
         }
     }
 
-    private func submitReservedDownload(
+    private func submitDownload(
         method: String,
         params: [Any],
-        reservation: TorrentSubmissionReservation
+        gid: String
     ) async throws -> String {
         do {
             return try await rpcCall(
@@ -1252,8 +1197,8 @@ actor Aria2TorrentService {
                     try? await Task.sleep(for: delay)
                 }
                 do {
-                    if try await reservedGIDExists(reservation.gid) {
-                        return reservation.gid
+                    if try await reservedGIDExists(gid) {
+                        return gid
                     }
                     lastProbeConfirmedMissing = true
                     lastProbeError = nil
@@ -1267,10 +1212,14 @@ actor Aria2TorrentService {
                 throw error
             }
             throw TorrentSubmissionUncertainError(
-                gid: reservation.gid,
+                gid: gid,
                 underlyingError: lastProbeError ?? error
             )
         }
+    }
+
+    private static func makeSubmissionGID() -> String {
+        String(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(16))
     }
 
     /// A decoded JSON-RPC error is an authoritative response from aria2 that
