@@ -158,15 +158,7 @@ actor MediaDownloadService {
         }
     }
 
-    struct RegularFileIdentity: Codable, Equatable, Sendable {
-        let device: dev_t
-        let inode: ino_t
-        let size: off_t
-        let modificationSeconds: time_t
-        let modificationNanoseconds: Int64
-        let statusChangeSeconds: time_t
-        let statusChangeNanoseconds: Int64
-    }
+    typealias RegularFileIdentity = DurableFileSystem.RegularFileIdentity
 
     private struct MediaAttemptManifest: Codable, Equatable, Sendable {
         static let currentVersion = 1
@@ -1850,33 +1842,13 @@ actor MediaDownloadService {
     }
 
     func regularFileIdentity(at url: URL) throws -> RegularFileIdentity {
-        var metadata = stat()
-        let result = url.path.withCString { path in
-            lstat(path, &metadata)
-        }
-        guard result == 0 else {
-            if let code = POSIXErrorCode(rawValue: errno) {
-                throw POSIXError(code)
-            }
-            throw CompletionManifestIntegrityError.invalid(
-                "The completed media file could not be inspected."
-            )
-        }
-        guard (metadata.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
-              metadata.st_size >= 0 else {
+        do {
+            return try DurableFileSystem.regularFileIdentity(at: url)
+        } catch is CocoaError {
             throw CompletionManifestIntegrityError.invalid(
                 "The completed media path is not a regular file."
             )
         }
-        return RegularFileIdentity(
-            device: metadata.st_dev,
-            inode: metadata.st_ino,
-            size: metadata.st_size,
-            modificationSeconds: metadata.st_mtimespec.tv_sec,
-            modificationNanoseconds: Int64(metadata.st_mtimespec.tv_nsec),
-            statusChangeSeconds: metadata.st_ctimespec.tv_sec,
-            statusChangeNanoseconds: Int64(metadata.st_ctimespec.tv_nsec)
-        )
     }
 
     private func destinationFileIdentities(

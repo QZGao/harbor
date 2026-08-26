@@ -3,6 +3,16 @@ import Darwin
 import Foundation
 
 enum DurableFileSystem {
+    nonisolated struct RegularFileIdentity: Codable, Equatable, Sendable {
+        let device: dev_t
+        let inode: ino_t
+        let size: off_t
+        let modificationSeconds: time_t
+        let modificationNanoseconds: Int64
+        let statusChangeSeconds: time_t
+        let statusChangeNanoseconds: Int64
+    }
+
     nonisolated static func writeAtomicallyWithoutReplacing(
         _ data: Data,
         to destinationURL: URL
@@ -153,6 +163,26 @@ enum DurableFileSystem {
             hasher.update(data: data)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    nonisolated static func regularFileIdentity(at url: URL) throws -> RegularFileIdentity {
+        var metadata = stat()
+        guard url.path.withCString({ Darwin.lstat($0, &metadata) }) == 0 else {
+            throw posixError()
+        }
+        guard (metadata.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              metadata.st_size >= 0 else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return RegularFileIdentity(
+            device: metadata.st_dev,
+            inode: metadata.st_ino,
+            size: metadata.st_size,
+            modificationSeconds: metadata.st_mtimespec.tv_sec,
+            modificationNanoseconds: Int64(metadata.st_mtimespec.tv_nsec),
+            statusChangeSeconds: metadata.st_ctimespec.tv_sec,
+            statusChangeNanoseconds: Int64(metadata.st_ctimespec.tv_nsec)
+        )
     }
 
     private nonisolated static func posixError() -> POSIXError {

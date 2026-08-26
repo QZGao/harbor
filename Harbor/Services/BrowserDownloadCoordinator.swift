@@ -1579,20 +1579,12 @@ extension BrowserDownloadCoordinator: WKDownloadDelegate {
         after error: Error,
         statusCode: Int?
     ) -> Bool {
-        if error is HTTPDownloadInvalidRangeResponseError {
-            return true
-        }
         if let statusCode,
            (200 ... 299).contains(statusCode) == false,
            DirectDownloadRetryPolicy.isRetryableHTTPStatus(statusCode) == false {
             return true
         }
-        let nsError = error as NSError
-        guard nsError.domain == NSURLErrorDomain else {
-            return false
-        }
-        let code = URLError.Code(rawValue: nsError.code)
-        return code == .badServerResponse || code == .cannotDecodeContentData
+        return DownloadHTTPResponseValidator.isInvalidResumeProtocolResponse(error)
     }
 }
 

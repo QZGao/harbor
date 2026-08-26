@@ -185,18 +185,8 @@ nonisolated enum CompletedDownloadHandoffError: LocalizedError {
 nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
     typealias PayloadHashOperation = @Sendable (URL) throws -> String
 
-    private struct RegularFileIdentity: Equatable {
-        let device: dev_t
-        let inode: ino_t
-        let size: off_t
-        let modificationSeconds: time_t
-        let modificationNanoseconds: Int64
-        let statusChangeSeconds: time_t
-        let statusChangeNanoseconds: Int64
-    }
-
     private struct VerifiedFile {
-        let identity: RegularFileIdentity
+        let identity: DurableFileSystem.RegularFileIdentity
         let sha256: String
     }
 
@@ -343,7 +333,8 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
     func finalize(
         _ claim: CompletedDownloadHandoffClaim
     ) throws -> CompletedDownloadHandoff {
-        if claim.packageURL.pathExtension == Self.packageExtension {
+        let pathExtension = claim.packageURL.pathExtension
+        if pathExtension == Self.packageExtension {
             return try withAttemptLock(
                 downloadID: claim.manifest.downloadID,
                 attemptIdentifier: claim.manifest.attemptIdentifier
@@ -351,45 +342,47 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
                 try validatedHandoff(at: claim.packageURL)
             }
         }
-        if claim.packageURL.pathExtension == Self.stagingExtension {
-            let recoveredReadyHandoff: CompletedDownloadHandoff? = try withAttemptLock(
-                downloadID: claim.manifest.downloadID,
-                attemptIdentifier: claim.manifest.attemptIdentifier
-            ) {
-                guard claim.manifest.downloadID == identifiers(from: claim.packageURL)?.downloadID,
-                      claim.manifest.attemptIdentifier == identifiers(from: claim.packageURL)?.attemptIdentifier else {
-                    throw CompletedDownloadHandoffError.invalidManifest
-                }
-                // A crash can occur after the ready manifest is made durable
-                // but before the staging directory is renamed. A repeated
-                // delegate callback may still hold the original claim, so
-                // finish that already-validated promotion instead of trying
-                // to reinterpret the ready manifest as a claiming manifest.
-                guard manifestIfDecodable(at: claim.packageURL)?.phase == .ready else {
-                    return nil
-                }
-                let staged = try validatedHandoff(at: claim.packageURL)
-                guard staged.manifest.matchesClaim(
-                    claim.manifest,
-                    actualBytes: staged.manifest.actualBytes
-                ) else {
-                    throw CompletedDownloadHandoffError.invalidManifest
-                }
-                try promoteStagingPackageLocked(at: claim.packageURL)
-                let readyURL = packageURL(
-                    downloadID: staged.manifest.downloadID,
-                    attemptIdentifier: staged.manifest.attemptIdentifier,
-                    pathExtension: Self.packageExtension
-                )
-                let ready = try validatedHandoff(at: readyURL)
-                guard ready.manifest == staged.manifest else {
-                    throw CompletedDownloadHandoffError.invalidManifest
-                }
-                return ready
+        guard pathExtension == Self.stagingExtension else {
+            throw CompletedDownloadHandoffError.invalidManifest
+        }
+        let recoveredReadyHandoff: CompletedDownloadHandoff? = try withAttemptLock(
+            downloadID: claim.manifest.downloadID,
+            attemptIdentifier: claim.manifest.attemptIdentifier
+        ) {
+            guard let identifiers = identifiers(from: claim.packageURL),
+                  claim.manifest.downloadID == identifiers.downloadID,
+                  claim.manifest.attemptIdentifier == identifiers.attemptIdentifier else {
+                throw CompletedDownloadHandoffError.invalidManifest
             }
-            if let recoveredReadyHandoff {
-                return recoveredReadyHandoff
+            // A crash can occur after the ready manifest is made durable
+            // but before the staging directory is renamed. A repeated
+            // delegate callback may still hold the original claim, so
+            // finish that already-validated promotion instead of trying
+            // to reinterpret the ready manifest as a claiming manifest.
+            guard manifestIfDecodable(at: claim.packageURL)?.phase == .ready else {
+                return nil
             }
+            let staged = try validatedHandoff(at: claim.packageURL)
+            guard staged.manifest.matchesClaim(
+                claim.manifest,
+                actualBytes: staged.manifest.actualBytes
+            ) else {
+                throw CompletedDownloadHandoffError.invalidManifest
+            }
+            try promoteStagingPackageLocked(at: claim.packageURL)
+            let readyURL = packageURL(
+                downloadID: staged.manifest.downloadID,
+                attemptIdentifier: staged.manifest.attemptIdentifier,
+                pathExtension: Self.packageExtension
+            )
+            let ready = try validatedHandoff(at: readyURL)
+            guard ready.manifest == staged.manifest else {
+                throw CompletedDownloadHandoffError.invalidManifest
+            }
+            return ready
+        }
+        if let recoveredReadyHandoff {
+            return recoveredReadyHandoff
         }
         let hashingInput: (
             stagingURL: URL,
@@ -400,11 +393,9 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
             downloadID: claim.manifest.downloadID,
             attemptIdentifier: claim.manifest.attemptIdentifier
         ) {
-            guard claim.manifest.downloadID == identifiers(from: claim.packageURL)?.downloadID,
-                  claim.manifest.attemptIdentifier == identifiers(from: claim.packageURL)?.attemptIdentifier else {
-                throw CompletedDownloadHandoffError.invalidManifest
-            }
-            guard claim.packageURL.pathExtension == Self.stagingExtension else {
+            guard let identifiers = identifiers(from: claim.packageURL),
+                  claim.manifest.downloadID == identifiers.downloadID,
+                  claim.manifest.attemptIdentifier == identifiers.attemptIdentifier else {
                 throw CompletedDownloadHandoffError.invalidManifest
             }
             let manifest = try claimingManifest(at: claim.packageURL)
@@ -1207,30 +1198,14 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
         return Int64(identity.size)
     }
 
-    private func regularFileIdentity(at url: URL) throws -> RegularFileIdentity {
-        var metadata = stat()
-        let result = url.path.withCString { path in
-            lstat(path, &metadata)
-        }
-        guard result == 0 else {
-            if let code = POSIXErrorCode(rawValue: errno) {
-                throw POSIXError(code)
-            }
+    private func regularFileIdentity(
+        at url: URL
+    ) throws -> DurableFileSystem.RegularFileIdentity {
+        do {
+            return try DurableFileSystem.regularFileIdentity(at: url)
+        } catch is CocoaError {
             throw CompletedDownloadHandoffError.invalidPayload
         }
-        guard (metadata.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
-              metadata.st_size >= 0 else {
-            throw CompletedDownloadHandoffError.invalidPayload
-        }
-        return RegularFileIdentity(
-            device: metadata.st_dev,
-            inode: metadata.st_ino,
-            size: metadata.st_size,
-            modificationSeconds: metadata.st_mtimespec.tv_sec,
-            modificationNanoseconds: Int64(metadata.st_mtimespec.tv_nsec),
-            statusChangeSeconds: metadata.st_ctimespec.tv_sec,
-            statusChangeNanoseconds: Int64(metadata.st_ctimespec.tv_nsec)
-        )
     }
 
     private func verifiedFile(

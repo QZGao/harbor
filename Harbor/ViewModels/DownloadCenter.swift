@@ -2542,21 +2542,13 @@ final class DownloadCenter {
         await pendingRemovalReconciliation?.value
         await cancelOrphanedTorrentCleanupTasksAndWait()
 
-        for task in Array(cancellationTasks.values) {
-            await task.value
-        }
-        for task in Array(removalTasks.values) {
-            await task.value
-        }
-        for task in Array(torrentStopSeedingTasks.values) {
-            await task.value
-        }
-        for task in Array(completionLookupTasks.values) {
-            await task.value
-        }
-        for task in Array(completionTasks.values) {
-            await task.value
-        }
+        await waitForTasks(
+            Array(cancellationTasks.values)
+                + Array(removalTasks.values)
+                + Array(torrentStopSeedingTasks.values)
+                + Array(completionLookupTasks.values)
+                + Array(completionTasks.values)
+        )
 
         let browserResults = await browserCoordinator.quiesceForShutdown()
         let browserWriterFailures = browserResults.filter {
@@ -2619,24 +2611,14 @@ final class DownloadCenter {
                     title: String(localized: "Couldn’t Save Browser Recovery Before Quitting"),
                     message: error.localizedDescription
                 )
-                browserCoordinator.resumeAfterFailedShutdown()
-                isShuttingDown = false
-                resumeDeferredSeedersAfterFailedShutdown()
-                configureTorrentWatchFolder()
-                startTorrentRefreshLoopIfNeeded()
-                startNextQueuedDownloadsIfNeeded()
+                resumeAfterFailedAuthoritativeShutdown()
                 return false
             }
             activeAlert = UserAlert(
                 title: String(localized: "Browser Download Is Still Stopping"),
                 message: writerMessage
             )
-            browserCoordinator.resumeAfterFailedShutdown()
-            isShuttingDown = false
-            resumeDeferredSeedersAfterFailedShutdown()
-            configureTorrentWatchFolder()
-            startTorrentRefreshLoopIfNeeded()
-            startNextQueuedDownloadsIfNeeded()
+            resumeAfterFailedAuthoritativeShutdown()
             return false
         }
         activeBrowserSession = nil
@@ -2644,9 +2626,7 @@ final class DownloadCenter {
         pendingBrowserContinuationIDs.removeAll()
 
         let pendingStarts = Array(mediaStartTasks.values) + Array(torrentStartTasks.values)
-        for task in pendingStarts {
-            await task.value
-        }
+        await waitForTasks(pendingStarts)
 
         let restoredStatus: DownloadStatus = settings.startDownloadsAutomatically ? .queued : .paused
         let pausedMessage = String(
@@ -2726,25 +2706,13 @@ final class DownloadCenter {
             }
         }
 
-        for task in Array(directPauseTasks.values) {
-            await task.value
-        }
-
-        for task in Array(browserCancellationTasks.values) {
-            await task.value
-        }
-
-        for task in Array(mediaPauseTasks.values) {
-            await task.value
-        }
-
-        for task in Array(torrentPauseTasks.values) {
-            await task.value
-        }
-
-        for task in Array(mediaCleanupTasks.values) {
-            await task.value
-        }
+        await waitForTasks(
+            Array(directPauseTasks.values)
+                + Array(browserCancellationTasks.values)
+                + Array(mediaPauseTasks.values)
+                + Array(torrentPauseTasks.values)
+                + Array(mediaCleanupTasks.values)
+        )
 
         // Cancellation/removal/stop-seeding tasks above are cleanup producers.
         // Drain again after they quiesce so no aria2 work can outlive daemon
@@ -2777,30 +2745,20 @@ final class DownloadCenter {
                     title: String(localized: "Couldn’t Save Downloads Before Quitting"),
                     message: error.localizedDescription
                 )
-                isShuttingDown = false
-                resumeDeferredSeedersAfterFailedShutdown()
-                configureTorrentWatchFolder()
-                startTorrentRefreshLoopIfNeeded()
-                startNextQueuedDownloadsIfNeeded()
+                resumeAfterFailedAuthoritativeShutdown()
                 return false
             }
             activeAlert = UserAlert(
                 title: String(localized: "Couldn’t Save Torrent Recovery Before Quitting"),
                 message: error.localizedDescription
             )
-            isShuttingDown = false
-            resumeDeferredSeedersAfterFailedShutdown()
-            configureTorrentWatchFolder()
-            startTorrentRefreshLoopIfNeeded()
-            startNextQueuedDownloadsIfNeeded()
+            resumeAfterFailedAuthoritativeShutdown()
             return false
         }
         // A backend can finish while its shutdown pause is being quiesced.
         // Wait for completion work created after the earlier barrier before
         // taking the final durable snapshot.
-        for task in Array(completionTasks.values) {
-            await task.value
-        }
+        await waitForTasks(Array(completionTasks.values))
         do {
             try await saveRecordsNow()
         } catch {
@@ -2808,14 +2766,19 @@ final class DownloadCenter {
                 title: String(localized: "Couldn’t Save Downloads Before Quitting"),
                 message: error.localizedDescription
             )
-            isShuttingDown = false
-            resumeDeferredSeedersAfterFailedShutdown()
-            configureTorrentWatchFolder()
-            startTorrentRefreshLoopIfNeeded()
-            startNextQueuedDownloadsIfNeeded()
+            resumeAfterFailedAuthoritativeShutdown()
             return false
         }
         return true
+    }
+
+    private func resumeAfterFailedAuthoritativeShutdown() {
+        browserCoordinator.resumeAfterFailedShutdown()
+        isShuttingDown = false
+        resumeDeferredSeedersAfterFailedShutdown()
+        configureTorrentWatchFolder()
+        startTorrentRefreshLoopIfNeeded()
+        startNextQueuedDownloadsIfNeeded()
     }
 
     private func shutdownWithoutAuthoritativeRecords() async -> Bool {
@@ -2835,34 +2798,28 @@ final class DownloadCenter {
         await pendingRemovalReconciliation?.value
         await pendingTorrentRefresh?.value
 
-        for task in Array(mediaStartTasks.values) + Array(torrentStartTasks.values) {
-            await task.value
-        }
+        await waitForTasks(
+            Array(mediaStartTasks.values) + Array(torrentStartTasks.values)
+        )
         await drainDurableTerminalMutationTasksForShutdown()
-        for task in Array(torrentStopSeedingTasks.values)
-            + Array(completionLookupTasks.values)
-            + Array(completionTasks.values) {
-            await task.value
-        }
-        for task in Array(directPauseTasks.values)
-            + Array(browserCancellationTasks.values)
-            + Array(mediaPauseTasks.values)
-            + Array(torrentPauseTasks.values) {
-            await task.value
-        }
+        await waitForTasks(
+            Array(torrentStopSeedingTasks.values)
+                + Array(completionLookupTasks.values)
+                + Array(completionTasks.values)
+                + Array(directPauseTasks.values)
+                + Array(browserCancellationTasks.values)
+                + Array(mediaPauseTasks.values)
+                + Array(torrentPauseTasks.values)
+        )
         // Terminal mutations and pause work can create backend cleanup after
         // the earlier snapshots. Observe that producer boundary before taking
         // the cleanup snapshot.
         await drainDurableTerminalMutationTasksForShutdown()
-        for task in Array(mediaCleanupTasks.values) {
-            await task.value
-        }
+        await waitForTasks(Array(mediaCleanupTasks.values))
         await cancelOrphanedTorrentCleanupTasksAndWait()
 
         let browserResults = await browserCoordinator.quiesceForShutdown()
-        for task in Array(completionTasks.values) {
-            await task.value
-        }
+        await waitForTasks(Array(completionTasks.values))
         await drainDurableTerminalMutationTasksForShutdown()
         if let failure = browserResults.values
             .compactMap(\.writerQuiescenceUnavailableMessage)
@@ -2898,18 +2855,20 @@ final class DownloadCenter {
             guard pendingTasks.isEmpty == false else {
                 return
             }
-            for task in pendingTasks {
-                await task.value
-            }
+            await waitForTasks(pendingTasks)
+        }
+    }
+
+    private func waitForTasks(_ tasks: [Task<Void, Never>]) async {
+        for task in tasks {
+            await task.value
         }
     }
 
     private func cancelOrphanedTorrentCleanupTasksAndWait() async {
         let tasks = Array(orphanedTorrentCleanupTasks.values)
         tasks.forEach { $0.cancel() }
-        for task in tasks {
-            await task.value
-        }
+        await waitForTasks(tasks)
         orphanedTorrentCleanupTasks.removeAll()
     }
 

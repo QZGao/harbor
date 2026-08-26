@@ -140,7 +140,10 @@ final class DirectDownloadRecoveryStore: @unchecked Sendable {
 
     func openFreshFile(id: UUID) throws -> FileHandle {
         try lock.withLock {
-            try createDirectoryIfNeeded()
+            try DurableFileSystem.createDirectoryIfNeeded(
+                at: directoryURL,
+                fileManager: fileManager
+            )
             let partialURL = partialURL(for: id)
             try removeItemIfPresent(at: partialURL)
             guard fileManager.createFile(atPath: partialURL.path, contents: nil) else {
@@ -177,7 +180,10 @@ final class DirectDownloadRecoveryStore: @unchecked Sendable {
         id: UUID
     ) throws {
         try lock.withLock {
-            try createDirectoryIfNeeded()
+            try DurableFileSystem.createDirectoryIfNeeded(
+                at: directoryURL,
+                fileManager: fileManager
+            )
             let data = try JSONEncoder().encode(metadata)
             let destinationURL = metadataURL(for: id)
             try data.write(to: destinationURL, options: .atomic)
@@ -319,17 +325,6 @@ final class DirectDownloadRecoveryStore: @unchecked Sendable {
             throw IntegrityError.invalidPartial
         }
         return Int64(fileSize)
-    }
-
-    private func createDirectoryIfNeeded() throws {
-        let alreadyExists = fileManager.fileExists(atPath: directoryURL.path)
-        try fileManager.createDirectory(
-            at: directoryURL,
-            withIntermediateDirectories: true
-        )
-        if alreadyExists == false {
-            try DurableFileSystem.synchronizeParentDirectory(of: directoryURL)
-        }
     }
 
     private func discardLocked(id: UUID) throws {

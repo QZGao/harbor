@@ -16,7 +16,7 @@ nonisolated struct BrowserCompletedTemporaryManifest: Codable, Sendable {
 nonisolated struct BrowserRecordedCompletion: Sendable {
     let payloadURL: URL
     let metadataURL: URL
-    let claimingManifest: CompletedDownloadHandoffManifest
+    let manifest: CompletedDownloadHandoffManifest
 }
 
 /// Owns WebKit's temporary payload and completion journal. WebKit lifecycle
@@ -79,14 +79,14 @@ nonisolated final class BrowserDownloadRecoveryStore: @unchecked Sendable {
         return BrowserRecordedCompletion(
             payloadURL: payloadURL,
             metadataURL: metadataURL,
-            claimingManifest: manifest
+            manifest: manifest
         )
     }
 
     func publishRecordedCompletion(
         _ recorded: BrowserRecordedCompletion
     ) throws -> CompletedDownloadHandoff {
-        let claiming = recorded.claimingManifest
+        let claiming = recorded.manifest
         let manifest = CompletedDownloadHandoffManifest(
             downloadID: claiming.downloadID,
             attemptIdentifier: claiming.attemptIdentifier,
@@ -97,13 +97,14 @@ nonisolated final class BrowserDownloadRecoveryStore: @unchecked Sendable {
             suggestedFilename: claiming.suggestedFilename,
             actualBytes: claiming.actualBytes,
             expectedBytes: claiming.expectedBytes,
+            payloadSHA256: claiming.payloadSHA256,
             createdAt: claiming.createdAt
         )
         let handoff = try completedHandoffStore.publish(
             payloadAt: recorded.payloadURL,
             manifest: manifest
         )
-        removeMetadataAfterPublication(at: recorded.metadataURL)
+        removeMetadata(at: recorded.metadataURL)
         return handoff
     }
 
@@ -169,48 +170,12 @@ nonisolated final class BrowserDownloadRecoveryStore: @unchecked Sendable {
                 continue
             }
 
-            var handoff = marker.handoff
+            let handoff = marker.handoff
+            let values: URLResourceValues
             do {
-                let values = try payloadURL.resourceValues(
+                values = try payloadURL.resourceValues(
                     forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey]
                 )
-                guard marker.version == BrowserCompletedTemporaryManifest.currentVersion,
-                      handoff.version == CompletedDownloadHandoffManifest.currentVersion,
-                      handoff.downloadID == identifiers.downloadID,
-                      handoff.attemptIdentifier == identifiers.attemptIdentifier,
-                      handoff.owner == .browser,
-                      handoff.phase == .claiming || handoff.phase == .ready,
-                      handoff.destinationPath == nil,
-                      handoff.placementStagingPath == nil,
-                      handoff.actualBytes >= 0,
-                      handoff.expectedBytes == handoff.actualBytes,
-                      (handoff.phase == .claiming && handoff.payloadSHA256.isEmpty)
-                        || (handoff.phase == .ready
-                            && handoff.payloadSHA256.count == SHA256.byteCount * 2),
-                      handoff.statusCode.map({ (200 ... 299).contains($0) }) != false,
-                      values.isRegularFile == true,
-                      values.isSymbolicLink != true,
-                      values.fileSize.map(Int64.init) == handoff.actualBytes else {
-                    removeCompletedTemporaryFiles(
-                        payloadURL: payloadURL,
-                        metadataURL: metadataURL
-                    )
-                    continue
-                }
-
-                if handoff.phase == .claiming {
-                    handoff = try finalizedManifest(
-                        handoff,
-                        payloadURL: payloadURL,
-                        metadataURL: metadataURL
-                    )
-                } else if try DurableFileSystem.sha256(at: payloadURL) != handoff.payloadSHA256 {
-                    removeCompletedTemporaryFiles(
-                        payloadURL: payloadURL,
-                        metadataURL: metadataURL
-                    )
-                    continue
-                }
             } catch {
                 // Failure to read file attributes is operational. The marker
                 // and payload remain the only ownership journal, so retain
@@ -218,15 +183,37 @@ nonisolated final class BrowserDownloadRecoveryStore: @unchecked Sendable {
                 failures[identifiers.downloadID] = error.localizedDescription
                 continue
             }
+            guard marker.version == BrowserCompletedTemporaryManifest.currentVersion,
+                  handoff.version == CompletedDownloadHandoffManifest.currentVersion,
+                  handoff.downloadID == identifiers.downloadID,
+                  handoff.attemptIdentifier == identifiers.attemptIdentifier,
+                  handoff.owner == .browser,
+                  handoff.phase == .claiming || handoff.phase == .ready,
+                  handoff.destinationPath == nil,
+                  handoff.placementStagingPath == nil,
+                  handoff.actualBytes >= 0,
+                  handoff.expectedBytes == handoff.actualBytes,
+                  (handoff.phase == .claiming && handoff.payloadSHA256.isEmpty)
+                    || (handoff.phase == .ready
+                        && handoff.payloadSHA256.count == SHA256.byteCount * 2),
+                  handoff.statusCode.map({ (200 ... 299).contains($0) }) != false,
+                  values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  values.fileSize.map(Int64.init) == handoff.actualBytes else {
+                removeCompletedTemporaryFiles(
+                    payloadURL: payloadURL,
+                    metadataURL: metadataURL
+                )
+                continue
+            }
 
             do {
-                _ = try completedHandoffStore.publish(
-                    payloadAt: payloadURL,
-                    manifest: handoff
-                )
-                removeCompletedTemporaryFiles(
-                    payloadURL: nil,
-                    metadataURL: metadataURL
+                _ = try publishRecordedCompletion(
+                    BrowserRecordedCompletion(
+                        payloadURL: payloadURL,
+                        metadataURL: metadataURL,
+                        manifest: handoff
+                    )
                 )
             } catch {
                 // These bytes passed their own integrity checks. A publish
@@ -309,44 +296,8 @@ nonisolated final class BrowserDownloadRecoveryStore: @unchecked Sendable {
     }
 
     func discardUnrecoverablePayload(at url: URL) {
-        do {
-            try fileManager.removeItem(at: url)
-            try DurableFileSystem.synchronizeParentDirectory(of: url)
-        } catch {
-            // The payload has no durable completion marker and cannot be
-            // published. Cleanup is best effort.
-        }
-    }
-
-    private func finalizedManifest(
-        _ claimingManifest: CompletedDownloadHandoffManifest,
-        payloadURL: URL,
-        metadataURL: URL
-    ) throws -> CompletedDownloadHandoffManifest {
-        let payloadSHA256 = try DurableFileSystem.sha256(at: payloadURL)
-        if claimingManifest.payloadSHA256.isEmpty == false,
-           claimingManifest.payloadSHA256 != payloadSHA256 {
-            throw CompletedDownloadHandoffError.invalidPayload
-        }
-        let readyManifest = CompletedDownloadHandoffManifest(
-            downloadID: claimingManifest.downloadID,
-            attemptIdentifier: claimingManifest.attemptIdentifier,
-            owner: claimingManifest.owner,
-            sourceURL: claimingManifest.sourceURL,
-            statusCode: claimingManifest.statusCode,
-            mimeType: claimingManifest.mimeType,
-            suggestedFilename: claimingManifest.suggestedFilename,
-            actualBytes: claimingManifest.actualBytes,
-            expectedBytes: claimingManifest.expectedBytes,
-            payloadSHA256: payloadSHA256,
-            createdAt: claimingManifest.createdAt
-        )
-        try JSONEncoder().encode(
-            BrowserCompletedTemporaryManifest(handoff: readyManifest)
-        ).write(to: metadataURL, options: .atomic)
-        try DurableFileSystem.synchronizeFile(at: metadataURL)
-        try DurableFileSystem.synchronizeParentDirectory(of: metadataURL)
-        return readyManifest
+        guard (try? fileManager.removeItem(at: url)) != nil else { return }
+        try? DurableFileSystem.synchronizeParentDirectory(of: url)
     }
 
     private func payloadURL(
@@ -389,14 +340,9 @@ nonisolated final class BrowserDownloadRecoveryStore: @unchecked Sendable {
         return (downloadID, attemptIdentifier)
     }
 
-    private func removeMetadataAfterPublication(at metadataURL: URL) {
-        do {
-            try fileManager.removeItem(at: metadataURL)
-            try DurableFileSystem.synchronizeParentDirectory(of: metadataURL)
-        } catch {
-            // The handoff is authoritative. Recovery safely prunes a stale
-            // marker once it observes that the payload has moved.
-        }
+    private func removeMetadata(at url: URL) {
+        guard (try? fileManager.removeItem(at: url)) != nil else { return }
+        try? DurableFileSystem.synchronizeParentDirectory(of: url)
     }
 
     private func removeCompletedTemporaryFiles(
@@ -406,12 +352,6 @@ nonisolated final class BrowserDownloadRecoveryStore: @unchecked Sendable {
         if let payloadURL {
             try? fileManager.removeItem(at: payloadURL)
         }
-        do {
-            try fileManager.removeItem(at: metadataURL)
-            try DurableFileSystem.synchronizeParentDirectory(of: metadataURL)
-        } catch {
-            // A malformed marker left behind cannot be published because each
-            // recovery scan repeats the complete integrity validation.
-        }
+        removeMetadata(at: metadataURL)
     }
 }

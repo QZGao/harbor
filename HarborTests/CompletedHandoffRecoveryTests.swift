@@ -101,7 +101,7 @@ extension HarborModelAndSafetyTests {
         await center.shutdownForTermination()
     }
 
-    func testBrowserCompletionMarkerRetainsPayloadAcrossHandoffStoreFailure() async throws {
+    func testBrowserReadyCompletionMarkerRetainsPayloadAcrossStoreFailure() async throws {
         let fileManager = FileManager.default
         let testRoot = fileManager.temporaryDirectory
             .appendingPathComponent("HarborBrowserCompletionMarkerTests-\(UUID().uuidString)", isDirectory: true)
@@ -131,6 +131,7 @@ extension HarborModelAndSafetyTests {
         let markerURL = browserRoot
             .appendingPathComponent(basename)
             .appendingPathExtension("completion")
+        try payload.write(to: payloadURL)
         let manifest = CompletedDownloadHandoffManifest(
             downloadID: downloadID,
             attemptIdentifier: attemptIdentifier,
@@ -141,9 +142,8 @@ extension HarborModelAndSafetyTests {
             suggestedFilename: "browser.bin",
             actualBytes: Int64(payload.count),
             expectedBytes: Int64(payload.count),
-            phase: .claiming
+            payloadSHA256: try DurableFileSystem.sha256(at: payloadURL)
         )
-        try payload.write(to: payloadURL)
         try JSONEncoder().encode(
             BrowserCompletedTemporaryManifest(handoff: manifest)
         ).write(to: markerURL, options: .atomic)
