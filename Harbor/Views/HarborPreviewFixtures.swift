@@ -37,16 +37,19 @@ enum HarborPreviewFixtures {
             backend: .aria2,
             preferredFilename: nil,
             destinationFolderPath: "/Users/example/Downloads",
-            status: .paused,
-            progress: 0.14,
-            bytesWritten: 246 * 1_024 * 1_024,
+            status: .seeding,
+            progress: 1,
+            bytesWritten: Int64(1.78 * 1_024 * 1_024 * 1_024),
             expectedBytes: Int64(1.78 * 1_024 * 1_024 * 1_024),
+            uploadedBytes: Int64(2.31 * 1_024 * 1_024 * 1_024),
             speedBytesPerSecond: 0,
-            uploadBytesPerSecond: 0,
+            uploadBytesPerSecond: 1.4 * 1_024 * 1_024,
             startedAt: now.addingTimeInterval(-3_420),
+            finishedAt: now.addingTimeInterval(-600),
             updatedAt: now.addingTimeInterval(-120),
             backendIdentifier: "preview-torrent",
-            metadataName: "Cold Storage (2026) [1080p] [WEBRip] [x265]"
+            metadataName: "Cold Storage (2026) [1080p] [WEBRip] [x265]",
+            shouldSeedAfterDownload: true
         )
 
         let direct = DownloadItem(

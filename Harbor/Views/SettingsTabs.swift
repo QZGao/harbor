@@ -10,9 +10,26 @@ struct GeneralSettingsTab: View {
             Section("Behavior") {
                 Toggle("Start downloads immediately", isOn: $settings.startDownloadsAutomatically)
                 Toggle("Send download notifications", isOn: $settings.notificationsEnabled)
+                Toggle(
+                    "Start at Login",
+                    isOn: Binding(
+                        get: { settings.startAtLogin },
+                        set: { settings.setStartAtLogin($0) }
+                    )
+                )
+                Toggle("Prevent sleep while downloading", isOn: $settings.preventSleepWhileDownloading)
+
+                if let startAtLoginErrorMessage = settings.startAtLoginErrorMessage {
+                    Text(startAtLoginErrorMessage)
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                }
             }
         }
         .formStyle(.grouped)
+        .onAppear {
+            settings.refreshStartAtLoginStatus()
+        }
     }
 }
 
@@ -65,9 +82,40 @@ struct TorrentsSettingsTab: View {
 
             Section("Seeding") {
                 Toggle("Seed new torrents after downloading", isOn: $settings.seedNewTorrents)
+
+                LabeledContent("Stop at Share Ratio") {
+                    HStack(spacing: 8) {
+                        Toggle("Stop at Share Ratio", isOn: $settings.stopSeedingAtRatioEnabled)
+                            .labelsHidden()
+
+                        TextField(
+                            "Ratio",
+                            value: $settings.stopSeedingRatio,
+                            format: .number.precision(.fractionLength(1...2))
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.trailing)
+                        .monospacedDigit()
+                        .frame(width: 72)
+                        .disabled(!settings.stopSeedingAtRatioEnabled)
+
+                        Text("ratio")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Text("Stops seeding after Harbor uploads the selected multiple of the torrent size.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
+        .onChange(of: settings.stopSeedingRatio) { _, value in
+            let clampedValue = AppSettingsStore.clampedSeedingRatio(value)
+            if clampedValue != value {
+                settings.stopSeedingRatio = clampedValue
+            }
+        }
     }
 }
 
@@ -78,6 +126,18 @@ struct BandwidthSettingsTab: View {
         @Bindable var settings = settings
 
         Form {
+            Section("Traffic Mode") {
+                Picker("Mode", selection: $settings.trafficMode) {
+                    ForEach(TrafficMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+
+                Text("Unlimited has no limits. Balanced uses 25 MB/s down and 5 MB/s up. Quiet uses 5 MB/s down and 512 KB/s up. Custom uses the limits below.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Connections") {
                 Stepper(
                     value: $settings.maxConcurrentDownloads,
@@ -94,7 +154,7 @@ struct BandwidthSettingsTab: View {
                 }
             }
 
-            Section("Download Limits") {
+            Section("Custom Download Limits") {
                 SpeedLimitRow(
                     title: "Global Download Limit",
                     isEnabled: $settings.globalSpeedLimitEnabled,
@@ -110,7 +170,7 @@ struct BandwidthSettingsTab: View {
                 }
             }
 
-            Section("Upload Limits") {
+            Section("Custom Upload Limits") {
                 SpeedLimitRow(
                     title: "Global Upload Limit",
                     isEnabled: $settings.globalUploadSpeedLimitEnabled,

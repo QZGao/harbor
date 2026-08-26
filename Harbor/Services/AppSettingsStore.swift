@@ -2,6 +2,52 @@ import AppKit
 import Foundation
 import Observation
 
+enum TrafficMode: String, CaseIterable, Identifiable, Sendable {
+    case unlimited
+    case balanced
+    case quiet
+    case custom
+
+    var id: String { rawValue }
+
+    var title: LocalizedStringResource {
+        switch self {
+        case .unlimited:
+            "Unlimited"
+        case .balanced:
+            "Balanced"
+        case .quiet:
+            "Quiet"
+        case .custom:
+            "Custom"
+        }
+    }
+
+    nonisolated func applying(to customSettings: DownloadTransferSettings) -> DownloadTransferSettings {
+        let limits: (download: Int64?, perDownload: Int64?, upload: Int64?, perUpload: Int64?)
+
+        switch self {
+        case .unlimited:
+            limits = (nil, nil, nil, nil)
+        case .balanced:
+            limits = (25 * 1_024 * 1_024, 5 * 1_024 * 1_024, 5 * 1_024 * 1_024, 1_024 * 1_024)
+        case .quiet:
+            limits = (5 * 1_024 * 1_024, 1_024 * 1_024, 512 * 1_024, 256 * 1_024)
+        case .custom:
+            return customSettings
+        }
+
+        return DownloadTransferSettings(
+            maxConcurrentDownloads: customSettings.maxConcurrentDownloads,
+            globalSpeedLimitBytesPerSecond: limits.download,
+            perDownloadSpeedLimitBytesPerSecond: limits.perDownload,
+            globalUploadSpeedLimitBytesPerSecond: limits.upload,
+            perDownloadUploadSpeedLimitBytesPerSecond: limits.perUpload,
+            perDownloadConnectionCount: customSettings.perDownloadConnectionCount
+        )
+    }
+}
+
 struct DownloadTransferSettings: Equatable, Sendable {
     nonisolated static var `default`: DownloadTransferSettings {
         DownloadTransferSettings(
@@ -31,9 +77,13 @@ final class AppSettingsStore {
         static let torrentWatchFolderPath = "torrentWatchFolderPath"
         static let torrentWatchFolderEnabled = "torrentWatchFolderEnabled"
         static let seedNewTorrents = "seedNewTorrents"
+        static let stopSeedingAtRatioEnabled = "stopSeedingAtRatioEnabled"
+        static let stopSeedingRatio = "stopSeedingRatio"
         static let maxConcurrentDownloads = "maxConcurrentDownloads"
         static let startDownloadsAutomatically = "startDownloadsAutomatically"
         static let notificationsEnabled = "notificationsEnabled"
+        static let preventSleepWhileDownloading = "preventSleepWhileDownloading"
+        static let trafficMode = "trafficMode"
         static let globalSpeedLimitEnabled = "globalSpeedLimitEnabled"
         static let globalSpeedLimitKilobytesPerSecond = "globalSpeedLimitKilobytesPerSecond"
         static let perDownloadSpeedLimitEnabled = "perDownloadSpeedLimitEnabled"
@@ -48,8 +98,10 @@ final class AppSettingsStore {
     static let maxConcurrentDownloadsRange = 1 ... 16
     static let perDownloadConnectionCountRange = 1 ... 16
     static let speedLimitKilobytesRange = 1 ... 1_048_576
+    static let seedingRatioRange = 0.1 ... 100.0
 
     private let userDefaults: UserDefaults
+    @ObservationIgnored private let loginItemController: any LoginItemControlling
     @ObservationIgnored var transferSettingsDidChange: ((DownloadTransferSettings) -> Void)?
     @ObservationIgnored var torrentAutomationSettingsDidChange: (() -> Void)?
 
@@ -87,6 +139,20 @@ final class AppSettingsStore {
         }
     }
 
+    var stopSeedingAtRatioEnabled: Bool {
+        didSet {
+            userDefaults.set(stopSeedingAtRatioEnabled, forKey: Keys.stopSeedingAtRatioEnabled)
+            notifyTransferSettingsChanged()
+        }
+    }
+
+    var stopSeedingRatio: Double {
+        didSet {
+            userDefaults.set(stopSeedingRatio, forKey: Keys.stopSeedingRatio)
+            notifyTransferSettingsChanged()
+        }
+    }
+
     private(set) var torrentWatchFolderStatus: TorrentWatchFolderStatus = .stopped
 
     var maxConcurrentDownloads: Int {
@@ -108,38 +174,64 @@ final class AppSettingsStore {
         }
     }
 
+    var preventSleepWhileDownloading: Bool {
+        didSet {
+            userDefaults.set(preventSleepWhileDownloading, forKey: Keys.preventSleepWhileDownloading)
+        }
+    }
+
+    private(set) var startAtLogin = false
+    private(set) var startAtLoginErrorMessage: String?
+
+    var trafficMode: TrafficMode {
+        didSet {
+            userDefaults.set(trafficMode.rawValue, forKey: Keys.trafficMode)
+            notifyTransferSettingsChanged()
+        }
+    }
+
     var globalSpeedLimitEnabled: Bool {
         didSet {
             userDefaults.set(globalSpeedLimitEnabled, forKey: Keys.globalSpeedLimitEnabled)
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
     var globalSpeedLimitKilobytesPerSecond: Int {
         didSet {
             userDefaults.set(globalSpeedLimitKilobytesPerSecond, forKey: Keys.globalSpeedLimitKilobytesPerSecond)
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
     var perDownloadSpeedLimitEnabled: Bool {
         didSet {
             userDefaults.set(perDownloadSpeedLimitEnabled, forKey: Keys.perDownloadSpeedLimitEnabled)
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
     var perDownloadSpeedLimitKilobytesPerSecond: Int {
         didSet {
             userDefaults.set(perDownloadSpeedLimitKilobytesPerSecond, forKey: Keys.perDownloadSpeedLimitKilobytesPerSecond)
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
     var globalUploadSpeedLimitEnabled: Bool {
         didSet {
             userDefaults.set(globalUploadSpeedLimitEnabled, forKey: Keys.globalUploadSpeedLimitEnabled)
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
@@ -149,14 +241,18 @@ final class AppSettingsStore {
                 globalUploadSpeedLimitKilobytesPerSecond,
                 forKey: Keys.globalUploadSpeedLimitKilobytesPerSecond
             )
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
     var perDownloadUploadSpeedLimitEnabled: Bool {
         didSet {
             userDefaults.set(perDownloadUploadSpeedLimitEnabled, forKey: Keys.perDownloadUploadSpeedLimitEnabled)
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
@@ -166,7 +262,9 @@ final class AppSettingsStore {
                 perDownloadUploadSpeedLimitKilobytesPerSecond,
                 forKey: Keys.perDownloadUploadSpeedLimitKilobytesPerSecond
             )
-            notifyTransferSettingsChanged()
+            if activateCustomTrafficMode() == false {
+                notifyTransferSettingsChanged()
+            }
         }
     }
 
@@ -177,8 +275,13 @@ final class AppSettingsStore {
         }
     }
 
-    init(userDefaults: UserDefaults = .standard) {
+    init(
+        userDefaults: UserDefaults = .standard,
+        loginItemController: (any LoginItemControlling)? = nil
+    ) {
         self.userDefaults = userDefaults
+        let resolvedLoginItemController = loginItemController ?? SystemLoginItemController()
+        self.loginItemController = resolvedLoginItemController
 
         let defaultDownloadsPath = FileManager.default.urls(
             for: .downloadsDirectory,
@@ -199,6 +302,9 @@ final class AppSettingsStore {
         } else {
             self.seedNewTorrents = userDefaults.bool(forKey: Keys.seedNewTorrents)
         }
+        self.stopSeedingAtRatioEnabled = userDefaults.bool(forKey: Keys.stopSeedingAtRatioEnabled)
+        let storedSeedingRatio = userDefaults.double(forKey: Keys.stopSeedingRatio)
+        self.stopSeedingRatio = Self.clampedSeedingRatio(storedSeedingRatio == 0 ? 2.0 : storedSeedingRatio)
 
         let storedConcurrency = userDefaults.integer(forKey: Keys.maxConcurrentDownloads)
         self.maxConcurrentDownloads = Self.clamped(
@@ -216,6 +322,19 @@ final class AppSettingsStore {
             self.notificationsEnabled = true
         } else {
             self.notificationsEnabled = userDefaults.bool(forKey: Keys.notificationsEnabled)
+        }
+        self.preventSleepWhileDownloading = userDefaults.bool(forKey: Keys.preventSleepWhileDownloading)
+        self.startAtLogin = resolvedLoginItemController.status == .enabled
+
+        if let storedTrafficMode = userDefaults.string(forKey: Keys.trafficMode)
+            .flatMap(TrafficMode.init(rawValue:)) {
+            self.trafficMode = storedTrafficMode
+        } else {
+            let hasLegacyLimits = userDefaults.bool(forKey: Keys.globalSpeedLimitEnabled)
+                || userDefaults.bool(forKey: Keys.perDownloadSpeedLimitEnabled)
+                || userDefaults.bool(forKey: Keys.globalUploadSpeedLimitEnabled)
+                || userDefaults.bool(forKey: Keys.perDownloadUploadSpeedLimitEnabled)
+            self.trafficMode = hasLegacyLimits ? .custom : .unlimited
         }
 
         self.globalSpeedLimitEnabled = userDefaults.bool(forKey: Keys.globalSpeedLimitEnabled)
@@ -259,6 +378,27 @@ final class AppSettingsStore {
         )
     }
 
+    func refreshStartAtLoginStatus() {
+        startAtLogin = loginItemController.status == .enabled
+    }
+
+    func setStartAtLogin(_ isEnabled: Bool) {
+        startAtLoginErrorMessage = nil
+
+        do {
+            try loginItemController.setEnabled(isEnabled)
+            refreshStartAtLoginStatus()
+
+            guard startAtLogin == isEnabled else {
+                startAtLoginErrorMessage = loginItemStatusMessage(loginItemController.status)
+                return
+            }
+        } catch {
+            refreshStartAtLoginStatus()
+            startAtLoginErrorMessage = error.localizedDescription
+        }
+    }
+
     var defaultDestinationURL: URL {
         URL(fileURLWithPath: defaultDestinationPath, isDirectory: true)
     }
@@ -272,7 +412,7 @@ final class AppSettingsStore {
     }
 
     var transferSettings: DownloadTransferSettings {
-        DownloadTransferSettings(
+        let customSettings = DownloadTransferSettings(
             maxConcurrentDownloads: Self.clamped(maxConcurrentDownloads, to: Self.maxConcurrentDownloadsRange),
             globalSpeedLimitBytesPerSecond: speedLimitBytesPerSecond(
                 isEnabled: globalSpeedLimitEnabled,
@@ -295,10 +435,24 @@ final class AppSettingsStore {
                 to: Self.perDownloadConnectionCountRange
             )
         )
+
+        return trafficMode.applying(to: customSettings)
     }
 
     static func clampedSpeedLimitKilobytes(_ value: Int) -> Int {
         clamped(value, to: speedLimitKilobytesRange)
+    }
+
+    static func clampedSeedingRatio(_ value: Double) -> Double {
+        guard value.isFinite else {
+            return 2.0
+        }
+
+        return min(max(value, seedingRatioRange.lowerBound), seedingRatioRange.upperBound)
+    }
+
+    var seedingRatioLimit: Double? {
+        stopSeedingAtRatioEnabled ? Self.clampedSeedingRatio(stopSeedingRatio) : nil
     }
 
     func chooseDefaultDestination() {
@@ -343,6 +497,29 @@ final class AppSettingsStore {
 
     private func notifyTransferSettingsChanged() {
         transferSettingsDidChange?(transferSettings)
+    }
+
+    @discardableResult
+    private func activateCustomTrafficMode() -> Bool {
+        guard trafficMode != .custom else {
+            return false
+        }
+
+        trafficMode = .custom
+        return true
+    }
+
+    private func loginItemStatusMessage(_ status: LoginItemStatus) -> String {
+        switch status {
+        case .requiresApproval:
+            String(
+                localized: "Allow Harbor in System Settings > General > Login Items, then return here."
+            )
+        case .unavailable:
+            String(localized: "Start at Login is not available for this copy of Harbor.")
+        case .disabled, .enabled:
+            String(localized: "Harbor could not update the Start at Login setting.")
+        }
     }
 
     private func notifyTorrentAutomationSettingsChanged() {

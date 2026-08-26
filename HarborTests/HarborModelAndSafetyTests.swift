@@ -4,6 +4,142 @@ import XCTest
 
 @MainActor
 final class HarborModelAndSafetyTests: XCTestCase {
+    func testHarborURLSchemeIsRegistered() throws {
+        let urlTypes = try XCTUnwrap(
+            Bundle.main.object(forInfoDictionaryKey: "CFBundleURLTypes") as? [[String: Any]]
+        )
+        let schemes = urlTypes
+            .compactMap { $0["CFBundleURLSchemes"] as? [String] }
+            .flatMap { $0 }
+
+        XCTAssertTrue(schemes.contains("harbor"))
+    }
+
+    func testExternalHTTPSourcePrefillsAddSheetWithDefaultDestination() throws {
+        let settings = HarborPreviewFixtures.makeSettings()
+        let center = DownloadCenter(settings: settings)
+        let sourceURL = try XCTUnwrap(URL(string: "https://example.com/file.zip"))
+
+        center.receiveExternalAddSources([sourceURL])
+
+        let draft = try XCTUnwrap(center.addSheetDraft)
+        XCTAssertEqual(draft.entryMode, .linkOrMagnet)
+        XCTAssertEqual(draft.sourceURLText, sourceURL.absoluteString)
+        XCTAssertEqual(draft.destinationFolderURL, settings.defaultDestinationURL)
+    }
+
+    func testDownloadedPayloadClassifierDetectsTorrentResponses() {
+        let extensionlessURL = URL(string: "https://example.com/download?id=42")!
+
+        XCTAssertTrue(
+            DownloadedPayloadClassifier.isTorrent(
+                sourceURL: extensionlessURL,
+                suggestedFilename: nil,
+                responseMimeType: "application/x-bittorrent"
+            )
+        )
+        XCTAssertTrue(
+            DownloadedPayloadClassifier.isTorrent(
+                sourceURL: extensionlessURL,
+                suggestedFilename: "Linux.torrent",
+                responseMimeType: "application/octet-stream"
+            )
+        )
+        XCTAssertTrue(
+            DownloadedPayloadClassifier.isTorrent(
+                sourceURL: URL(string: "https://example.com/linux.torrent")!,
+                suggestedFilename: nil,
+                responseMimeType: nil
+            )
+        )
+        XCTAssertFalse(
+            DownloadedPayloadClassifier.isTorrent(
+                sourceURL: extensionlessURL,
+                suggestedFilename: "archive.zip",
+                responseMimeType: "application/octet-stream"
+            )
+        )
+        XCTAssertFalse(
+            DownloadedPayloadClassifier.isTorrent(
+                sourceURL: extensionlessURL,
+                suggestedFilename: "error.torrent",
+                responseMimeType: "application/x-bittorrent",
+                statusCode: 404
+            )
+        )
+    }
+
+    func testTorrentShareRatioPersistsWithUploadedBytes() throws {
+        let item = DownloadItem(
+            sourceURL: URL(fileURLWithPath: "/tmp/example.torrent"),
+            sourceKind: .torrentFile,
+            backend: .aria2,
+            preferredFilename: nil,
+            destinationFolderPath: "/tmp",
+            status: .seeding,
+            progress: 1,
+            bytesWritten: 1_000,
+            expectedBytes: 1_000,
+            uploadedBytes: 1_500
+        )
+
+        XCTAssertEqual(item.shareRatio, 1.5)
+
+        let restoredItem = DownloadItem(record: item.makeRecord())
+        XCTAssertEqual(restoredItem.uploadedBytes, 1_500)
+        XCTAssertEqual(restoredItem.shareRatio, 1.5)
+    }
+
+    func testDownloadedTorrentHandoffReusesTheDirectDownloadRow() {
+        let sourceURL = URL(string: "https://example.com/download?id=42")!
+        let item = DownloadItem(
+            sourceURL: sourceURL,
+            sourceKind: .directURL,
+            backend: .urlSession,
+            preferredFilename: "metadata.torrent",
+            destinationFolderPath: "/tmp",
+            fileLocationPath: "/tmp/metadata.torrent",
+            status: .downloading,
+            progress: 1,
+            bytesWritten: 512,
+            expectedBytes: 512,
+            finishedAt: .now,
+            resumeData: Data([0x01]),
+            taskIdentifier: 7,
+            backendIdentifier: "old-backend",
+            completionNotificationDelivered: true,
+            activityEvents: [
+                DownloadActivityEvent(kind: .added),
+                DownloadActivityEvent(kind: .started)
+            ]
+        )
+        let originalID = item.id
+        let originalActivity = item.activityEvents
+
+        DownloadCenter.configureDownloadedTorrentHandoff(
+            item,
+            shouldSeedAfterDownload: true
+        )
+
+        XCTAssertEqual(item.id, originalID)
+        XCTAssertEqual(item.sourceURL, sourceURL)
+        XCTAssertEqual(item.sourceKind, .torrentFile)
+        XCTAssertEqual(item.backend, .aria2)
+        XCTAssertEqual(item.status, .preparing)
+        XCTAssertEqual(item.activityEvents, originalActivity)
+        XCTAssertNil(item.preferredFilename)
+        XCTAssertNil(item.fileLocationPath)
+        XCTAssertNil(item.resumeData)
+        XCTAssertNil(item.taskIdentifier)
+        XCTAssertNil(item.backendIdentifier)
+        XCTAssertEqual(item.progress, 0)
+        XCTAssertEqual(item.bytesWritten, 0)
+        XCTAssertEqual(item.expectedBytes, 0)
+        XCTAssertNil(item.finishedAt)
+        XCTAssertTrue(item.shouldSeedAfterDownload)
+        XCTAssertFalse(item.completionNotificationDelivered)
+    }
+
     func testTransferLimitOverrideResolution() {
         XCTAssertEqual(
             TransferLimitOverride.inherit.resolvedBytesPerSecond(inheriting: 4_096),
@@ -96,6 +232,17 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertEqual(options["max-connection-per-server"], "6")
         XCTAssertEqual(options["seed-ratio"], "0.0")
         XCTAssertNil(options["seed-time"])
+
+        let ratioLimitedOptions = Aria2TorrentService.perDownloadOptions(
+            settings,
+            transferOptions: TorrentTransferOptions(
+                downloadLimitBytesPerSecond: nil,
+                uploadLimitBytesPerSecond: nil,
+                shouldSeed: true,
+                seedRatioLimit: 2
+            )
+        )
+        XCTAssertEqual(ratioLimitedOptions["seed-ratio"], "2.0")
     }
 
     func testMediaDownloadArgumentsKeepAutomaticAndExactFormatPathsSeparate() throws {
@@ -129,6 +276,8 @@ final class HarborModelAndSafetyTests: XCTestCase {
 
         let limitIndex = try XCTUnwrap(limitedArguments.firstIndex(of: "--limit-rate"))
         XCTAssertEqual(limitedArguments[limitedArguments.index(after: limitIndex)], "345678")
+        XCTAssertTrue(limitedArguments.contains("--progress"))
+        XCTAssertTrue(unlimitedArguments.contains("--progress"))
         XCTAssertFalse(unlimitedArguments.contains("--limit-rate"))
         XCTAssertFalse(limitedArguments.contains("--format"))
         XCTAssertFalse(unlimitedArguments.contains("--format"))
@@ -366,6 +515,48 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertTrue(restored.shouldSeedAfterDownload)
     }
 
+    func testQuickLookRequiresCompletedExistingLocalFiles() throws {
+        let suiteName = "HarborTests.QuickLook.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Harbor-Quick-Look-\(UUID().uuidString).txt")
+        try Data("Preview".utf8).write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let previewService = FakeQuickLookPreviewService()
+        let center = DownloadCenter(
+            settings: AppSettingsStore(userDefaults: userDefaults),
+            quickLookPreviewService: previewService
+        )
+        let item = makeTorrentItem(
+            sourceURL: URL(fileURLWithPath: "/tmp/preview.torrent"),
+            sourceKind: .torrentFile,
+            fileLocationPath: fileURL.path
+        )
+        center.downloads = [item]
+        center.selectedDownloadID = item.id
+
+        XCTAssertTrue(center.canQuickLookSelectedDownloads)
+
+        center.quickLookSelectedDownloads()
+
+        XCTAssertEqual(previewService.previewedURLs, [fileURL])
+        XCTAssertEqual(item.status, .completed)
+
+        item.status = .paused
+        XCTAssertFalse(center.canQuickLookSelectedDownloads)
+
+        item.status = .completed
+        try FileManager.default.removeItem(at: fileURL)
+        XCTAssertFalse(center.canQuickLookSelectedDownloads)
+
+        center.quickLookSelectedDownloads()
+        XCTAssertEqual(center.activeAlert?.title, "Quick Look Unavailable")
+    }
+
     func testLegacyCompletedTorrentDoesNotSeed() throws {
         let record = try legacyTorrentRecord(status: .completed)
 
@@ -497,8 +688,10 @@ final class HarborModelAndSafetyTests: XCTestCase {
             "downloadLimitOverride",
             "uploadLimitOverride",
             "torrentFingerprint",
+            "torrentSourceFingerprint",
             "managedTorrentSourcePath",
             "torrentPayloadPaths",
+            "uploadedBytes",
             "shouldSeedAfterDownload",
             "removeOriginalTorrentAfterImport",
             "completionNotificationDelivered"
@@ -525,5 +718,14 @@ final class HarborModelAndSafetyTests: XCTestCase {
             status: status,
             metadataName: metadataName
         )
+    }
+}
+
+@MainActor
+private final class FakeQuickLookPreviewService: QuickLookPreviewing {
+    private(set) var previewedURLs: [URL] = []
+
+    func preview(urls: [URL]) {
+        previewedURLs = urls
     }
 }

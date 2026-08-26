@@ -47,6 +47,7 @@ If you want a downloader that respects the platform, respects your machine, and 
 - Local-first and privacy-friendly by design
 - Direct HTTP and HTTPS downloads
 - Magnet link and local `.torrent` support
+- Batch add: paste many links, pick one folder, queue them all at once
 - Queue persistence across launches
 - Pause, resume, retry, cancel, and history flows
 - Finder reveal and open-file actions
@@ -68,6 +69,22 @@ Or download the latest DMG:
 - Drag `Harbor.app` into `Applications`
 
 Once installed, Harbor can check for new versions from the app menu and update through its built-in Sparkle updater.
+
+## URL handoff
+
+Browser extensions, command-line tools, and automations can open Harbor with an HTTP or HTTPS download URL:
+
+```text
+harbor://download?url=https%3A%2F%2Fexample.com%2Ffile.zip
+```
+
+Percent-encode the download URL as the `url` query value. On macOS, you can test the handoff with `open`:
+
+```sh
+open 'harbor://download?url=https%3A%2F%2Fexample.com%2Ffile.zip'
+```
+
+Harbor opens its Add Download sheet with the link filled in. The user can confirm the destination and start the download.
 
 ## Philosophy
 

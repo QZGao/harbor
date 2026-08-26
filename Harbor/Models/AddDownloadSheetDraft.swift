@@ -20,7 +20,6 @@ struct AddDownloadSheetDraft: Identifiable, Sendable {
     let id: UUID
     let entryMode: AddDownloadEntryMode
     let sourceURLText: String
-    let customFilename: String
     let torrentFileURL: URL?
     let destinationFolderURL: URL
     let shouldStartImmediately: Bool
@@ -30,7 +29,6 @@ struct AddDownloadSheetDraft: Identifiable, Sendable {
         id: UUID = UUID(),
         entryMode: AddDownloadEntryMode,
         sourceURLText: String = "",
-        customFilename: String = "",
         torrentFileURL: URL? = nil,
         destinationFolderURL: URL,
         shouldStartImmediately: Bool,
@@ -39,7 +37,6 @@ struct AddDownloadSheetDraft: Identifiable, Sendable {
         self.id = id
         self.entryMode = entryMode
         self.sourceURLText = sourceURLText
-        self.customFilename = customFilename
         self.torrentFileURL = torrentFileURL
         self.destinationFolderURL = destinationFolderURL
         self.shouldStartImmediately = shouldStartImmediately

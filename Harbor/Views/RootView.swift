@@ -4,6 +4,8 @@ import SwiftUI
 struct RootView: View {
     let center: DownloadCenter
     let settings: AppSettingsStore
+    @AppStorage("downloads.inspector.width")
+    private var storedInspectorWidth = Double(Layout.inspectorIdealWidth)
     @State private var isDownloadDropTargeted = false
     @FocusState private var isSearchFocused: Bool
 
@@ -36,9 +38,14 @@ struct RootView: View {
                 )
                 .inspector(isPresented: inspectorPresentation) {
                     DownloadDetailView(center: center)
+                        .onGeometryChange(for: CGFloat.self) { proxy in
+                            proxy.size.width
+                        } action: { width in
+                            persistInspectorWidth(width)
+                        }
                         .inspectorColumnWidth(
                             min: Layout.inspectorMinWidth,
-                            ideal: Layout.inspectorIdealWidth,
+                            ideal: restoredInspectorWidth,
                             max: Layout.inspectorMaxWidth
                         )
                 }
@@ -56,8 +63,8 @@ struct RootView: View {
                 mediaPreviewProvider: { url in
                     try await center.previewMediaDownload(for: url)
                 }
-            ) { request in
-                center.queueDownload(request)
+            ) { requests in
+                center.queueDownloads(requests)
             }
         }
         .sheet(
@@ -120,6 +127,31 @@ struct RootView: View {
                 }
             }
         )
+    }
+
+    private var restoredInspectorWidth: CGFloat {
+        min(
+            max(CGFloat(storedInspectorWidth), Layout.inspectorMinWidth),
+            Layout.inspectorMaxWidth
+        )
+    }
+
+    private func persistInspectorWidth(_ width: CGFloat) {
+        guard width.isFinite,
+              width >= Layout.inspectorMinWidth - 1,
+              width <= Layout.inspectorMaxWidth + 1 else {
+            return
+        }
+
+        let clampedWidth = min(
+            max(width, Layout.inspectorMinWidth),
+            Layout.inspectorMaxWidth
+        )
+        guard abs(storedInspectorWidth - Double(clampedWidth)) >= 0.5 else {
+            return
+        }
+
+        storedInspectorWidth = Double(clampedWidth)
     }
 
     private func loadExternalAddSources(_ providers: [NSItemProvider]) -> Bool {
@@ -188,25 +220,19 @@ private struct DownloadToolbarContent: ToolbarContent {
 
         ToolbarItem(placement: .primaryAction) {
             Menu {
-                Toggle("Limit Downloads", isOn: $settings.globalSpeedLimitEnabled)
-
-                Text(
-                    settings.globalSpeedLimitEnabled
-                        ? DownloadFormatting.speedString(Double(settings.globalSpeedLimitKilobytesPerSecond) * 1_024)
-                        : String(localized: "Unlimited")
-                )
-                .foregroundStyle(.secondary)
-
-                Divider()
-
-                Toggle("Limit Uploads", isOn: $settings.globalUploadSpeedLimitEnabled)
-
-                Text(
-                    settings.globalUploadSpeedLimitEnabled
-                        ? DownloadFormatting.speedString(Double(settings.globalUploadSpeedLimitKilobytesPerSecond) * 1_024)
-                        : String(localized: "Unlimited")
-                )
-                .foregroundStyle(.secondary)
+                ForEach(TrafficMode.allCases) { mode in
+                    Toggle(
+                        mode.title,
+                        isOn: Binding(
+                            get: { settings.trafficMode == mode },
+                            set: { isSelected in
+                                if isSelected {
+                                    settings.trafficMode = mode
+                                }
+                            }
+                        )
+                    )
+                }
 
                 Divider()
 
@@ -214,8 +240,10 @@ private struct DownloadToolbarContent: ToolbarContent {
                     Label("Edit Limits…", systemImage: "gearshape")
                 }
             } label: {
-                Label("Speed Limits", systemImage: "speedometer")
+                Label(settings.trafficMode.title, systemImage: "speedometer")
+                    .labelStyle(.titleAndIcon)
             }
+            .help("Traffic Mode")
         }
 
         ToolbarItem(placement: .primaryAction) {
@@ -223,19 +251,6 @@ private struct DownloadToolbarContent: ToolbarContent {
                 center.revealSelectedInFinder()
             }
             .disabled(center.selectedDownload == nil)
-        }
-
-        ToolbarItem(placement: .primaryAction) {
-            Menu {
-                Picker("Sort", selection: $center.sortMode) {
-                    ForEach(DownloadSortMode.allCases) { sortMode in
-                        Text(sortMode.title).tag(sortMode)
-                    }
-                }
-            } label: {
-                Label("Sort", systemImage: "arrow.up.arrow.down.circle")
-            }
-            .disabled(center.downloads.isEmpty)
         }
     }
 }
