@@ -1,4 +1,3 @@
-import Darwin
 import Foundation
 
 struct DownloadPayloadPathResolution: Equatable, Sendable {
@@ -115,7 +114,7 @@ struct DownloadDataRemovalService {
 
         for url in resolution.safeURLs {
             do {
-                guard try pathEntryExists(at: url) else {
+                guard try DurableFileSystem.pathEntryExists(at: url) else {
                     missingPaths.append(url.path)
                     continue
                 }
@@ -174,7 +173,7 @@ struct DownloadDataRemovalService {
         }
         for url in resolution.safeURLs {
             do {
-                if try pathEntryExists(at: url) {
+                if try DurableFileSystem.pathEntryExists(at: url) {
                     existingPaths.append(url.path)
                 } else {
                     missingPaths.append(url.path)
@@ -199,17 +198,4 @@ struct DownloadDataRemovalService {
         url.standardizedFileURL.resolvingSymlinksInPath()
     }
 
-    private nonisolated func pathEntryExists(at url: URL) throws -> Bool {
-        var info = stat()
-        let result = url.path.withCString { path in
-            Darwin.lstat(path, &info)
-        }
-        if result == 0 {
-            return true
-        }
-        if errno == ENOENT {
-            return false
-        }
-        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-    }
 }

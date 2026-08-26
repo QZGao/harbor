@@ -219,7 +219,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
     init(
         fileManager: FileManager = .default,
         directoryURL: URL? = nil,
-        payloadHashOperation: @escaping PayloadHashOperation = CompletedDownloadHandoffStore.computeSHA256
+        payloadHashOperation: @escaping PayloadHashOperation = DurableFileSystem.sha256
     ) {
         self.fileManager = fileManager
         self.directoryURL = directoryURL
@@ -239,7 +239,10 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
             downloadID: proposedManifest.downloadID,
             attemptIdentifier: proposedManifest.attemptIdentifier
         ) {
-            try createDirectoryIfNeeded()
+            try DurableFileSystem.createDirectoryIfNeeded(
+                at: directoryURL,
+                fileManager: fileManager
+            )
             let actualBytes = try regularFileSize(at: sourceURL)
             guard proposedManifest.version == CompletedDownloadHandoffManifest.currentVersion,
                   proposedManifest.actualBytes == actualBytes,
@@ -282,7 +285,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
                 attemptIdentifier: claimingManifest.attemptIdentifier,
                 pathExtension: Self.packageExtension
             )
-            if try itemExists(at: readyURL) {
+            if try DurableFileSystem.itemExists(at: readyURL) {
                 let existingManifest = try manifestMatchingClaim(
                     at: readyURL,
                     claim: claimingManifest,
@@ -299,7 +302,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
                 attemptIdentifier: claimingManifest.attemptIdentifier,
                 pathExtension: Self.stagingExtension
             )
-            if try itemExists(at: stagingURL) {
+            if try DurableFileSystem.itemExists(at: stagingURL) {
                 let existingManifest = try manifestMatchingClaim(
                     at: stagingURL,
                     claim: claimingManifest,
@@ -317,30 +320,23 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
                 withIntermediateDirectories: false
             )
             try DurableFileSystem.synchronizeDirectory(at: directoryURL)
-            do {
-                try writeManifest(claimingManifest, to: stagingURL)
-                try DurableFileSystem.synchronizeDirectory(at: stagingURL)
-                let payloadURL = stagingURL.appendingPathComponent(Self.payloadFilename)
-                try fileManager.moveItem(at: sourceURL, to: payloadURL)
-                let stagedBytes = try regularFileSize(at: payloadURL)
-                guard stagedBytes == actualBytes else {
-                    throw CompletedDownloadHandoffError.payloadLengthMismatch(
-                        actual: stagedBytes,
-                        expected: actualBytes
-                    )
-                }
-                try synchronizeFile(at: payloadURL)
-                try DurableFileSystem.synchronizeDirectory(at: stagingURL)
-                return CompletedDownloadHandoffClaim(
-                    packageURL: stagingURL,
-                    manifest: claimingManifest
+            try writeManifest(claimingManifest, to: stagingURL)
+            try DurableFileSystem.synchronizeDirectory(at: stagingURL)
+            let payloadURL = stagingURL.appendingPathComponent(Self.payloadFilename)
+            try fileManager.moveItem(at: sourceURL, to: payloadURL)
+            let stagedBytes = try regularFileSize(at: payloadURL)
+            guard stagedBytes == actualBytes else {
+                throw CompletedDownloadHandoffError.payloadLengthMismatch(
+                    actual: stagedBytes,
+                    expected: actualBytes
                 )
-            } catch {
-                // Once the move succeeds, staging may own the only completed
-                // bytes. Leave it for recovery; invalid empty claims are
-                // distinguished and pruned by the startup scanner.
-                throw error
             }
+            try synchronizeFile(at: payloadURL)
+            try DurableFileSystem.synchronizeDirectory(at: stagingURL)
+            return CompletedDownloadHandoffClaim(
+                packageURL: stagingURL,
+                manifest: claimingManifest
+            )
         }
     }
 
@@ -446,7 +442,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
             downloadID: claim.manifest.downloadID,
             attemptIdentifier: claim.manifest.attemptIdentifier
         ) {
-            if try itemExists(at: hashingInput.readyURL) {
+            if try DurableFileSystem.itemExists(at: hashingInput.readyURL) {
                 do {
                     let existing = try validatedHandoff(at: hashingInput.readyURL)
                     guard existing.manifest.matchesClaim(
@@ -455,7 +451,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
                     ) else {
                         throw CocoaError(.fileWriteFileExists)
                     }
-                    if try itemExists(at: hashingInput.stagingURL) {
+                    if try DurableFileSystem.itemExists(at: hashingInput.stagingURL) {
                         try fileManager.removeItem(at: hashingInput.stagingURL)
                         try DurableFileSystem.synchronizeDirectory(at: directoryURL)
                     }
@@ -507,173 +503,9 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
 
     func publish(
         payloadAt sourceURL: URL,
-        manifest proposedManifest: CompletedDownloadHandoffManifest
+        manifest: CompletedDownloadHandoffManifest
     ) throws -> CompletedDownloadHandoff {
-        try withAttemptLock(
-            downloadID: proposedManifest.downloadID,
-            attemptIdentifier: proposedManifest.attemptIdentifier
-        ) {
-            try createDirectoryIfNeeded()
-
-            let actualBytes = try regularFileSize(at: sourceURL)
-            guard proposedManifest.version == CompletedDownloadHandoffManifest.currentVersion,
-                  proposedManifest.actualBytes == actualBytes,
-                  proposedManifest.phase == .ready,
-                  proposedManifest.destinationPath == nil,
-                  proposedManifest.placementStagingPath == nil,
-                  proposedManifest.payloadSHA256.isEmpty
-                    || proposedManifest.payloadSHA256.count == SHA256.byteCount * 2 else {
-                throw CompletedDownloadHandoffError.invalidManifest
-            }
-            if let statusCode = proposedManifest.statusCode,
-               (200 ... 299).contains(statusCode) == false {
-                throw CompletedDownloadHandoffError.unexpectedResponseStatus(statusCode)
-            }
-            if proposedManifest.expectedBytes > 0,
-               proposedManifest.expectedBytes != actualBytes {
-                throw CompletedDownloadHandoffError.payloadLengthMismatch(
-                    actual: actualBytes,
-                    expected: proposedManifest.expectedBytes
-                )
-            }
-
-            let expectedBytes = proposedManifest.expectedBytes > 0
-                ? proposedManifest.expectedBytes
-                : actualBytes
-            let claimingManifest = CompletedDownloadHandoffManifest(
-                downloadID: proposedManifest.downloadID,
-                attemptIdentifier: proposedManifest.attemptIdentifier,
-                owner: proposedManifest.owner,
-                sourceURL: proposedManifest.sourceURL,
-                statusCode: proposedManifest.statusCode,
-                mimeType: proposedManifest.mimeType,
-                suggestedFilename: proposedManifest.suggestedFilename,
-                actualBytes: actualBytes,
-                expectedBytes: expectedBytes,
-                payloadSHA256: proposedManifest.payloadSHA256,
-                createdAt: proposedManifest.createdAt,
-                phase: .claiming
-            )
-
-            let readyURL = packageURL(
-                downloadID: claimingManifest.downloadID,
-                attemptIdentifier: claimingManifest.attemptIdentifier,
-                pathExtension: Self.packageExtension
-            )
-            if try itemExists(at: readyURL) {
-                let existing = try validatedHandoff(at: readyURL)
-                guard existing.manifest.matchesClaim(
-                    claimingManifest,
-                    actualBytes: actualBytes
-                ) else {
-                    throw CocoaError(.fileWriteFileExists)
-                }
-                try? fileManager.removeItem(at: sourceURL)
-                return existing
-            }
-
-            let stagingURL = packageURL(
-                downloadID: claimingManifest.downloadID,
-                attemptIdentifier: claimingManifest.attemptIdentifier,
-                pathExtension: Self.stagingExtension
-            )
-            if try itemExists(at: stagingURL) {
-                try promoteStagingPackageLocked(at: stagingURL)
-                if try itemExists(at: readyURL) {
-                    let existing = try validatedHandoff(at: readyURL)
-                    guard existing.manifest.matchesClaim(
-                        claimingManifest,
-                        actualBytes: actualBytes
-                    ) else {
-                        throw CocoaError(.fileWriteFileExists)
-                    }
-                    try? fileManager.removeItem(at: sourceURL)
-                    return existing
-                }
-
-                // A staging package is already the durable owner for this
-                // immutable attempt. Never overwrite it with another source.
-                throw CocoaError(.fileWriteFileExists)
-            }
-            try fileManager.createDirectory(
-                at: stagingURL,
-                withIntermediateDirectories: false
-            )
-            // The staging directory must itself be durable before moving the
-            // only completed payload into it. Otherwise a crash can persist
-            // the source deletion without preserving the new directory entry.
-            try DurableFileSystem.synchronizeDirectory(at: directoryURL)
-
-            do {
-                // Record the immutable claim before taking the source. The
-                // completed bytes then live at a deterministic path while the
-                // potentially expensive hash is computed.
-                try writeManifest(claimingManifest, to: stagingURL)
-                try DurableFileSystem.synchronizeDirectory(at: stagingURL)
-                try fileManager.moveItem(
-                    at: sourceURL,
-                    to: stagingURL.appendingPathComponent(Self.payloadFilename)
-                )
-                let stagedBytes = try regularFileSize(
-                    at: stagingURL.appendingPathComponent(Self.payloadFilename)
-                )
-                guard stagedBytes == actualBytes else {
-                    throw CompletedDownloadHandoffError.payloadLengthMismatch(
-                        actual: stagedBytes,
-                        expected: actualBytes
-                    )
-                }
-                try synchronizeFile(
-                    at: stagingURL.appendingPathComponent(Self.payloadFilename)
-                )
-                try DurableFileSystem.synchronizeDirectory(at: stagingURL)
-
-                let stagedPayloadURL = stagingURL.appendingPathComponent(Self.payloadFilename)
-                let payloadVerification = try verifiedFile(
-                    at: stagedPayloadURL,
-                    expectedBytes: actualBytes
-                )
-                let payloadSHA256 = payloadVerification.sha256
-                if claimingManifest.payloadSHA256.isEmpty == false,
-                   claimingManifest.payloadSHA256 != payloadSHA256 {
-                    throw CompletedDownloadHandoffError.invalidPayload
-                }
-                try requireUnchanged(payloadVerification, at: stagedPayloadURL)
-                let readyManifest = CompletedDownloadHandoffManifest(
-                    downloadID: claimingManifest.downloadID,
-                    attemptIdentifier: claimingManifest.attemptIdentifier,
-                    owner: claimingManifest.owner,
-                    sourceURL: claimingManifest.sourceURL,
-                    statusCode: claimingManifest.statusCode,
-                    mimeType: claimingManifest.mimeType,
-                    suggestedFilename: claimingManifest.suggestedFilename,
-                    actualBytes: actualBytes,
-                    expectedBytes: expectedBytes,
-                    payloadSHA256: payloadSHA256,
-                    createdAt: claimingManifest.createdAt
-                )
-                try writeManifest(readyManifest, to: stagingURL)
-                try DurableFileSystem.synchronizeDirectory(at: stagingURL)
-                try fileManager.moveItem(at: stagingURL, to: readyURL)
-                try DurableFileSystem.synchronizeDirectory(at: directoryURL)
-            } catch {
-                if let committed = try? validatedHandoff(at: readyURL) {
-                    do {
-                        try DurableFileSystem.synchronizeDirectory(at: directoryURL)
-                        return committed
-                    } catch {
-                        // Keep the committed package. A later reconciliation
-                        // can retry the durability barrier without redownloading.
-                    }
-                }
-                // Staging may now be the only owner of the completed bytes.
-                // Startup reconciliation decides whether it is valid,
-                // incomplete, or temporarily unavailable.
-                throw error
-            }
-
-            return try validatedHandoff(at: readyURL)
-        }
+        try finalize(claim(payloadAt: sourceURL, manifest: manifest))
     }
 
     func recordDestination(
@@ -780,7 +612,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
                 attemptIdentifier: attemptIdentifier,
                 pathExtension: Self.stagingExtension
             )
-            guard (try? itemExists(at: stagingURL)) == true else {
+            guard (try? DurableFileSystem.itemExists(at: stagingURL)) == true else {
                 return nil
             }
             try? promoteStagingPackageLocked(at: stagingURL)
@@ -795,7 +627,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
         ) {
             for pathExtension in [Self.packageExtension, Self.stagingExtension] {
                 do {
-                    if try itemExists(
+                    if try DurableFileSystem.itemExists(
                         at: packageURL(
                             downloadID: downloadID,
                             attemptIdentifier: attemptIdentifier,
@@ -816,7 +648,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
 
     func entries() throws -> [CompletedDownloadHandoffEntry] {
         let exists = try withRegistryLock {
-            try itemExists(at: directoryURL)
+            try DurableFileSystem.itemExists(at: directoryURL)
         }
         guard exists else {
             return []
@@ -914,7 +746,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
             downloadID: downloadID,
             attemptIdentifier: attemptIdentifier ?? downloadID
         ) {
-            guard try itemExists(at: directoryURL) else {
+            guard try DurableFileSystem.itemExists(at: directoryURL) else {
                 return
             }
             let contents = try fileManager.contentsOfDirectory(
@@ -1035,7 +867,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
               let identifiers = identifiers(from: packageURL) else {
             throw CompletedDownloadHandoffError.invalidManifest
         }
-        guard try itemExists(at: packageURL) else {
+        guard try DurableFileSystem.itemExists(at: packageURL) else {
             throw CompletedDownloadHandoffError.invalidManifest
         }
         let packageValues = try packageURL.resourceValues(
@@ -1044,7 +876,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
         guard
               packageValues.isDirectory == true,
               packageValues.isSymbolicLink != true,
-              try itemExists(at: manifestURL(for: packageURL)) else {
+              try DurableFileSystem.itemExists(at: manifestURL(for: packageURL)) else {
             throw CompletedDownloadHandoffError.invalidManifest
         }
         let manifestData = try Data(contentsOf: manifestURL(for: packageURL))
@@ -1076,7 +908,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
         let payloadURL = packageURL.appendingPathComponent(Self.payloadFilename)
         let validPayloadURL: URL?
         let payloadVerification: VerifiedFile?
-        if try itemExists(at: payloadURL) {
+        if try DurableFileSystem.itemExists(at: payloadURL) {
             let verified = try verifiedFile(
                 at: payloadURL,
                 expectedBytes: manifest.actualBytes
@@ -1101,7 +933,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
             }
             placementStagingURL = ownedStagingURL
             let candidate = URL(fileURLWithPath: destinationPath).standardizedFileURL
-            if try itemExists(at: candidate) {
+            if try DurableFileSystem.itemExists(at: candidate) {
                 do {
                     let verified = try verifiedFile(
                         at: candidate,
@@ -1173,7 +1005,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
                 .appendingPathComponent(
                     ".harbor-placement-\(manifest.downloadID.uuidString)-\(manifest.attemptIdentifier.uuidString)-\(UUID().uuidString)"
                 )
-            if try itemExists(at: candidate) == false {
+            if try DurableFileSystem.itemExists(at: candidate) == false {
                 return candidate
             }
         }
@@ -1213,7 +1045,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
         for manifest: CompletedDownloadHandoffManifest
     ) throws {
         guard let stagingURL = ownedPlacementStagingURL(for: manifest),
-              try itemExists(at: stagingURL) else {
+              try DurableFileSystem.itemExists(at: stagingURL) else {
             return
         }
         try fileManager.removeItem(at: stagingURL)
@@ -1254,7 +1086,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
         at packageURL: URL
     ) throws -> CompletedDownloadHandoffManifest? {
         let url = manifestURL(for: packageURL)
-        guard try itemExists(at: url) else {
+        guard try DurableFileSystem.itemExists(at: url) else {
             return nil
         }
         let data = try Data(contentsOf: url)
@@ -1277,7 +1109,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
         at stagingURL: URL
     ) throws -> CompletedDownloadHandoff {
         let payloadURL = stagingURL.appendingPathComponent(Self.payloadFilename)
-        guard try itemExists(at: payloadURL) else {
+        guard try DurableFileSystem.itemExists(at: payloadURL) else {
             // A crash can leave the claiming manifest durable before the
             // source payload is moved into its package. That state contains
             // no completed bytes and must not be retained as an operationally
@@ -1412,7 +1244,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
                 expected: expectedBytes
             )
         }
-        let hash = try sha256(at: url)
+        let hash = try payloadHashOperation(url)
         let after = try regularFileIdentity(at: url)
         guard after == before else {
             throw CompletedDownloadHandoffError.invalidPayload
@@ -1426,47 +1258,8 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
         }
     }
 
-    private func itemExists(at url: URL) throws -> Bool {
-        do {
-            _ = try url.resourceValues(
-                forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
-            )
-            return true
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            return false
-        } catch let error as POSIXError where error.code == .ENOENT {
-            return false
-        }
-    }
-
-    private func sha256(at url: URL) throws -> String {
-        try payloadHashOperation(url)
-    }
-
-    private nonisolated static func computeSHA256(at url: URL) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-
-        var hasher = SHA256()
-        while let data = try handle.read(upToCount: 1024 * 1024), data.isEmpty == false {
-            hasher.update(data: data)
-        }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
-    }
-
     private func synchronizeFile(at url: URL) throws {
         try DurableFileSystem.synchronizeFile(at: url)
-    }
-
-    private func createDirectoryIfNeeded() throws {
-        let alreadyExists = try itemExists(at: directoryURL)
-        try fileManager.createDirectory(
-            at: directoryURL,
-            withIntermediateDirectories: true
-        )
-        if alreadyExists == false {
-            try DurableFileSystem.synchronizeParentDirectory(of: directoryURL)
-        }
     }
 
     private func packageURL(
@@ -1557,7 +1350,7 @@ nonisolated final class CompletedDownloadHandoffStore: @unchecked Sendable {
         }
         try DurableFileSystem.synchronizeDirectory(at: stagingURL)
 
-        if try itemExists(at: readyURL) {
+        if try DurableFileSystem.itemExists(at: readyURL) {
             do {
                 _ = try validatedHandoff(at: readyURL)
                 // A valid ready package already owns this immutable attempt.

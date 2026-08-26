@@ -384,11 +384,3 @@ private nonisolated func withCStringArray<Result>(
         try body(buffer.baseAddress!)
     }
 }
-
-private extension NSLock {
-    nonisolated func withLock<T>(_ operation: () -> T) -> T {
-        lock()
-        defer { unlock() }
-        return operation()
-    }
-}

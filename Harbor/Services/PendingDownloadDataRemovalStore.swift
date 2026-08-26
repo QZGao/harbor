@@ -69,10 +69,10 @@ nonisolated final class PendingDownloadDataRemovalStore: @unchecked Sendable {
         record: DownloadRecord,
         removingData: Bool = true
     ) throws -> PendingDownloadDataRemovalManifest {
-        try withLock {
+        try lock.withLock {
             try createDirectoryIfNeeded()
             let url = manifestURL(for: record.id)
-            if try itemExists(at: url) {
+            if try DurableFileSystem.itemExists(at: url) {
                 return try validatedManifest(at: url)
             }
 
@@ -111,8 +111,8 @@ nonisolated final class PendingDownloadDataRemovalStore: @unchecked Sendable {
     }
 
     func recoveryEntries() throws -> [PendingDownloadDataRemovalEntry] {
-        try withLock {
-            guard try itemExists(at: directoryURL) else {
+        try lock.withLock {
+            guard try DurableFileSystem.itemExists(at: directoryURL) else {
                 return []
             }
             try validateDirectory()
@@ -130,9 +130,9 @@ nonisolated final class PendingDownloadDataRemovalStore: @unchecked Sendable {
     }
 
     func acknowledgeOrThrow(downloadID: UUID) throws {
-        try withLock {
+        try lock.withLock {
             let url = manifestURL(for: downloadID)
-            guard try itemExists(at: url) else {
+            guard try DurableFileSystem.itemExists(at: url) else {
                 return
             }
             try validateDirectory()
@@ -145,7 +145,7 @@ nonisolated final class PendingDownloadDataRemovalStore: @unchecked Sendable {
         downloadID: UUID,
         to phase: PendingDownloadRemovalPhase
     ) throws -> PendingDownloadDataRemovalManifest {
-        try withLock {
+        try lock.withLock {
             try validateDirectory()
             let url = manifestURL(for: downloadID)
             let current = try validatedManifest(at: url)
@@ -280,7 +280,7 @@ nonisolated final class PendingDownloadDataRemovalStore: @unchecked Sendable {
     }
 
     private func createDirectoryIfNeeded() throws {
-        let existed = try itemExists(at: directoryURL)
+        let existed = try DurableFileSystem.itemExists(at: directoryURL)
         try fileManager.createDirectory(
             at: directoryURL,
             withIntermediateDirectories: true
@@ -303,24 +303,6 @@ nonisolated final class PendingDownloadDataRemovalStore: @unchecked Sendable {
         }
     }
 
-    private func itemExists(at url: URL) throws -> Bool {
-        do {
-            _ = try url.resourceValues(
-                forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
-            )
-            return true
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            return false
-        } catch let error as POSIXError where error.code == .ENOENT {
-            return false
-        }
-    }
-
-    private func withLock<T>(_ work: () throws -> T) rethrows -> T {
-        lock.lock()
-        defer { lock.unlock() }
-        return try work()
-    }
 }
 
 private enum PendingDownloadDataRemovalStoreError: LocalizedError {

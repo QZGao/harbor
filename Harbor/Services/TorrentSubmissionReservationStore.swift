@@ -54,10 +54,13 @@ nonisolated final class TorrentSubmissionReservationStore: @unchecked Sendable {
         sourceKind: DownloadSourceKind? = nil,
         shouldSeedAfterDownload: Bool? = nil
     ) throws -> TorrentSubmissionReservation {
-        try withLock {
-            try createDirectoryIfNeeded()
+        try lock.withLock {
+            try DurableFileSystem.createDirectoryIfNeeded(
+                at: directoryURL,
+                fileManager: fileManager
+            )
             let url = reservationURL(for: ownerDownloadID)
-            if try itemExists(at: url) {
+            if try DurableFileSystem.itemExists(at: url) {
                 let existing = try validatedReservation(at: url)
                 guard existing.sourceURL == sourceURL,
                       existing.destinationFolderPath == destinationFolderPath,
@@ -85,9 +88,9 @@ nonisolated final class TorrentSubmissionReservationStore: @unchecked Sendable {
     }
 
     func reservation(ownerDownloadID: UUID) throws -> TorrentSubmissionReservation? {
-        try withLock {
+        try lock.withLock {
             let url = reservationURL(for: ownerDownloadID)
-            guard try itemExists(at: url) else {
+            guard try DurableFileSystem.itemExists(at: url) else {
                 return nil
             }
             return try validatedReservation(at: url)
@@ -95,8 +98,8 @@ nonisolated final class TorrentSubmissionReservationStore: @unchecked Sendable {
     }
 
     func reservations() throws -> [TorrentSubmissionReservation] {
-        try withLock {
-            guard try itemExists(at: directoryURL) else {
+        try lock.withLock {
+            guard try DurableFileSystem.itemExists(at: directoryURL) else {
                 return []
             }
             let urls = try fileManager.contentsOfDirectory(
@@ -116,9 +119,9 @@ nonisolated final class TorrentSubmissionReservationStore: @unchecked Sendable {
     }
 
     func acknowledge(ownerDownloadID: UUID, gid: String) throws {
-        try withLock {
+        try lock.withLock {
             let url = reservationURL(for: ownerDownloadID)
-            guard try itemExists(at: url) else {
+            guard try DurableFileSystem.itemExists(at: url) else {
                 return
             }
             let reservation = try validatedReservation(at: url)
@@ -162,30 +165,6 @@ nonisolated final class TorrentSubmissionReservationStore: @unchecked Sendable {
             .appendingPathExtension("json")
     }
 
-    private func createDirectoryIfNeeded() throws {
-        let existed = try itemExists(at: directoryURL)
-        try fileManager.createDirectory(
-            at: directoryURL,
-            withIntermediateDirectories: true
-        )
-        if existed == false {
-            try DurableFileSystem.synchronizeParentDirectory(of: directoryURL)
-        }
-    }
-
-    private func itemExists(at url: URL) throws -> Bool {
-        do {
-            _ = try url.resourceValues(
-                forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
-            )
-            return true
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            return false
-        } catch let error as POSIXError where error.code == .ENOENT {
-            return false
-        }
-    }
-
     private static func makeGID() -> String {
         String(
             UUID().uuidString
@@ -195,9 +174,4 @@ nonisolated final class TorrentSubmissionReservationStore: @unchecked Sendable {
         )
     }
 
-    private func withLock<T>(_ work: () throws -> T) rethrows -> T {
-        lock.lock()
-        defer { lock.unlock() }
-        return try work()
-    }
 }

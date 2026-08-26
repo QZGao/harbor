@@ -43,7 +43,7 @@ struct DownloadDestinationResolver: @unchecked Sendable {
         let cleanName = sanitize(filename)
         let baseURL = directory.appendingPathComponent(cleanName)
 
-        guard try pathEntryExists(at: baseURL) else {
+        guard try DurableFileSystem.pathEntryExists(at: baseURL) else {
             return baseURL
         }
 
@@ -62,7 +62,7 @@ struct DownloadDestinationResolver: @unchecked Sendable {
             }
 
             let candidateURL = directory.appendingPathComponent(candidateName)
-            if try pathEntryExists(at: candidateURL) == false {
+            if try DurableFileSystem.pathEntryExists(at: candidateURL) == false {
                 return candidateURL
             }
 
@@ -136,7 +136,7 @@ struct DownloadDestinationResolver: @unchecked Sendable {
     }
 
     nonisolated func synchronizePlacedFile(at destinationURL: URL) throws {
-        guard try pathEntryExists(at: destinationURL) else {
+        guard try DurableFileSystem.pathEntryExists(at: destinationURL) else {
             throw CocoaError(.fileNoSuchFile)
         }
         try DurableFileSystem.synchronizeFile(at: destinationURL)
@@ -145,7 +145,7 @@ struct DownloadDestinationResolver: @unchecked Sendable {
 
     nonisolated func copyDownloadedFile(from sourceURL: URL, to stagingURL: URL) throws {
         try createDirectoryIfNeeded(stagingURL.deletingLastPathComponent())
-        guard try pathEntryExists(at: stagingURL) == false else {
+        guard try DurableFileSystem.pathEntryExists(at: stagingURL) == false else {
             throw CocoaError(.fileWriteFileExists)
         }
         try fileManager.copyItem(at: sourceURL, to: stagingURL)
@@ -154,7 +154,7 @@ struct DownloadDestinationResolver: @unchecked Sendable {
     }
 
     private nonisolated func createDirectoryIfNeeded(_ directoryURL: URL) throws {
-        let alreadyExists = try pathEntryExists(at: directoryURL)
+        let alreadyExists = try DurableFileSystem.pathEntryExists(at: directoryURL)
         try fileManager.createDirectory(
             at: directoryURL,
             withIntermediateDirectories: true
@@ -162,20 +162,6 @@ struct DownloadDestinationResolver: @unchecked Sendable {
         if alreadyExists == false {
             try DurableFileSystem.synchronizeParentDirectory(of: directoryURL)
         }
-    }
-
-    private nonisolated func pathEntryExists(at url: URL) throws -> Bool {
-        var info = stat()
-        let result = url.path.withCString { path in
-            Darwin.lstat(path, &info)
-        }
-        if result == 0 {
-            return true
-        }
-        if errno == ENOENT {
-            return false
-        }
-        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
 
     private nonisolated func sanitize(_ filename: String) -> String {

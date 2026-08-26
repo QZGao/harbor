@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -104,6 +105,54 @@ enum DurableFileSystem {
 
     nonisolated static func synchronizeParentDirectory(of url: URL) throws {
         try synchronizeDirectory(at: url.deletingLastPathComponent())
+    }
+
+    nonisolated static func itemExists(at url: URL) throws -> Bool {
+        do {
+            _ = try url.resourceValues(
+                forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+            )
+            return true
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return false
+        } catch let error as POSIXError where error.code == .ENOENT {
+            return false
+        }
+    }
+
+    nonisolated static func pathEntryExists(at url: URL) throws -> Bool {
+        var info = stat()
+        let result = url.path.withCString { path in
+            Darwin.lstat(path, &info)
+        }
+        if result == 0 {
+            return true
+        }
+        if errno == ENOENT {
+            return false
+        }
+        throw posixError()
+    }
+
+    nonisolated static func createDirectoryIfNeeded(
+        at url: URL,
+        fileManager: FileManager
+    ) throws {
+        let existed = try itemExists(at: url)
+        try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
+        if existed == false {
+            try synchronizeParentDirectory(of: url)
+        }
+    }
+
+    nonisolated static func sha256(at url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let data = try handle.read(upToCount: 1024 * 1024), data.isEmpty == false {
+            hasher.update(data: data)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private nonisolated static func posixError() -> POSIXError {

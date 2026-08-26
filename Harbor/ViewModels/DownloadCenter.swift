@@ -8,19 +8,9 @@ private struct DownloadRecoveryQuiescenceError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-private enum DownloadCenterDurableMutationContext {
-    @TaskLocal static var token: UUID?
-}
-
 @Observable
 @MainActor
 final class DownloadCenter {
-    private struct PersistenceGateWaiter {
-        let id: UUID
-        let token: UUID
-        let continuation: CheckedContinuation<Void, any Error>
-    }
-
     private enum AttemptState: Equatable {
         case active(UUID)
         case pausing(UUID)
@@ -99,14 +89,10 @@ final class DownloadCenter {
         BrowserDownloadCoordinator,
         UUID
     ) throws -> Void
-    typealias RecordSaveOperation = @Sendable (
-        DownloadPersistence,
-        [DownloadRecord],
-        DownloadPersistenceRevision
-    ) async throws -> Void
+    typealias RecordSaveOperation = DownloadRecordStore.SaveOperation
 
     @ObservationIgnored private let settings: AppSettingsStore
-    @ObservationIgnored private let persistence: DownloadPersistence
+    @ObservationIgnored private let recordStore: DownloadRecordStore
     @ObservationIgnored private let destinationResolver: DownloadDestinationResolver
     @ObservationIgnored private let notificationService: DownloadNotificationService
     @ObservationIgnored private let dataRemovalService: DownloadDataRemovalService
@@ -122,7 +108,6 @@ final class DownloadCenter {
     @ObservationIgnored private let torrentShutdownOperation: TorrentShutdownOperation
     @ObservationIgnored private let browserQuiescenceOperation: BrowserQuiescenceOperation
     @ObservationIgnored private let urlSessionCleanupOperation: URLSessionCleanupOperation
-    @ObservationIgnored private let recordSaveOperation: RecordSaveOperation
     @ObservationIgnored private let completedHandoffStore: CompletedDownloadHandoffStore
     @ObservationIgnored private let pendingDataRemovalStore: PendingDownloadDataRemovalStore
     @ObservationIgnored private let sleepPreventionService: any DownloadSleepPreventing
@@ -177,10 +162,6 @@ final class DownloadCenter {
     @ObservationIgnored private var activeMediaAttemptIdentifiers: [UUID: UUID] = [:]
     @ObservationIgnored private var pendingExternalAddSheetDrafts: [AddDownloadSheetDraft] = []
     @ObservationIgnored private var isDrainingDownloadQueue = false
-    @ObservationIgnored private var persistenceRevision: UInt64 = 0
-    @ObservationIgnored private let persistenceWriterIdentifier = UUID()
-    @ObservationIgnored private var persistenceGateOwner: UUID?
-    @ObservationIgnored private var persistenceGateWaiters: [PersistenceGateWaiter] = []
     var downloads: [DownloadItem] = []
     var selectedFilter: DownloadFilter = .all {
         didSet {
@@ -279,7 +260,10 @@ final class DownloadCenter {
             directoryURL: pendingDataRemovalDirectoryURL
         )
         self.settings = settings
-        self.persistence = persistence
+        self.recordStore = DownloadRecordStore(
+            persistence: persistence,
+            saveOperation: recordSaveOperation
+        )
         self.destinationResolver = destinationResolver
         self.notificationService = notificationService
         self.dataRemovalService = dataRemovalService
@@ -298,7 +282,6 @@ final class DownloadCenter {
         self.torrentShutdownOperation = torrentShutdownOperation
         self.browserQuiescenceOperation = browserQuiescenceOperation
         self.urlSessionCleanupOperation = urlSessionCleanupOperation
-        self.recordSaveOperation = recordSaveOperation
         self.completedHandoffStore = completedHandoffStore
         self.pendingDataRemovalStore = pendingDataRemovalStore
         self.mediaService = mediaService ?? MediaDownloadService { [weak self] attemptIdentifier, event in
@@ -376,7 +359,7 @@ final class DownloadCenter {
                 // records and queues from being restored.
                 orphanCleanupWarning = error.localizedDescription
             }
-            let records = try await persistence.load()
+            let records = try await recordStore.load()
             let restoredItems = records
                 .sorted { $0.createdAt > $1.createdAt }
                 .map { record in
@@ -8665,30 +8648,31 @@ final class DownloadCenter {
         }
 
         persistTask?.cancel()
-        persistTask = Task { @MainActor [weak self] in
-            await DownloadCenterDurableMutationContext.$token.withValue(nil) {
-                guard let self else {
+        // A detached task does not inherit the durable mutation's task-local
+        // ownership token. The delayed save must queue behind that mutation,
+        // not re-enter a gate whose owning operation may still be running.
+        persistTask = Task.detached { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                try await Task.sleep(for: .milliseconds(250))
+                try Task.checkCancellation()
+                try await self.persistCurrentRecords()
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.isShuttingDown == false else {
                     return
                 }
-                do {
-                    try await Task.sleep(for: .milliseconds(250))
-                    try Task.checkCancellation()
-                    try await self.persistCurrentRecords()
-                } catch is CancellationError {
-                    return
-                } catch {
-                    guard self.isShuttingDown == false else {
-                        return
-                    }
-                    self.activeAlert = UserAlert(
-                        title: String(
-                            localized: "alert.saveDownloads.title",
-                            defaultValue: "Couldn’t Save Downloads",
-                            comment: "Alert title shown when Harbor cannot save the download list."
-                        ),
-                        message: error.localizedDescription
-                    )
-                }
+                self.activeAlert = UserAlert(
+                    title: String(
+                        localized: "alert.saveDownloads.title",
+                        defaultValue: "Couldn’t Save Downloads",
+                        comment: "Alert title shown when Harbor cannot save the download list."
+                    ),
+                    message: error.localizedDescription
+                )
             }
         }
     }
@@ -8699,114 +8683,17 @@ final class DownloadCenter {
     }
 
     private func persistCurrentRecords() async throws {
-        if let contextToken = DownloadCenterDurableMutationContext.token,
-           persistenceGateOwner == contextToken {
-            try await writeCurrentRecords()
-            return
+        try await recordStore.save {
+            downloads.map { $0.makeRecord() }
         }
-
-        let token = UUID()
-        try await acquirePersistenceGate(token: token)
-        defer { releasePersistenceGate(token: token) }
-        try await DownloadCenterDurableMutationContext.$token.withValue(token) {
-            try await writeCurrentRecords()
-        }
-    }
-
-    private func writeCurrentRecords() async throws {
-        let revision = nextPersistenceRevision()
-        try await recordSaveOperation(
-            persistence,
-            downloads.map { $0.makeRecord() },
-            revision
-        )
     }
 
     private func performSerializedDurableMutation(
         _ operation: () async -> Void
     ) async {
-        let token = UUID()
-        do {
-            try await acquirePersistenceGate(token: token)
-        } catch {
-            return
-        }
-        defer { releasePersistenceGate(token: token) }
-        await DownloadCenterDurableMutationContext.$token.withValue(token) {
+        await recordStore.performSerializedMutation {
             await operation()
         }
-    }
-
-    private func acquirePersistenceGate(token: UUID) async throws {
-        try Task.checkCancellation()
-        if persistenceGateOwner == nil {
-            persistenceGateOwner = token
-            return
-        }
-
-        let waiterID = UUID()
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation {
-                (continuation: CheckedContinuation<Void, any Error>) in
-                guard Task.isCancelled == false else {
-                    continuation.resume(throwing: CancellationError())
-                    return
-                }
-                persistenceGateWaiters.append(
-                    PersistenceGateWaiter(
-                        id: waiterID,
-                        token: token,
-                        continuation: continuation
-                    )
-                )
-            }
-        } onCancel: {
-            Task { @MainActor [weak self] in
-                self?.cancelPersistenceGateWaiter(id: waiterID)
-            }
-        }
-        do {
-            try Task.checkCancellation()
-        } catch {
-            // The previous owner may have granted this waiter at the same
-            // instant its task was cancelled. Once granted, the waiter is no
-            // longer present for the cancellation handler to remove; release
-            // that ownership explicitly or every later persistence mutation
-            // would wait forever.
-            if persistenceGateOwner == token {
-                releasePersistenceGate(token: token)
-            }
-            throw error
-        }
-    }
-
-    private func cancelPersistenceGateWaiter(id: UUID) {
-        guard let index = persistenceGateWaiters.firstIndex(where: { $0.id == id }) else {
-            return
-        }
-        let waiter = persistenceGateWaiters.remove(at: index)
-        waiter.continuation.resume(throwing: CancellationError())
-    }
-
-    private func releasePersistenceGate(token: UUID) {
-        guard persistenceGateOwner == token else {
-            return
-        }
-        guard persistenceGateWaiters.isEmpty == false else {
-            persistenceGateOwner = nil
-            return
-        }
-        let next = persistenceGateWaiters.removeFirst()
-        persistenceGateOwner = next.token
-        next.continuation.resume()
-    }
-
-    private func nextPersistenceRevision() -> DownloadPersistenceRevision {
-        persistenceRevision &+= 1
-        return DownloadPersistenceRevision(
-            writerIdentifier: persistenceWriterIdentifier,
-            value: persistenceRevision
-        )
     }
 
     private func cancelPendingPersistenceAndWait() async {

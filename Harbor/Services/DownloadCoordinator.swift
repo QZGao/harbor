@@ -1,24 +1,5 @@
 import Foundation
 
-private struct DirectDownloadRecoveryRestartError: LocalizedError {
-    var errorDescription: String? {
-        "The server did not accept the saved partial download."
-    }
-}
-
-struct DirectDownloadIncompleteResponseError: LocalizedError {
-    let actualBytes: Int64
-    let expectedBytes: Int64?
-
-    var errorDescription: String? {
-        if let expectedBytes {
-            return "The download ended after \(actualBytes) of \(expectedBytes) bytes."
-        }
-
-        return "The server ended a ranged download without declaring the complete file length."
-    }
-}
-
 private struct DirectDownloadRangeOverflowError: LocalizedError {
     let declaredEnd: Int64
 
@@ -32,12 +13,6 @@ private struct DirectDownloadBodyOverflowError: LocalizedError {
 
     var errorDescription: String? {
         "The server sent data beyond its declared body length of \(expectedBytes) bytes."
-    }
-}
-
-struct DirectDownloadInvalidRangeResponseError: LocalizedError {
-    var errorDescription: String? {
-        "The server returned an invalid or contradictory byte-range response."
     }
 }
 
@@ -84,10 +59,10 @@ struct DirectDownloadFailure: Sendable {
         self.wasResuming = wasResuming
         self.recoverableBytes = recoverableBytes
         self.retryableOverride = error is DirectDownloadRecoveryRestartError
-            || error is DirectDownloadIncompleteResponseError
+            || error is HTTPDownloadIncompleteResponseError
             || error is DirectDownloadRangeOverflowError
             || error is DirectDownloadBodyOverflowError
-            || error is DirectDownloadInvalidRangeResponseError
+            || error is HTTPDownloadInvalidRangeResponseError
         self.freshStartOverride = forcesFreshStart
             || error is DirectDownloadRecoveryRestartError
     }
@@ -109,20 +84,6 @@ struct DirectDownloadPauseResult: Sendable {
         self.resumeData = resumeData
         self.ownedRecovery = ownedRecovery
         self.recoveryUnavailableMessage = recoveryUnavailableMessage
-    }
-}
-
-struct DirectDownloadContentRange: Equatable, Sendable {
-    let start: Int64
-    let end: Int64
-    let total: Int64?
-}
-
-struct DirectDownloadHTTPStatusError: LocalizedError {
-    let statusCode: Int
-
-    var errorDescription: String? {
-        "The server returned HTTP \(statusCode) instead of a downloadable file."
     }
 }
 
@@ -254,6 +215,17 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         case ownedPartial(OwnedPartialState)
     }
 
+    private enum OwnedResponseDisposition {
+        case receiveBody(resetReason: DirectDownloadRecoveryResetReason?)
+        case finishExistingPartial
+        case reject(
+            error: Error,
+            statusCode: Int?,
+            wasResuming: Bool,
+            requiresFreshStart: Bool
+        )
+    }
+
     private struct CompletionPublicationState {
         let context: TaskContext
         var waiters: [CheckedContinuation<DirectDownloadPauseResult, Never>] = []
@@ -326,7 +298,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
     }
 
     deinit {
-        let activeContexts = withLock {
+        let activeContexts = stateLock.withLock {
             Array(self.contexts.values)
         }
         for context in activeContexts {
@@ -336,7 +308,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
     }
 
     func updateTransferSettings(_ transferSettings: DownloadTransferSettings) {
-        let tasksToResume = withLock { () -> [URLSessionTask] in
+        let tasksToResume = stateLock.withLock { () -> [URLSessionTask] in
             self.transferSettings = transferSettings
             return releaseThrottledTasksLocked()
         }
@@ -347,7 +319,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         _ speedLimitOverride: TransferLimitOverride,
         for id: UUID
     ) {
-        let tasksToResume = withLock { () -> [URLSessionTask] in
+        let tasksToResume = stateLock.withLock { () -> [URLSessionTask] in
             guard let taskKey = taskKeysByDownloadID[id],
                   var context = contexts[taskKey] else {
                 return []
@@ -374,7 +346,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         resumeData: Data?,
         speedLimitOverride: TransferLimitOverride = .inherit
     ) throws -> Int {
-        guard withLock({
+        guard stateLock.withLock({
             guard taskKeysByDownloadID[id] == nil,
                   reservedDownloadIDs.contains(id) == false else {
                 return false
@@ -387,7 +359,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         var installedContext = false
         defer {
             if installedContext == false {
-                _ = withLock {
+                _ = stateLock.withLock {
                     reservedDownloadIDs.remove(id)
                 }
             }
@@ -457,7 +429,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
             )
         )
 
-        withLock {
+        stateLock.withLock {
             contexts[key] = context
             taskKeysByDownloadID[id] = key
             reservedDownloadIDs.remove(id)
@@ -551,7 +523,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
 
     func cancelDownload(id: UUID) {
         guard let context = takeContext(forDownloadID: id, suppressCompletion: true) else {
-            let ownsCompletion = withLock {
+            let ownsCompletion = stateLock.withLock {
                 completionPublications[id] != nil
                     || completedPublicationPauseResults[id]?.attemptIdentifier != nil
             }
@@ -573,8 +545,8 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
     }
 
     func discardRecoveryDataOrThrow(id: UUID) throws {
-        withLock {
-            completedPublicationPauseResults.removeValue(forKey: id)
+        stateLock.withLock {
+            completedPublicationPauseResults[id] = nil
         }
         try recoveryStore.discardThrowing(id: id)
         try completedHandoffStore.discardThrowing(downloadID: id)
@@ -584,12 +556,12 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         id: UUID,
         attemptIdentifier: UUID
     ) {
-        _ = withLock {
+        stateLock.withLock {
             guard completedPublicationPauseResults[id]?.attemptIdentifier
                     == attemptIdentifier else {
                 return
             }
-            completedPublicationPauseResults.removeValue(forKey: id)
+            completedPublicationPauseResults[id] = nil
         }
     }
 
@@ -598,8 +570,8 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
     }
 
     func discardOwnedRecoveryDataOrThrow(id: UUID) throws {
-        _ = withLock {
-            completedPublicationPauseResults.removeValue(forKey: id)
+        stateLock.withLock {
+            completedPublicationPauseResults[id] = nil
         }
         try recoveryStore.discardThrowing(id: id)
     }
@@ -629,7 +601,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
     }
 
     private func takeContext(forDownloadID id: UUID, suppressCompletion: Bool) -> TaskContext? {
-        withLock {
+        stateLock.withLock {
             guard let taskKey = taskKeysByDownloadID.removeValue(forKey: id),
                   let context = contexts.removeValue(forKey: taskKey) else {
                 return nil
@@ -644,7 +616,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
     }
 
     private func takeContext(forTaskKey taskKey: TaskKey) -> TaskContext? {
-        withLock {
+        stateLock.withLock {
             guard let context = contexts.removeValue(forKey: taskKey) else {
                 return nil
             }
@@ -657,7 +629,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
     }
 
     private func beginCompletionPublication(forTaskKey taskKey: TaskKey) -> TaskContext? {
-        withLock {
+        stateLock.withLock {
             guard let context = contexts.removeValue(forKey: taskKey),
                   completionPublications[context.downloadID] == nil else {
                 return nil
@@ -684,7 +656,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
             ownedRecovery: ownedRecovery,
             recoveryUnavailableMessage: recoveryUnavailableMessage
         )
-        let waiters = withLock { () -> [CheckedContinuation<DirectDownloadPauseResult, Never>] in
+        let waiters = stateLock.withLock { () -> [CheckedContinuation<DirectDownloadPauseResult, Never>] in
             guard let publication = completionPublications[context.downloadID],
                   publication.context.attemptIdentifier == context.attemptIdentifier else {
                 return []
@@ -734,14 +706,14 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
     private func waitForCompletionPublication(
         id: UUID
     ) async -> DirectDownloadPauseResult {
-        if let completed = withLock({
+        if let completed = stateLock.withLock({
             completedPublicationPauseResults.removeValue(forKey: id)
         }) {
             return completed
         }
 
         return await withCheckedContinuation { continuation in
-            let shouldReturnNil = withLock { () -> Bool in
+            let shouldReturnNil = stateLock.withLock { () -> Bool in
                 if let completed = completedPublicationPauseResults.removeValue(forKey: id) {
                     continuation.resume(returning: completed)
                     return false
@@ -769,25 +741,34 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         for taskKey: TaskKey,
         _ update: (inout TaskContext) -> Void
     ) -> TaskContext? {
-        withLock {
+        mutateContext(for: taskKey) { context in
+            update(&context)
+        }?.context
+    }
+
+    private func mutateContext<Result>(
+        for taskKey: TaskKey,
+        _ mutation: (inout TaskContext) -> Result
+    ) -> (context: TaskContext, result: Result)? {
+        stateLock.withLock {
             guard var context = contexts[taskKey] else {
                 return nil
             }
 
-            update(&context)
+            let result = mutation(&context)
             contexts[taskKey] = context
-            return context
+            return (context, result)
         }
     }
 
     private func shouldIgnoreCompletion(taskKey: TaskKey, error: NSError) -> Bool {
-        withLock {
+        stateLock.withLock {
             suppressedCompletionTaskKeys.remove(taskKey) != nil
         }
     }
 
     private func makeSession() -> URLSession {
-        let perDownloadConnectionCount = withLock {
+        let perDownloadConnectionCount = stateLock.withLock {
             transferSettings.perDownloadConnectionCount
         }
 
@@ -810,106 +791,14 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         "\(ObjectIdentifier(session))-\(taskIdentifier)"
     }
 
-    nonisolated static func ownedDownloadRequest(
-        sourceURL: URL,
-        recovery: DirectDownloadRecoverySnapshot?
-    ) -> URLRequest {
-        var request = URLRequest(url: sourceURL)
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-
-        if let recovery,
-           let validator = recovery.metadata.ifRangeValidator {
-            request.setValue(
-                "bytes=\(recovery.bytesWritten)-",
-                forHTTPHeaderField: "Range"
-            )
-            request.setValue(validator, forHTTPHeaderField: "If-Range")
-        }
-
-        return request
-    }
-
-    nonisolated static func contentRange(
-        from value: String?
-    ) -> DirectDownloadContentRange? {
-        guard let value else {
-            return nil
-        }
-
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.lowercased().hasPrefix("bytes ") else {
-            return nil
-        }
-
-        let payload = trimmed.dropFirst("bytes ".count)
-        let components = payload.split(separator: "/", maxSplits: 1)
-        guard components.count == 2 else {
-            return nil
-        }
-
-        let rangeComponents = components[0].split(separator: "-", maxSplits: 1)
-        guard rangeComponents.count == 2,
-              let start = Int64(rangeComponents[0]),
-              let end = Int64(rangeComponents[1]),
-              start >= 0,
-              end >= start else {
-            return nil
-        }
-
-        let total: Int64?
-        if components[1] == "*" {
-            total = nil
-        } else {
-            guard let parsedTotal = Int64(components[1]), parsedTotal > end else {
-                return nil
-            }
-            total = parsedTotal
-        }
-
-        return DirectDownloadContentRange(start: start, end: end, total: total)
-    }
-
-    nonisolated static func unsatisfiedContentRangeTotal(
-        from value: String?
-    ) -> Int64? {
-        guard let value else {
-            return nil
-        }
-
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.lowercased().hasPrefix("bytes */") else {
-            return nil
-        }
-
-        guard let total = Int64(trimmed.dropFirst("bytes */".count)), total >= 0 else {
-            return nil
-        }
-        return total
-    }
-
     private func makeOwnedRequest(
         sourceURL: URL,
         recovery: DirectDownloadRecoverySnapshot?
     ) -> URLRequest {
-        Self.ownedDownloadRequest(sourceURL: sourceURL, recovery: recovery)
-    }
-
-    private func expectedByteCount(for response: HTTPURLResponse) throws -> Int64? {
-        if let contentRange = Self.contentRange(
-            from: response.value(forHTTPHeaderField: "Content-Range")
-        ), let total = contentRange.total {
-            return total
-        }
-
-        // A 206 Content-Length covers only this response body. Without a
-        // concrete Content-Range total, it cannot replace the saved whole-file
-        // length or prove that a ranged download is complete.
-        guard response.statusCode != 206 else {
-            return nil
-        }
-        return try Self.declaredContentLength(response)
-            ?? (response.expectedContentLength >= 0 ? response.expectedContentLength : nil)
+        DirectDownloadResponsePolicy.request(
+            sourceURL: sourceURL,
+            recovery: recovery
+        )
     }
 
     private func recoveryMetadata(
@@ -926,11 +815,13 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         )
     }
 
-    private static func responseMatchesSavedValidator(
-        _ response: HTTPURLResponse,
-        state: OwnedPartialState
-    ) -> Bool {
-        let savedMetadata = DirectDownloadRecoveryMetadata(
+    private func resumeIdentity(
+        for state: OwnedPartialState
+    ) -> DirectDownloadResponsePolicy.ResumeIdentity? {
+        guard state.resumeOffset > 0 else {
+            return nil
+        }
+        let metadata = DirectDownloadRecoveryMetadata(
             sourceURL: state.sourceURL,
             entityTag: state.entityTag,
             lastModified: state.lastModified,
@@ -938,16 +829,92 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
             suggestedFilename: state.suggestedFilename,
             mimeType: state.responseMimeType
         )
-        guard let savedValidator = savedMetadata.ifRangeValidator else {
-            return false
-        }
+        return DirectDownloadResponsePolicy.ResumeIdentity(
+            offset: state.resumeOffset,
+            expectedBytes: state.expectedBytes,
+            validator: metadata.ifRangeValidator
+        )
+    }
 
-        let responseHeader = savedValidator.hasPrefix("\"") ? "ETag" : "Last-Modified"
-        guard let responseValidator = response.value(forHTTPHeaderField: responseHeader)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) else {
-            return false
+    private func apply(
+        _ plan: DirectDownloadResponsePolicy.Plan,
+        response: HTTPURLResponse,
+        downloadID: UUID,
+        state: inout OwnedPartialState,
+        transferSample: inout TransferSample
+    ) throws -> OwnedResponseDisposition {
+        switch plan {
+        case let .finishExisting(expectedBytes):
+            state.expectedBytes = expectedBytes
+            state.declaredExpectedBytes = expectedBytes
+            // A validated 416 certifies the existing partial as the complete
+            // representation. Keep the payload metadata from the original
+            // response rather than adopting the 416 error body's metadata.
+            state.statusCode = 206
+            return .finishExistingPartial
+
+        case let .receiveBody(destination, contentRange, expectedBytes, resetReason):
+            switch destination {
+            case .append:
+                state.fileHandle = try recoveryStore.openFileForAppending(
+                    id: downloadID,
+                    expectedOffset: state.resumeOffset
+                )
+
+            case .fresh:
+                if resetReason != nil {
+                    try recoveryStore.discardThrowing(id: downloadID)
+                    state.resumeOffset = 0
+                    state.bytesWritten = 0
+                    state.declaredExpectedBytes = nil
+                    state.entityTag = nil
+                    state.lastModified = nil
+                    state.suggestedFilename = nil
+                    state.responseMimeType = nil
+                    transferSample = TransferSample(
+                        lastTotalBytesWritten: 0,
+                        sampleDate: .now,
+                        speedBytesPerSecond: 0
+                    )
+                }
+                state.fileHandle = try recoveryStore.openFreshFile(id: downloadID)
+            }
+
+            state.declaredExpectedBytes = expectedBytes
+            if let expectedBytes {
+                state.expectedBytes = expectedBytes
+            } else if resetReason != nil {
+                state.expectedBytes = 0
+            }
+            state.suggestedFilename = response.suggestedFilename ?? state.suggestedFilename
+            state.responseMimeType = response.mimeType ?? state.responseMimeType
+            state.statusCode = response.statusCode
+            state.responseRangeEnd = contentRange?.end
+            state.entityTag = response.value(forHTTPHeaderField: "ETag") ?? state.entityTag
+            state.lastModified = response.value(forHTTPHeaderField: "Last-Modified")
+                ?? state.lastModified
+
+            try recoveryStore.saveMetadata(
+                recoveryMetadata(for: response, state: state),
+                id: downloadID
+            )
+            return .receiveBody(resetReason: resetReason)
         }
-        return responseValidator == savedValidator
+    }
+
+    private func discardRejectedResume(
+        downloadID: UUID,
+        state: inout OwnedPartialState
+    ) -> Error {
+        state.resumeOffset = 0
+        state.bytesWritten = 0
+        state.declaredExpectedBytes = nil
+        do {
+            try recoveryStore.discardThrowing(id: downloadID)
+            return DirectDownloadRecoveryRestartError()
+        } catch {
+            return error
+        }
     }
 
     nonisolated static func legacyDownloadHTTPFailure(
@@ -959,7 +926,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         }
 
         return DirectDownloadFailure(
-            error: DirectDownloadHTTPStatusError(statusCode: statusCode),
+            error: HTTPDownloadStatusError(statusCode: statusCode),
             resumeData: nil,
             wasResuming: startedFromResumeData,
             httpStatusCode: statusCode
@@ -1088,32 +1055,6 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         }
     }
 
-    private func publishOwnedPartial(
-        context: TaskContext,
-        state: OwnedPartialState
-    ) throws -> CompletedDownloadHandoff {
-        try recoveryStore.publishCompletedPayload(
-            id: context.downloadID,
-            expectedBytes: state.expectedBytes
-        ) { payloadURL in
-            let actualBytes = try fileSize(at: payloadURL)
-            return try completedHandoffStore.publish(
-                payloadAt: payloadURL,
-                manifest: CompletedDownloadHandoffManifest(
-                    downloadID: context.downloadID,
-                    attemptIdentifier: context.attemptIdentifier,
-                    owner: .direct,
-                    sourceURL: context.sourceURL,
-                    statusCode: state.statusCode,
-                    mimeType: state.responseMimeType,
-                    suggestedFilename: state.suggestedFilename,
-                    actualBytes: actualBytes,
-                    expectedBytes: state.expectedBytes
-                )
-            )
-        }
-    }
-
     private func claimOwnedPartial(
         context: TaskContext,
         state: OwnedPartialState
@@ -1149,7 +1090,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         resumeValidator: String?
     ) throws -> CompletedDownloadHandoffClaim {
         let actualBytes = try fileSize(at: location)
-        let expectedBytes = try Self.validatedCompletedByteCount(
+        let expectedBytes = try DownloadHTTPResponseValidator.validatedCompletedByteCount(
             response: response,
             actualBytes: actualBytes,
             startedFromResumeData: startedFromResumeData,
@@ -1329,44 +1270,6 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         return tasks
     }
 
-    private func withLock<T>(_ work: () -> T) -> T {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return work()
-    }
-
-    private func publishLegacyDownload(
-        at location: URL,
-        context: TaskContext,
-        response: HTTPURLResponse,
-        startedFromResumeData: Bool,
-        resumeOffset: Int64?,
-        resumeValidator: String?
-    ) throws -> CompletedDownloadHandoff {
-        let actualBytes = try fileSize(at: location)
-        let expectedBytes = try Self.validatedCompletedByteCount(
-            response: response,
-            actualBytes: actualBytes,
-            startedFromResumeData: startedFromResumeData,
-            resumeOffset: resumeOffset,
-            resumeValidator: resumeValidator
-        )
-        return try completedHandoffStore.publish(
-            payloadAt: location,
-            manifest: CompletedDownloadHandoffManifest(
-                downloadID: context.downloadID,
-                attemptIdentifier: context.attemptIdentifier,
-                owner: .direct,
-                sourceURL: context.sourceURL,
-                statusCode: response.statusCode,
-                mimeType: response.mimeType,
-                suggestedFilename: response.suggestedFilename,
-                actualBytes: actualBytes,
-                expectedBytes: expectedBytes
-            )
-        )
-    }
-
     private func fileSize(at url: URL) throws -> Int64 {
         let values = try url.resourceValues(
             forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey]
@@ -1380,128 +1283,6 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         return Int64(size)
     }
 
-    nonisolated static func validatedCompletedByteCount(
-        response: HTTPURLResponse,
-        actualBytes: Int64,
-        startedFromResumeData: Bool,
-        resumeOffset: Int64?,
-        resumeValidator: String? = nil
-    ) throws -> Int64 {
-        guard actualBytes >= 0 else {
-            throw URLError(.badServerResponse)
-        }
-        guard responseUsesIdentityEncoding(response) else {
-            throw URLError(.cannotDecodeContentData)
-        }
-        guard (200 ... 299).contains(response.statusCode) else {
-            throw DirectDownloadHTTPStatusError(statusCode: response.statusCode)
-        }
-
-        if response.statusCode == 206 {
-            let range = try validatedPartialContentRange(response)
-            guard startedFromResumeData,
-                  let resumeOffset,
-                  let resumeValidator,
-                  range.start == resumeOffset,
-                  let total = range.total,
-                  range.start > 0,
-                  range.end == total - 1,
-                  total == actualBytes,
-                  responseValidator(response, matching: resumeValidator) else {
-                throw DirectDownloadIncompleteResponseError(
-                    actualBytes: actualBytes,
-                    expectedBytes: contentRange(
-                        from: response.value(forHTTPHeaderField: "Content-Range")
-                    )?.total
-                )
-            }
-            return total
-        }
-
-        guard response.statusCode == 200 else {
-            throw URLError(.badServerResponse)
-        }
-        guard response.value(forHTTPHeaderField: "Content-Range") == nil else {
-            throw URLError(.badServerResponse)
-        }
-        let declaredLength = try declaredContentLength(response)
-            ?? (response.expectedContentLength >= 0 ? response.expectedContentLength : nil)
-        if let declaredLength, declaredLength != actualBytes {
-            throw DirectDownloadIncompleteResponseError(
-                actualBytes: actualBytes,
-                expectedBytes: declaredLength
-            )
-        }
-        return actualBytes
-    }
-
-    private nonisolated static func responseValidator(
-        _ response: HTTPURLResponse,
-        matching savedValidator: String
-    ) -> Bool {
-        let headerName = savedValidator.hasPrefix("\"") ? "ETag" : "Last-Modified"
-        guard let value = response.value(forHTTPHeaderField: headerName)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) else {
-            return false
-        }
-        return value == savedValidator
-    }
-
-    nonisolated static func validatedPartialContentRange(
-        _ response: HTTPURLResponse
-    ) throws -> DirectDownloadContentRange {
-        guard responseUsesIdentityEncoding(response),
-              let range = contentRange(
-                  from: response.value(forHTTPHeaderField: "Content-Range")
-              ),
-              range.total != nil else {
-            throw DirectDownloadInvalidRangeResponseError()
-        }
-
-        let bodyLength = range.end - range.start + 1
-        if let declaredLength = try declaredContentLength(response),
-           declaredLength != bodyLength {
-            throw DirectDownloadInvalidRangeResponseError()
-        }
-        return range
-    }
-
-    nonisolated static func declaredContentLength(
-        _ response: HTTPURLResponse
-    ) throws -> Int64? {
-        guard let rawValue = response.value(forHTTPHeaderField: "Content-Length") else {
-            return nil
-        }
-        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let value = Int64(trimmed), value >= 0 else {
-            throw URLError(.badServerResponse)
-        }
-        return value
-    }
-
-    nonisolated static func responseUsesIdentityEncoding(
-        _ response: HTTPURLResponse
-    ) -> Bool {
-        guard let rawValue = response.value(forHTTPHeaderField: "Content-Encoding") else {
-            return true
-        }
-        return rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            .caseInsensitiveCompare("identity") == .orderedSame
-    }
-
-    private nonisolated static func isInvalidResumeProtocolResponse(
-        _ error: Error
-    ) -> Bool {
-        if error is DirectDownloadInvalidRangeResponseError {
-            return true
-        }
-        let nsError = error as NSError
-        guard nsError.domain == NSURLErrorDomain else {
-            return false
-        }
-        let code = URLError.Code(rawValue: nsError.code)
-        return code == .badServerResponse || code == .cannotDecodeContentData
-    }
 }
 
 extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegate, URLSessionTaskDelegate {
@@ -1567,201 +1348,88 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
         let taskKey = makeTaskKey(session: session, taskIdentifier: dataTask.taskIdentifier)
-        var responseError: Error?
-        var responseStatusCode: Int?
-        var responseWasResuming = false
-        var resetReason: DirectDownloadRecoveryResetReason?
-        var shouldFinishExistingPartial = false
-        var responseRequiresFreshStart = false
-
-        guard let updatedContext = updateContext(for: taskKey, { context in
+        guard let handledResponse = mutateContext(for: taskKey, { context in
             guard case var .ownedPartial(state) = context.mode else {
-                responseError = URLError(.badServerResponse)
-                return
-            }
-
-            guard let httpResponse = response as? HTTPURLResponse else {
-                responseError = URLError(.badServerResponse)
-                return
-            }
-
-            let statusCode = httpResponse.statusCode
-            responseStatusCode = statusCode
-            responseWasResuming = state.resumeOffset > 0
-
-            if responseWasResuming, statusCode == 416 {
-                let total = Self.unsatisfiedContentRangeTotal(
-                    from: httpResponse.value(forHTTPHeaderField: "Content-Range")
+                return OwnedResponseDisposition.reject(
+                    error: URLError(.badServerResponse),
+                    statusCode: nil,
+                    wasResuming: false,
+                    requiresFreshStart: false
                 )
-                let matchesSavedTotal = state.expectedBytes <= 0
-                    || total == state.expectedBytes
-                if total == state.resumeOffset,
-                   matchesSavedTotal,
-                   Self.responseMatchesSavedValidator(
-                       httpResponse,
-                       state: state
-                   ) {
-                    state.expectedBytes = total ?? state.resumeOffset
-                    state.declaredExpectedBytes = total
-                    state.statusCode = 206
-                    context.mode = .ownedPartial(state)
-                    shouldFinishExistingPartial = true
-                    return
-                }
-
-                responseRequiresFreshStart = true
-                do {
-                    try recoveryStore.discardThrowing(id: context.downloadID)
-                    responseError = DirectDownloadRecoveryRestartError()
-                } catch {
-                    responseError = error
-                }
-                state.resumeOffset = 0
-                state.bytesWritten = 0
-                state.declaredExpectedBytes = nil
-                context.mode = .ownedPartial(state)
-                return
+            }
+            guard let httpResponse = response as? HTTPURLResponse else {
+                return OwnedResponseDisposition.reject(
+                    error: URLError(.badServerResponse),
+                    statusCode: nil,
+                    wasResuming: false,
+                    requiresFreshStart: false
+                )
             }
 
-            guard (200 ... 299).contains(statusCode) else {
-                responseError = DirectDownloadHTTPStatusError(statusCode: statusCode)
-                return
-            }
+            let wasResuming = state.resumeOffset > 0
+            defer { context.mode = .ownedPartial(state) }
 
+            let plan: DirectDownloadResponsePolicy.Plan
             do {
-                guard statusCode == 200 || statusCode == 206,
-                      Self.responseUsesIdentityEncoding(httpResponse) else {
-                    throw URLError(.badServerResponse)
-                }
-                let contentRange: DirectDownloadContentRange?
-                if statusCode == 206 {
-                    contentRange = try Self.validatedPartialContentRange(httpResponse)
-                } else {
-                    guard httpResponse.value(forHTTPHeaderField: "Content-Range") == nil else {
-                        throw URLError(.badServerResponse)
-                    }
-                    _ = try Self.declaredContentLength(httpResponse)
-                    contentRange = nil
-                }
-                if responseWasResuming {
-                    if statusCode == 206 {
-                        let matchesSavedTotal = state.expectedBytes <= 0
-                            || contentRange?.total == state.expectedBytes
-                        guard let contentRange,
-                              contentRange.start == state.resumeOffset,
-                              matchesSavedTotal,
-                              Self.responseMatchesSavedValidator(
-                                  httpResponse,
-                                  state: state
-                              ) else {
-                            responseRequiresFreshStart = true
-                            do {
-                                try recoveryStore.discardThrowing(id: context.downloadID)
-                                responseError = DirectDownloadRecoveryRestartError()
-                            } catch {
-                                responseError = error
-                            }
-                            state.resumeOffset = 0
-                            state.bytesWritten = 0
-                            state.declaredExpectedBytes = nil
-                            context.mode = .ownedPartial(state)
-                            return
-                        }
-
-                        state.fileHandle = try recoveryStore.openFileForAppending(
-                            id: context.downloadID,
-                            expectedOffset: state.resumeOffset
-                        )
-                    } else if statusCode == 200 {
-                        responseRequiresFreshStart = true
-                        do {
-                            try recoveryStore.discardThrowing(id: context.downloadID)
-                        } catch {
-                            responseError = error
-                            context.mode = .ownedPartial(state)
-                            return
-                        }
-                        state.resumeOffset = 0
-                        state.bytesWritten = 0
-                        state.declaredExpectedBytes = nil
-                        state.entityTag = nil
-                        state.lastModified = nil
-                        state.suggestedFilename = nil
-                        state.responseMimeType = nil
-                        state.fileHandle = try recoveryStore.openFreshFile(id: context.downloadID)
-                        context.transferSample = TransferSample(
-                            lastTotalBytesWritten: 0,
-                            sampleDate: .now,
-                            speedBytesPerSecond: 0
-                        )
-                        resetReason = .serverRejectedRange
-                    } else {
-                        responseRequiresFreshStart = true
-                        do {
-                            try recoveryStore.discardThrowing(id: context.downloadID)
-                            responseError = DirectDownloadRecoveryRestartError()
-                        } catch {
-                            responseError = error
-                        }
-                        state.resumeOffset = 0
-                        state.bytesWritten = 0
-                        context.mode = .ownedPartial(state)
-                        return
-                    }
-                } else {
-                    if statusCode == 206 {
-                        guard contentRange?.start == 0 else {
-                            throw URLError(.badServerResponse)
-                        }
-                    }
-                    state.fileHandle = try recoveryStore.openFreshFile(id: context.downloadID)
-                }
-
-                let responseExpectedBytes = try expectedByteCount(for: httpResponse)
-                state.declaredExpectedBytes = responseExpectedBytes
-                if let responseExpectedBytes {
-                    state.expectedBytes = responseExpectedBytes
-                } else if resetReason != nil {
-                    state.expectedBytes = 0
-                }
-                state.suggestedFilename = httpResponse.suggestedFilename ?? state.suggestedFilename
-                state.responseMimeType = httpResponse.mimeType ?? state.responseMimeType
-                state.statusCode = statusCode
-                state.responseRangeEnd = statusCode == 206 ? contentRange?.end : nil
-                state.entityTag = httpResponse.value(forHTTPHeaderField: "ETag") ?? state.entityTag
-                state.lastModified = httpResponse.value(forHTTPHeaderField: "Last-Modified") ?? state.lastModified
-                context.mode = .ownedPartial(state)
-
-                try recoveryStore.saveMetadata(
-                    recoveryMetadata(for: httpResponse, state: state),
-                    id: context.downloadID
+                plan = try DirectDownloadResponsePolicy.plan(
+                    for: httpResponse,
+                    resume: resumeIdentity(for: state)
                 )
             } catch {
-                context.mode = .ownedPartial(state)
-                if responseWasResuming,
-                   Self.isInvalidResumeProtocolResponse(error) {
-                    responseRequiresFreshStart = true
-                    do {
-                        try recoveryStore.discardThrowing(id: context.downloadID)
-                        responseError = DirectDownloadRecoveryRestartError()
-                    } catch {
-                        responseError = error
-                    }
-                } else {
-                    responseError = error
+                if error is DirectDownloadRecoveryRestartError {
+                    return .reject(
+                        error: discardRejectedResume(
+                            downloadID: context.downloadID,
+                            state: &state
+                        ),
+                        statusCode: httpResponse.statusCode,
+                        wasResuming: wasResuming,
+                        requiresFreshStart: true
+                    )
                 }
+                return .reject(
+                    error: error,
+                    statusCode: httpResponse.statusCode,
+                    wasResuming: wasResuming,
+                    requiresFreshStart: false
+                )
+            }
+
+            let requiresFreshStart: Bool
+            if case let .receiveBody(_, _, _, resetReason) = plan {
+                requiresFreshStart = resetReason != nil
+            } else {
+                requiresFreshStart = false
+            }
+            do {
+                return try apply(
+                    plan,
+                    response: httpResponse,
+                    downloadID: context.downloadID,
+                    state: &state,
+                    transferSample: &context.transferSample
+                )
+            } catch {
+                return .reject(
+                    error: error,
+                    statusCode: httpResponse.statusCode,
+                    wasResuming: wasResuming,
+                    requiresFreshStart: requiresFreshStart
+                )
             }
         }) else {
             completionHandler(.cancel)
             return
         }
 
-        if shouldFinishExistingPartial {
+        let updatedContext = handledResponse.context
+        switch handledResponse.result {
+        case .finishExistingPartial:
             guard let context = beginCompletionPublication(forTaskKey: taskKey) else {
                 completionHandler(.cancel)
                 return
             }
-            _ = withLock {
+            _ = stateLock.withLock {
                 suppressedCompletionTaskKeys.insert(taskKey)
             }
             completionHandler(.cancel)
@@ -1806,14 +1474,18 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
                 context.session.finishTasksAndInvalidate()
             }
             return
-        }
 
-        if let responseError {
+        case let .reject(
+            responseError,
+            responseStatusCode,
+            responseWasResuming,
+            responseRequiresFreshStart
+        ):
             guard let context = beginCompletionPublication(forTaskKey: taskKey) else {
                 completionHandler(.cancel)
                 return
             }
-            _ = withLock {
+            _ = stateLock.withLock {
                 suppressedCompletionTaskKeys.insert(taskKey)
             }
             let didPreserveRecovery = closeOwnedFile(
@@ -1848,18 +1520,19 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
             )
             context.session.finishTasksAndInvalidate()
             return
-        }
 
-        if let resetReason {
-            eventHandler(
-                .recoveryReset(
-                    id: updatedContext.downloadID,
-                    attemptIdentifier: updatedContext.attemptIdentifier,
-                    reason: resetReason
+        case let .receiveBody(resetReason):
+            if let resetReason {
+                eventHandler(
+                    .recoveryReset(
+                        id: updatedContext.downloadID,
+                        attemptIdentifier: updatedContext.attemptIdentifier,
+                        reason: resetReason
+                    )
                 )
-            )
+            }
+            completionHandler(.allow)
         }
-        completionHandler(.allow)
     }
 
     func urlSession(
@@ -1973,7 +1646,7 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
             guard let failedContext = beginCompletionPublication(forTaskKey: taskKey) else {
                 return
             }
-            _ = withLock {
+            _ = stateLock.withLock {
                 suppressedCompletionTaskKeys.insert(taskKey)
             }
             let didPreserveRecovery = closeOwnedFile(
@@ -2111,7 +1784,7 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
         let taskKey = makeTaskKey(session: session, taskIdentifier: task.taskIdentifier)
-        guard let context = withLock({ contexts[taskKey] }),
+        guard let context = stateLock.withLock({ contexts[taskKey] }),
               case let .ownedPartial(state) = context.mode else {
             completionHandler(request)
             return
@@ -2250,7 +1923,7 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
                     id: context.downloadID,
                     attemptIdentifier: context.attemptIdentifier,
                     failure: DirectDownloadFailure(
-                        error: DirectDownloadIncompleteResponseError(
+                        error: HTTPDownloadIncompleteResponseError(
                             actualBytes: actualBytes,
                             expectedBytes: expectedBytes
                         ),

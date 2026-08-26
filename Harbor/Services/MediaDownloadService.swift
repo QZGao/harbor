@@ -364,7 +364,7 @@ actor MediaDownloadService {
                 "A previous media process may still be using this download’s recovery data. Harbor left it untouched."
             )
         }
-        guard try itemExists(at: processOwnershipManifestURL(id: id)) == false else {
+        guard try DurableFileSystem.itemExists(at: processOwnershipManifestURL(id: id)) == false else {
             throw MediaDownloadError.unavailable(
                 "Harbor found an unverifiable owner for this download’s recovery data and left it untouched."
             )
@@ -548,7 +548,7 @@ actor MediaDownloadService {
         // writer may still exist, so explicit cleanup must fail closed until
         // orphan reconciliation verifies the process has stopped and retires
         // that marker.
-        guard try itemExists(at: processOwnershipManifestURL(id: id)) == false else {
+        guard try DurableFileSystem.itemExists(at: processOwnershipManifestURL(id: id)) == false else {
             throw MediaDownloadError.unavailable(
                 "Harbor couldn’t clear this media download while a previous process may still own its recovery data."
             )
@@ -556,7 +556,7 @@ actor MediaDownloadService {
 
         terminalOutcomes.removeValue(forKey: id)
         let folder = temporaryFolder(for: id)
-        guard try itemExists(at: folder) else {
+        guard try DurableFileSystem.itemExists(at: folder) else {
             return
         }
         try validateTemporaryFolder(folder)
@@ -565,7 +565,7 @@ actor MediaDownloadService {
     }
 
     func discardOrphanedRecoveryData(retaining retainedIDs: Set<UUID>) throws {
-        guard try itemExists(at: temporaryRoot) else {
+        guard try DurableFileSystem.itemExists(at: temporaryRoot) else {
             return
         }
         try validateTemporaryRoot()
@@ -589,7 +589,7 @@ actor MediaDownloadService {
             guard values.isDirectory == true,
                   values.isSymbolicLink != true,
                   retainedIDs.contains(id) == false,
-                  try itemExists(at: processOwnershipManifestURL(id: id)) == false,
+                  try DurableFileSystem.itemExists(at: processOwnershipManifestURL(id: id)) == false,
                   runningProcessCommands.contains(where: { $0.contains(entry.path) }) == false,
                   runningDownloads[id] == nil else {
                 continue
@@ -656,7 +656,7 @@ actor MediaDownloadService {
     }
 
     func completedDownloadEntries() throws -> [MediaCompletionEntry] {
-        guard try itemExists(at: temporaryRoot) else {
+        guard try DurableFileSystem.itemExists(at: temporaryRoot) else {
             return []
         }
         try validateTemporaryRoot()
@@ -731,7 +731,7 @@ actor MediaDownloadService {
         }
 
         let manifestURL = completionManifestURL(id: id)
-        if try itemExists(at: manifestURL) {
+        if try DurableFileSystem.itemExists(at: manifestURL) {
             let manifest = try validatedCompletionManifest(id: id)
             guard manifest.attemptIdentifier == attemptIdentifier else {
                 throw MediaDownloadError.unavailable(
@@ -747,7 +747,7 @@ actor MediaDownloadService {
 
         terminalOutcomes.removeValue(forKey: id)
         let folder = temporaryFolder(for: id)
-        if try itemExists(at: folder) {
+        if try DurableFileSystem.itemExists(at: folder) {
             try validateTemporaryFolder(folder)
             try fileManager.removeItem(at: folder)
             try DurableFileSystem.synchronizeParentDirectory(of: folder)
@@ -762,11 +762,11 @@ actor MediaDownloadService {
             )
         }
         let folder = temporaryFolder(for: id)
-        guard try itemExists(at: folder) else {
+        guard try DurableFileSystem.itemExists(at: folder) else {
             return
         }
         try validateTemporaryFolder(folder)
-        guard try itemExists(at: processOwnershipManifestURL(id: id)) == false else {
+        guard try DurableFileSystem.itemExists(at: processOwnershipManifestURL(id: id)) == false else {
             throw MediaDownloadError.unavailable(
                 "Harbor could not reset media completion evidence while an earlier process owner remained."
             )
@@ -908,7 +908,7 @@ actor MediaDownloadService {
                 // Keep the writer-exclusion marker until this callback has
                 // either published a parent manifest or left child-owned
                 // terminal evidence for relaunch reconciliation.
-                try discardProcessOwnership(for: download)
+                try discardProcessOwnershipManifest(download.processOwnership)
             } catch {
                 // The child has already been reaped. A stale exact-identity
                 // marker is harmless and will be retired by the next scan.
@@ -923,7 +923,7 @@ actor MediaDownloadService {
         var successfulCompletionError: Error?
         let childSuccessMarkerExists: Bool
         do {
-            childSuccessMarkerExists = try itemExists(
+            childSuccessMarkerExists = try DurableFileSystem.itemExists(
                 at: processSucceededMarkerURL(id: id)
             )
         } catch {
@@ -1408,12 +1408,12 @@ actor MediaDownloadService {
     }
 
     private func completionManifestExists(id: UUID) throws -> Bool {
-        try itemExists(at: completionManifestURL(id: id))
+        try DurableFileSystem.itemExists(at: completionManifestURL(id: id))
     }
 
     private func completionEvidenceExists(id: UUID) throws -> Bool {
         try completionManifestExists(id: id)
-            || itemExists(at: processSucceededMarkerURL(id: id))
+            || DurableFileSystem.itemExists(at: processSucceededMarkerURL(id: id))
     }
 
     private func prepareCompletionAttempt(
@@ -1454,7 +1454,7 @@ actor MediaDownloadService {
         _ url: URL,
         in folder: URL
     ) throws {
-        guard try itemExists(at: url) else {
+        guard try DurableFileSystem.itemExists(at: url) else {
             return
         }
         try validateTemporaryFolder(folder)
@@ -1577,7 +1577,7 @@ actor MediaDownloadService {
         if try completionManifestExists(id: id) {
             return try validatedCompletionManifest(id: id)
         }
-        guard try itemExists(at: processSucceededMarkerURL(id: id)) else {
+        guard try DurableFileSystem.itemExists(at: processSucceededMarkerURL(id: id)) else {
             return nil
         }
 
@@ -1713,7 +1713,7 @@ actor MediaDownloadService {
         at url: URL,
         missingMessage: String
     ) throws -> Data {
-        guard try itemExists(at: url) else {
+        guard try DurableFileSystem.itemExists(at: url) else {
             throw CompletionManifestIntegrityError.invalid(missingMessage)
         }
         let identity = try regularFileIdentity(at: url)
@@ -1947,26 +1947,13 @@ actor MediaDownloadService {
                 "A completed media payload no longer matches its journal."
             )
         }
-        let digest = try sha256(at: url)
+        let digest = try DurableFileSystem.sha256(at: url)
         guard try regularFileIdentity(at: url) == before else {
             throw CompletionManifestIntegrityError.invalid(
                 "A completed media payload changed while it was being verified."
             )
         }
         return digest
-    }
-
-    private func itemExists(at url: URL) throws -> Bool {
-        do {
-            _ = try url.resourceValues(
-                forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
-            )
-            return true
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            return false
-        } catch let error as POSIXError where error.code == .ENOENT {
-            return false
-        }
     }
 
     private func createAndValidateTemporaryFolder(_ folder: URL) throws {
@@ -2003,17 +1990,6 @@ actor MediaDownloadService {
                 "Harbor’s media recovery directory is not a safe owned directory."
             )
         }
-    }
-
-    private func sha256(at url: URL) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        var hasher = SHA256()
-        while let data = try handle.read(upToCount: 1024 * 1024),
-              data.isEmpty == false {
-            hasher.update(data: data)
-        }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private func cleanupTemporaryFolder(_ folder: URL) {
@@ -2400,7 +2376,7 @@ actor MediaDownloadService {
             command: process.command
         )
         let url = processOwnershipManifestURL(id: downloadID)
-        guard try itemExists(at: url) == false else {
+        guard try DurableFileSystem.itemExists(at: url) == false else {
             throw MediaDownloadError.unavailable(
                 "A previous media process still owns this recovery directory."
             )
@@ -2414,7 +2390,7 @@ actor MediaDownloadService {
     }
 
     private func processOwnershipManifests() throws -> [MediaProcessOwnershipManifest] {
-        guard try itemExists(at: temporaryRoot) else {
+        guard try DurableFileSystem.itemExists(at: temporaryRoot) else {
             return []
         }
         try validateTemporaryRoot()
@@ -2441,7 +2417,7 @@ actor MediaDownloadService {
     }
 
     private func processOwnershipMarkerIDs() throws -> Set<UUID> {
-        guard try itemExists(at: temporaryRoot) else {
+        guard try DurableFileSystem.itemExists(at: temporaryRoot) else {
             return []
         }
         try validateTemporaryRoot()
@@ -2453,7 +2429,7 @@ actor MediaDownloadService {
         var identifiers = Set<UUID>()
         for folder in folders {
             guard let id = UUID(uuidString: folder.lastPathComponent),
-                  try itemExists(at: processOwnershipManifestURL(id: id)) else {
+                  try DurableFileSystem.itemExists(at: processOwnershipManifestURL(id: id)) else {
                 continue
             }
             identifiers.insert(id)
@@ -2466,7 +2442,7 @@ actor MediaDownloadService {
     ) throws -> MediaProcessOwnershipManifest? {
         let folder = temporaryFolder(for: id)
         let url = processOwnershipManifestURL(id: id)
-        guard try itemExists(at: url) else {
+        guard try DurableFileSystem.itemExists(at: url) else {
             return nil
         }
         try validateTemporaryFolder(folder)
@@ -2493,10 +2469,6 @@ actor MediaDownloadService {
             throw CocoaError(.fileReadCorruptFile)
         }
         return manifest
-    }
-
-    private func discardProcessOwnership(for download: RunningDownload) throws {
-        try discardProcessOwnershipManifest(download.processOwnership)
     }
 
     private func discardUnverifiableProcessOwnershipMarker(id: UUID) throws {
@@ -2744,13 +2716,5 @@ enum MediaDownloadErrorClassifier {
         }
 
         return "The media download failed."
-    }
-}
-
-private extension NSLock {
-    nonisolated func withLock<T>(_ operation: () -> T) -> T {
-        lock()
-        defer { unlock() }
-        return operation()
     }
 }
