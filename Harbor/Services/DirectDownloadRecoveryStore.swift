@@ -138,6 +138,103 @@ final class DirectDownloadRecoveryStore: @unchecked Sendable {
         }
     }
 
+    /// Attempts to convert a paused direct download from URLSession's former
+    /// opaque resume-data representation into Harbor's owned recovery format.
+    ///
+    /// URLSession publicly treats resume data as an opaque token, but Harbor
+    /// releases predating owned partials persisted that token. We have observed
+    /// two representations: older flat property-list dictionaries and newer
+    /// `NSKeyedArchiver` envelopes. Their keys are implementation details, so
+    /// parsing is deliberately best-effort. Rejecting an unknown representation
+    /// is safe because the download will restart instead of combining bytes whose
+    /// identity or origin Harbor cannot establish.
+    ///
+    /// Import never replaces valid owned recovery. It also requires a matching
+    /// source URL, a positive byte count within any known total, a physical file
+    /// of exactly that size, a usable If-Range validator, and a regular,
+    /// non-symlink file confined to the process temporary directory. On success,
+    /// the partial is moved into the normal recovery store and receives ordinary
+    /// recovery metadata; every later operation therefore uses the owned-partial
+    /// path. The caller clears the opaque token after this attempt, whether it
+    /// succeeds or fails, so this importer does not preserve a second transport.
+    func adoptResumeData(
+        _ data: Data,
+        id: UUID,
+        sourceURL: URL,
+        expectedBytes: Int64
+    ) {
+        guard case .absent = lookup(id: id, sourceURL: sourceURL),
+              let info = Self.resumeInfo(from: data),
+              let archivedSource = Self.string(
+                  ["NSURLSessionDownloadURL"],
+                  in: info
+              ),
+              URL(string: archivedSource) == sourceURL,
+              let bytesWritten = Self.byteCount(in: info),
+              bytesWritten > 0,
+              expectedBytes <= 0 || bytesWritten <= expectedBytes,
+              let location = Self.string(
+                  [
+                      "NSURLSessionResumeInfoLocalPath",
+                      "NSURLSessionResumeInfoTempFileName"
+                  ],
+                  in: info
+              ),
+              let source = temporaryPartialURL(for: location) else {
+            return
+        }
+
+        let metadata = DirectDownloadRecoveryMetadata(
+            sourceURL: sourceURL,
+            entityTag: Self.string(
+                ["NSURLSessionResumeEntityTag", "NSURLSessionResumeInfoEntityTag"],
+                in: info
+            ),
+            lastModified: Self.string(
+                ["NSURLSessionResumeLastModified", "NSURLSessionResumeInfoLastModified"],
+                in: info
+            ),
+            expectedBytes: expectedBytes,
+            suggestedFilename: nil,
+            mimeType: nil
+        )
+        guard metadata.ifRangeValidator != nil else {
+            return
+        }
+
+        try? lock.withLock {
+            if try recoveryPreparation(id: id, sourceURL: sourceURL).snapshot != nil {
+                return
+            }
+            guard try fileSizeIfPresent(at: source) == bytesWritten else {
+                return
+            }
+            try discardLocked(id: id)
+            // Write the metadata while holding the store lock, before moving the
+            // partial into place. This ordering makes both interruption points
+            // recoverable: if the process exits before the move, the next lookup
+            // sees metadata without a partial and discards it; if it exits after
+            // the move, the complete recovery pair is already present. If the
+            // move itself fails, remove the metadata so a later lookup cannot
+            // mistake the failed adoption for valid recovery.
+            try saveMetadataLocked(metadata, id: id)
+            let destination = partialURL(for: id)
+            do {
+                try fileManager.moveItem(at: source, to: destination)
+            } catch {
+                try? removeItemIfPresent(at: metadataURL(for: id))
+                return
+            }
+
+            guard (try? fileSizeIfPresent(at: destination)) == bytesWritten else {
+                try? discardLocked(id: id)
+                return
+            }
+            try? DurableFileSystem.synchronizeFile(at: destination)
+            try? DurableFileSystem.synchronizeParentDirectory(of: destination)
+        }
+    }
+
     func openFreshFile(id: UUID) throws -> FileHandle {
         try lock.withLock {
             try DurableFileSystem.createDirectoryIfNeeded(
@@ -180,15 +277,7 @@ final class DirectDownloadRecoveryStore: @unchecked Sendable {
         id: UUID
     ) throws {
         try lock.withLock {
-            try DurableFileSystem.createDirectoryIfNeeded(
-                at: directoryURL,
-                fileManager: fileManager
-            )
-            let data = try JSONEncoder().encode(metadata)
-            let destinationURL = metadataURL(for: id)
-            try data.write(to: destinationURL, options: .atomic)
-            try DurableFileSystem.synchronizeFile(at: destinationURL)
-            try DurableFileSystem.synchronizeParentDirectory(of: destinationURL)
+            try saveMetadataLocked(metadata, id: id)
         }
     }
 
@@ -259,6 +348,93 @@ final class DirectDownloadRecoveryStore: @unchecked Sendable {
         directoryURL
             .appendingPathComponent(id.uuidString)
             .appendingPathExtension("json")
+    }
+
+    private static func resumeInfo(from data: Data) -> [String: Any]? {
+        guard let object = try? PropertyListSerialization.propertyList(
+            from: data,
+            options: [],
+            format: nil
+        ), let dictionary = object as? [String: Any] else {
+            return nil
+        }
+        // PropertyListSerialization exposes the actual resume dictionary for
+        // older tokens. A modern token is itself a property list describing a
+        // keyed archive, so its outer dictionary contains archive machinery
+        // rather than the resume fields. Recognize that envelope and securely
+        // decode its restricted root object before reading any values.
+        if byteCount(in: dictionary) != nil {
+            return dictionary
+        }
+        guard dictionary["$archiver"] as? String == "NSKeyedArchiver",
+              let unarchiver = try? NSKeyedUnarchiver(forReadingFrom: data) else {
+            return nil
+        }
+        defer { unarchiver.finishDecoding() }
+        unarchiver.requiresSecureCoding = true
+        return unarchiver.decodeObject(
+            of: [NSDictionary.self, NSString.self, NSNumber.self, NSData.self],
+            forKey: "NSKeyedArchiveRootObjectKey"
+        ) as? [String: Any]
+    }
+
+    private static func byteCount(in info: [String: Any]) -> Int64? {
+        for key in ["NSURLSessionResumeBytesReceived", "NSURLSessionResumeInfoBytesReceived"] {
+            if let number = info[key] as? NSNumber {
+                return number.int64Value
+            }
+            if let text = info[key] as? String, let value = Int64(text) {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private static func string(_ keys: [String], in info: [String: Any]) -> String? {
+        keys.lazy.compactMap { info[$0] as? String }.first
+    }
+
+    private func temporaryPartialURL(for location: String) -> URL? {
+        // Depending on the URLSession representation, the partial is identified
+        // by either an absolute local path or only a CFNetwork temporary filename.
+        // Resolve both forms, then standardize the path and resolve symlinks before
+        // confirming that it remains beneath the process temporary directory.
+        // This prevents path traversal or a symlink from turning the importer into
+        // a way to inspect or move an unrelated file.
+        let temporaryDirectory = fileManager.temporaryDirectory
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        let path = location as NSString
+        let candidate: URL
+        if path.isAbsolutePath {
+            candidate = URL(fileURLWithPath: location)
+        } else {
+            guard location.isEmpty == false, path.lastPathComponent == location else {
+                return nil
+            }
+            candidate = temporaryDirectory.appendingPathComponent(location)
+        }
+        let standardized = candidate.standardizedFileURL
+        let resolvedPath = standardized.resolvingSymlinksInPath().path
+        guard resolvedPath.hasPrefix(temporaryDirectory.path + "/") else {
+            return nil
+        }
+        return standardized
+    }
+
+    private func saveMetadataLocked(
+        _ metadata: DirectDownloadRecoveryMetadata,
+        id: UUID
+    ) throws {
+        try DurableFileSystem.createDirectoryIfNeeded(
+            at: directoryURL,
+            fileManager: fileManager
+        )
+        let data = try JSONEncoder().encode(metadata)
+        let destinationURL = metadataURL(for: id)
+        try data.write(to: destinationURL, options: .atomic)
+        try DurableFileSystem.synchronizeFile(at: destinationURL)
+        try DurableFileSystem.synchronizeParentDirectory(of: destinationURL)
     }
 
     private func loadMetadata(id: UUID) throws -> DirectDownloadRecoveryMetadata? {

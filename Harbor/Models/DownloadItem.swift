@@ -129,6 +129,10 @@ struct DownloadRecord: Codable, Sendable {
     let finishedAt: Date?
     let updatedAt: Date
     let lastError: String?
+    /// Opaque resume data produced by URLSession for direct downloads created
+    /// before Harbor owned its partial files. The field remains in the persisted
+    /// model only so startup can perform a one-time import. New direct downloads
+    /// never populate it; WebKit continuation data uses `browserResumeData`.
     let resumeData: Data?
     let browserResumeData: Data?
     let backendIdentifier: String?
@@ -396,6 +400,8 @@ final class DownloadItem: Identifiable {
     var finishedAt: Date?
     var updatedAt: Date
     var lastError: String?
+    /// In-memory copy of the persisted compatibility token. Initialization
+    /// clears it after attempting the one-time import, before records are saved.
     var resumeData: Data?
     var browserResumeData: Data?
     var taskIdentifier: Int?

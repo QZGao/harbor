@@ -87,7 +87,6 @@ extension HarborModelAndSafetyTests {
                 id: item.id,
                 attemptIdentifier: directAttemptIdentifier,
                 taskIdentifier: 99,
-                usesOwnedPartial: true,
                 ownedRecovery: nil,
                 resetReason: nil
             )

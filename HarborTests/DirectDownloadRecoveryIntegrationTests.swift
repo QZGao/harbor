@@ -42,7 +42,7 @@ extension HarborModelAndSafetyTests {
 
         let id = UUID()
         let sourceURL = try XCTUnwrap(URL(string: "https://recovery.example.test/file.bin"))
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [firstFailure], timeout: 2)
 
         let failure = eventState.firstFailure
@@ -53,7 +53,7 @@ extension HarborModelAndSafetyTests {
             5
         )
 
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [completion], timeout: 2)
 
         let unwrappedResultURL = try XCTUnwrap(eventState.completedURL)
@@ -106,10 +106,10 @@ extension HarborModelAndSafetyTests {
 
         let id = UUID()
         let sourceURL = try XCTUnwrap(URL(string: "https://recovery.example.test/file.bin"))
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [initialFailure], timeout: 2)
 
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [changedValidatorFailure], timeout: 2)
 
         XCTAssertNil(eventState.completedURL)
@@ -117,7 +117,7 @@ extension HarborModelAndSafetyTests {
         XCTAssertEqual(eventState.failures.last?.recoverableBytes, 0)
         XCTAssertNil(coordinator.recoverySnapshot(id: id, sourceURL: sourceURL))
 
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [completion], timeout: 2)
 
         let completedURL = try XCTUnwrap(eventState.completedURL)
@@ -164,10 +164,10 @@ extension HarborModelAndSafetyTests {
 
         let id = UUID()
         let sourceURL = try XCTUnwrap(URL(string: "https://recovery.example.test/file.bin"))
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [initialFailure], timeout: 2)
 
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [completion], timeout: 2)
 
         let completedURL = try XCTUnwrap(eventState.completedURL)
@@ -228,7 +228,7 @@ extension HarborModelAndSafetyTests {
             sessionConfiguration: configuration
         )
 
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [completion], timeout: 2)
 
         let completedURL = try XCTUnwrap(eventState.completedURL)
@@ -291,7 +291,7 @@ extension HarborModelAndSafetyTests {
             sessionConfiguration: configuration
         )
 
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [failureExpectation], timeout: 2)
 
         XCTAssertNil(eventState.completedURL)
@@ -338,10 +338,10 @@ extension HarborModelAndSafetyTests {
 
         let id = UUID()
         let sourceURL = try XCTUnwrap(URL(string: "https://recovery.example.test/file.bin"))
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [initialFailure], timeout: 2)
 
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [overflowFailure], timeout: 2)
 
         XCTAssertNil(eventState.completedURL)
@@ -349,7 +349,7 @@ extension HarborModelAndSafetyTests {
         XCTAssertEqual(eventState.failures.last?.recoverableBytes, 0)
         XCTAssertNil(coordinator.recoverySnapshot(id: id, sourceURL: sourceURL))
 
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [completion], timeout: 2)
 
         let completedURL = try XCTUnwrap(eventState.completedURL)
@@ -397,7 +397,7 @@ extension HarborModelAndSafetyTests {
 
         let id = UUID()
         let sourceURL = try XCTUnwrap(URL(string: "https://recovery.example.test/file.bin"))
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [firstFailure], timeout: 2)
 
         XCTAssertEqual(eventState.firstFailure?.recoverableBytes, 0)
@@ -420,7 +420,7 @@ extension HarborModelAndSafetyTests {
             )
         )
 
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [completion], timeout: 2)
 
         let resultURL = try XCTUnwrap(eventState.completedURL)
@@ -472,11 +472,11 @@ extension HarborModelAndSafetyTests {
 
         let id = UUID()
         let sourceURL = try XCTUnwrap(URL(string: "https://recovery.example.test/file.bin"))
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [firstFailure], timeout: 2)
         let progressCountBeforeRejection = eventState.progressCount
 
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [rejectedResume], timeout: 2)
         try await Task.sleep(for: .milliseconds(100))
 
@@ -488,7 +488,7 @@ extension HarborModelAndSafetyTests {
             5
         )
 
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [completion], timeout: 2)
 
         let resultURL = try XCTUnwrap(eventState.completedURL)

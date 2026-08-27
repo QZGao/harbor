@@ -419,11 +419,38 @@ final class DownloadCenter {
                     .map(\.id)
             )
             coordinator.discardOrphanedRecoveryData(retaining: directDownloadIDs)
-            for item in downloads
-            where item.backend == .urlSession && item.status.isTerminal == false {
+            // `resumeData` exists only to carry direct-download state persisted
+            // by releases that relied on URLSession's opaque resume token. A
+            // terminal item no longer needs it. If WebKit resume data is present,
+            // that browser-owned continuation is authoritative and any direct
+            // recovery is discarded. For every other nonterminal direct download,
+            // give the recovery store one opportunity to adopt URLSession's
+            // temporary partial before performing the normal recovery lookup.
+            //
+            // Clear the opaque token after that attempt regardless of outcome.
+            // Successful adoption is immediately returned by the ordinary lookup;
+            // failed adoption with no owned recovery reaches `.absent`, which
+            // removes stale displayed progress and makes the next resume start
+            // from byte zero. No active legacy execution path survives startup.
+            for item in downloads where item.backend == .urlSession {
+                guard item.status.isTerminal == false else {
+                    item.resumeData = nil
+                    continue
+                }
                 if item.browserResumeData != nil {
                     coordinator.discardOwnedRecoveryData(id: item.id)
+                    item.resumeData = nil
                     continue
+                }
+
+                if let resumeData = item.resumeData {
+                    coordinator.adoptResumeData(
+                        resumeData,
+                        id: item.id,
+                        sourceURL: item.sourceURL,
+                        expectedBytes: item.expectedBytes
+                    )
+                    item.resumeData = nil
                 }
 
                 switch coordinator.recoveryLookup(
@@ -431,26 +458,15 @@ final class DownloadCenter {
                     sourceURL: item.sourceURL
                 ) {
                 case let .available(recovery):
-                    item.resumeData = nil
                     item.bytesWritten = recovery.bytesWritten
                     item.expectedBytes = recovery.metadata.expectedBytes
                     item.progress = item.expectedBytes > 0
                         ? min(Double(item.bytesWritten) / Double(item.expectedBytes), 1)
                         : 0
                 case .absent:
-                    if let resumeData = item.resumeData {
-                        item.bytesWritten = DownloadCoordinator.legacyResumeByteCount(
-                            from: resumeData
-                        ) ?? 0
-                        item.expectedBytes = max(item.expectedBytes, item.bytesWritten)
-                        item.progress = item.expectedBytes > 0
-                            ? min(Double(item.bytesWritten) / Double(item.expectedBytes), 1)
-                            : 0
-                    } else {
-                        item.bytesWritten = 0
-                        item.expectedBytes = 0
-                        item.progress = 0
-                    }
+                    item.bytesWritten = 0
+                    item.expectedBytes = 0
+                    item.progress = 0
                 case let .unavailable(message):
                     item.taskIdentifier = nil
                     item.speedBytesPerSecond = 0
@@ -1058,7 +1074,6 @@ final class DownloadCenter {
                 item.bytesWritten = initialHandoff.manifest.actualBytes
                 item.finishedAt = item.finishedAt ?? .now
                 item.lastError = nil
-                item.resumeData = nil
                 item.browserResumeData = nil
                 item.taskIdentifier = nil
                 item.speedBytesPerSecond = 0
@@ -2749,7 +2764,6 @@ final class DownloadCenter {
                 item.bytesWritten = 0
                 item.expectedBytes = 0
                 item.progress = 0
-                item.resumeData = nil
                 item.browserResumeData = nil
             }
         case .aria2:
@@ -3029,12 +3043,10 @@ final class DownloadCenter {
                 return
             }
 
-            let preservedResumeData = item.resumeData
             let preservedBrowserResumeData = item.browserResumeData
             item.taskIdentifier = nil
             item.speedBytesPerSecond = 0
             item.uploadBytesPerSecond = 0
-            item.resumeData = nil
             item.browserResumeData = nil
             item.progress = 0
             item.bytesWritten = 0
@@ -3055,7 +3067,6 @@ final class DownloadCenter {
             } catch {
                 item.status = self.durableMutationFailureStatus(from: originalRecord.status)
                 item.activityEvents = originalActivityEvents
-                item.resumeData = preservedResumeData
                 item.browserResumeData = preservedBrowserResumeData
                 item.progress = originalRecord.progress
                 item.bytesWritten = originalRecord.bytesWritten
@@ -4434,7 +4445,6 @@ final class DownloadCenter {
                 startNextQueuedDownloadsIfNeeded()
                 return
             }
-            item.resumeData = nil
             item.bytesWritten = 0
             item.progress = 0
         }
@@ -4448,10 +4458,8 @@ final class DownloadCenter {
                 id: item.id,
                 attemptIdentifier: attemptIdentifier,
                 sourceURL: item.sourceURL,
-                resumeData: item.resumeData,
                 speedLimitOverride: item.downloadLimitOverride
             )
-            item.resumeData = nil
         } catch {
             if directAttemptStates[item.id]?.identifier == attemptIdentifier {
                 directAttemptStates.removeValue(forKey: item.id)
@@ -4472,7 +4480,7 @@ final class DownloadCenter {
             handleDirectDownloadFailure(
                 DirectDownloadFailure(
                     error: error,
-                    resumeData: item.resumeData,
+                    resumeData: nil,
                     recoverableBytes: recoverableBytes
                 ),
                 for: item
@@ -4610,7 +4618,6 @@ final class DownloadCenter {
         item.updatedAt = .now
 
         if let recoverableBytes = failure.recoverableBytes {
-            item.resumeData = nil
             item.bytesWritten = recoverableBytes
             if item.expectedBytes > 0 {
                 item.progress = min(
@@ -4620,11 +4627,7 @@ final class DownloadCenter {
             } else if recoverableBytes == 0 {
                 item.progress = 0
             }
-        } else if failure.resumeData == nil {
-            // A byte count without either Apple resume data or a validated
-            // owned partial is historical transfer telemetry, not recoverable
-            // progress. Do not persist or display it as though Retry could use
-            // those bytes.
+        } else {
             item.bytesWritten = 0
             item.expectedBytes = 0
             item.progress = 0
@@ -4635,13 +4638,6 @@ final class DownloadCenter {
            let delay = DirectDownloadRetryPolicy.delay(forAttempt: nextAttempt),
            isShuttingDown == false {
             directRetryAttempts[item.id] = nextAttempt
-            if failure.recoverableBytes != nil {
-                item.resumeData = nil
-            } else if failure.wasResuming, failure.resumeData == nil {
-                item.resumeData = nil
-            } else {
-                item.resumeData = failure.resumeData
-            }
             item.lastError = directRetryMessage(
                 for: failure,
                 delay: delay,
@@ -4676,7 +4672,6 @@ final class DownloadCenter {
 
         let attempts = directRetryAttempts[item.id] ?? 0
         resetDirectRetryState(for: item.id)
-        item.resumeData = failure.recoverableBytes == nil ? failure.resumeData : nil
         let finalError: String
         if failure.isRetryable, attempts == DirectDownloadRetryPolicy.delays.count {
             finalError = String(
@@ -4692,8 +4687,7 @@ final class DownloadCenter {
             finalError = failure.message
         }
 
-        if failure.resumeData == nil,
-           (failure.recoverableBytes ?? 0) == 0,
+        if (failure.recoverableBytes ?? 0) == 0,
            hadReportedProgress {
             item.lastError = String(
                 format: String(
@@ -4719,9 +4713,7 @@ final class DownloadCenter {
         let delaySeconds = delay.components.seconds
         let maximumAttempts = DirectDownloadRetryPolicy.delays.count
 
-        if failure.wasResuming,
-           failure.resumeData == nil,
-           failure.recoverableBytes == nil {
+        if failure.wasResuming, failure.recoverableBytes == nil {
             return String(
                 format: String(
                     localized: "download.direct.retryCannotResume",
@@ -4734,8 +4726,7 @@ final class DownloadCenter {
             )
         }
 
-        if failure.resumeData == nil,
-           (failure.recoverableBytes ?? 0) == 0,
+        if (failure.recoverableBytes ?? 0) == 0,
            hadProgress {
             return String(
                 format: String(
@@ -5560,8 +5551,7 @@ final class DownloadCenter {
                 didStoreRecovery = true
             } else if let directResult,
                       directResult.attemptIdentifier == attemptIdentifier,
-                      directResult.resumeData != nil
-                        || directResult.ownedRecovery != nil
+                      directResult.ownedRecovery != nil
                         || directResult.recoveryUnavailableMessage != nil {
                 self.storeURLSessionPauseResult(directResult, for: item)
                 didStoreRecovery = true
@@ -5579,7 +5569,6 @@ final class DownloadCenter {
                     self.storeURLSessionPauseResult(
                         DirectDownloadPauseResult(
                             attemptIdentifier: attemptIdentifier,
-                            resumeData: nil,
                             ownedRecovery: nil
                         ),
                         for: item
@@ -5640,16 +5629,12 @@ final class DownloadCenter {
         _ result: DirectDownloadPauseResult,
         for item: DownloadItem
     ) {
-        item.resumeData = result.resumeData
-
         if let message = result.recoveryUnavailableMessage {
-            item.resumeData = nil
             item.lastError = directRecoveryUnavailableMessage(message)
             return
         }
 
         if let recovery = result.ownedRecovery {
-            item.resumeData = nil
             item.bytesWritten = recovery.bytesWritten
             item.expectedBytes = recovery.metadata.expectedBytes
             if item.expectedBytes > 0 {
@@ -5658,10 +5643,6 @@ final class DownloadCenter {
                     1
                 )
             }
-            return
-        }
-
-        guard result.resumeData == nil else {
             return
         }
 
@@ -5710,24 +5691,11 @@ final class DownloadCenter {
             storeURLSessionPauseResult(
                 DirectDownloadPauseResult(
                     attemptIdentifier: directAttemptStates[item.id]?.identifier,
-                    resumeData: ownedRecovery == nil && unavailableMessage == nil
-                        ? failure.resumeData
-                        : nil,
                     ownedRecovery: ownedRecovery,
                     recoveryUnavailableMessage: unavailableMessage
                 ),
                 for: item
             )
-            if let resumeData = failure.resumeData,
-               ownedRecovery == nil,
-               unavailableMessage == nil,
-               let bytesWritten = DownloadCoordinator.legacyResumeByteCount(from: resumeData) {
-                item.bytesWritten = bytesWritten
-                item.expectedBytes = max(item.expectedBytes, bytesWritten)
-                item.progress = item.expectedBytes > 0
-                    ? min(Double(bytesWritten) / Double(item.expectedBytes), 1)
-                    : 0
-            }
             item.lastError = unavailableMessage.map(directRecoveryUnavailableMessage)
                 ?? failure.message
         }
@@ -6393,7 +6361,6 @@ final class DownloadCenter {
             id,
             attemptIdentifier,
             taskIdentifier,
-            usesOwnedPartial,
             ownedRecovery,
             resetReason
         ):
@@ -6404,22 +6371,20 @@ final class DownloadCenter {
 
             item.taskIdentifier = taskIdentifier
             setStatus(for: item, to: .downloading)
-            if usesOwnedPartial {
-                item.bytesWritten = ownedRecovery?.bytesWritten ?? 0
-                if let recoveryExpectedBytes = ownedRecovery?.metadata.expectedBytes,
-                   recoveryExpectedBytes > 0 {
-                    item.expectedBytes = recoveryExpectedBytes
-                } else if ownedRecovery == nil {
-                    item.expectedBytes = 0
-                }
-                if item.expectedBytes > 0 {
-                    item.progress = min(
-                        Double(item.bytesWritten) / Double(item.expectedBytes),
-                        1
-                    )
-                } else if item.bytesWritten == 0 {
-                    item.progress = 0
-                }
+            item.bytesWritten = ownedRecovery?.bytesWritten ?? 0
+            if let recoveryExpectedBytes = ownedRecovery?.metadata.expectedBytes,
+               recoveryExpectedBytes > 0 {
+                item.expectedBytes = recoveryExpectedBytes
+            } else if ownedRecovery == nil {
+                item.expectedBytes = 0
+            }
+            if item.expectedBytes > 0 {
+                item.progress = min(
+                    Double(item.bytesWritten) / Double(item.expectedBytes),
+                    1
+                )
+            } else if item.bytesWritten == 0 {
+                item.progress = 0
             }
             item.lastError = resetReason.map { directRecoveryResetMessage(for: $0) }
             item.updatedAt = .now
@@ -6523,7 +6488,6 @@ final class DownloadCenter {
                 item.expectedBytes = expectedBytes
             }
             item.lastError = nil
-            item.resumeData = nil
             item.browserResumeData = nil
             item.speedBytesPerSecond = 0
             item.uploadBytesPerSecond = 0
@@ -6652,7 +6616,6 @@ final class DownloadCenter {
         clearActiveBrowserSession(matching: id, attemptIdentifier: attemptIdentifier)
         directAttemptStates.removeValue(forKey: id)
         item.taskIdentifier = nil
-        item.resumeData = nil
         item.browserResumeData = nil
         item.speedBytesPerSecond = 0
         item.uploadBytesPerSecond = 0
@@ -7360,7 +7323,6 @@ final class DownloadCenter {
         item.speedBytesPerSecond = 0
         item.uploadBytesPerSecond = 0
         item.lastError = message
-        item.resumeData = nil
         item.updatedAt = .now
     }
 

@@ -30,89 +30,6 @@ extension HarborModelAndSafetyTests {
         XCTAssertFalse(DirectDownloadRetryPolicy.isRetryable(nil))
     }
 
-    func testLegacyResumeHTTPFailuresReachTransientStatusRetryPolicy() throws {
-        let transientFailure = try XCTUnwrap(
-            DownloadCoordinator.legacyDownloadHTTPFailure(
-                statusCode: 503,
-                startedFromResumeData: true
-            )
-        )
-        XCTAssertEqual(transientFailure.httpStatusCode, 503)
-        XCTAssertTrue(transientFailure.isRetryable)
-        XCTAssertTrue(transientFailure.requiresFreshStart)
-
-        let permanentFailure = try XCTUnwrap(
-            DownloadCoordinator.legacyDownloadHTTPFailure(
-                statusCode: 403,
-                startedFromResumeData: true
-            )
-        )
-        XCTAssertEqual(permanentFailure.httpStatusCode, 403)
-        XCTAssertFalse(permanentFailure.isRetryable)
-
-        XCTAssertNil(
-            DownloadCoordinator.legacyDownloadHTTPFailure(
-                statusCode: 200,
-                startedFromResumeData: true
-            )
-        )
-    }
-
-    func testLegacyRangeCompletionMustMatchSavedResumeOffset() throws {
-        let sourceURL = try XCTUnwrap(URL(string: "https://example.test/archive.bin"))
-        let response = try XCTUnwrap(
-            HTTPURLResponse(
-                url: sourceURL,
-                statusCode: 206,
-                httpVersion: "HTTP/1.1",
-                headerFields: [
-                    "Content-Range": "bytes 5-9/10",
-                    "Content-Length": "5",
-                    "Content-Encoding": "identity",
-                    "ETag": "\"archive-v1\""
-                ]
-            )
-        )
-
-        XCTAssertEqual(
-            try DownloadHTTPResponseValidator.validatedCompletedByteCount(
-                response: response,
-                actualBytes: 10,
-                startedFromResumeData: true,
-                resumeOffset: 5,
-                resumeValidator: "\"archive-v1\""
-            ),
-            10
-        )
-        XCTAssertThrowsError(
-            try DownloadHTTPResponseValidator.validatedCompletedByteCount(
-                response: response,
-                actualBytes: 10,
-                startedFromResumeData: true,
-                resumeOffset: 4,
-                resumeValidator: "\"archive-v1\""
-            )
-        )
-        XCTAssertThrowsError(
-            try DownloadHTTPResponseValidator.validatedCompletedByteCount(
-                response: response,
-                actualBytes: 10,
-                startedFromResumeData: true,
-                resumeOffset: nil,
-                resumeValidator: "\"archive-v1\""
-            )
-        )
-        XCTAssertThrowsError(
-            try DownloadHTTPResponseValidator.validatedCompletedByteCount(
-                response: response,
-                actualBytes: 10,
-                startedFromResumeData: true,
-                resumeOffset: 5,
-                resumeValidator: nil
-            )
-        )
-    }
-
     func testKnownZeroContentLengthRejectsUnexpectedResponseBody() throws {
         let sourceURL = try XCTUnwrap(URL(string: "https://example.test/empty.bin"))
         let response = try XCTUnwrap(
@@ -128,20 +45,18 @@ extension HarborModelAndSafetyTests {
         )
 
         XCTAssertEqual(
-            try DownloadHTTPResponseValidator.validatedCompletedByteCount(
+            try DownloadHTTPResponseValidator.validatedBrowserCompletedByteCount(
                 response: response,
                 actualBytes: 0,
-                startedFromResumeData: false,
-                resumeOffset: nil
+                isResumeAttempt: false
             ),
             0
         )
         XCTAssertThrowsError(
-            try DownloadHTTPResponseValidator.validatedCompletedByteCount(
+            try DownloadHTTPResponseValidator.validatedBrowserCompletedByteCount(
                 response: response,
                 actualBytes: 1,
-                startedFromResumeData: false,
-                resumeOffset: nil
+                isResumeAttempt: false
             )
         )
     }
@@ -189,7 +104,7 @@ extension HarborModelAndSafetyTests {
         let sourceURL = try XCTUnwrap(
             URL(string: "https://known-zero.example.test/archive.bin")
         )
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [firstFailure], timeout: 2)
 
         let failure = try XCTUnwrap(eventState.firstFailure)
@@ -199,7 +114,7 @@ extension HarborModelAndSafetyTests {
         XCTAssertNil(coordinator.recoverySnapshot(id: id, sourceURL: sourceURL))
         XCTAssertNil(eventState.completedURL)
 
-        try coordinator.startDownload(id: id, sourceURL: sourceURL, resumeData: nil)
+        try coordinator.startDownload(id: id, sourceURL: sourceURL)
         await fulfillment(of: [completion], timeout: 2)
 
         let completedURL = try XCTUnwrap(eventState.completedURL)

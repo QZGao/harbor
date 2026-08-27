@@ -92,59 +92,6 @@ enum DownloadHTTPResponseValidator {
         return total
     }
 
-    nonisolated static func validatedCompletedByteCount(
-        response: HTTPURLResponse,
-        actualBytes: Int64,
-        startedFromResumeData: Bool,
-        resumeOffset: Int64?,
-        resumeValidator: String? = nil
-    ) throws -> Int64 {
-        guard actualBytes >= 0 else {
-            throw URLError(.badServerResponse)
-        }
-        guard usesIdentityEncoding(response) else {
-            throw URLError(.cannotDecodeContentData)
-        }
-        guard (200 ... 299).contains(response.statusCode) else {
-            throw HTTPDownloadStatusError(statusCode: response.statusCode)
-        }
-
-        if response.statusCode == 206 {
-            let range = try validatedPartialContentRange(response)
-            guard startedFromResumeData,
-                  let resumeOffset,
-                  let resumeValidator,
-                  range.start == resumeOffset,
-                  let total = range.total,
-                  range.start > 0,
-                  range.end == total - 1,
-                  total == actualBytes,
-                  responseValidator(response, matching: resumeValidator) else {
-                throw HTTPDownloadIncompleteResponseError(
-                    actualBytes: actualBytes,
-                    expectedBytes: contentRange(
-                        from: response.value(forHTTPHeaderField: "Content-Range")
-                    )?.total
-                )
-            }
-            return total
-        }
-
-        guard response.statusCode == 200,
-              response.value(forHTTPHeaderField: "Content-Range") == nil else {
-            throw URLError(.badServerResponse)
-        }
-        let expectedBytes = try declaredContentLength(response)
-            ?? (response.expectedContentLength >= 0 ? response.expectedContentLength : nil)
-        if let expectedBytes, expectedBytes != actualBytes {
-            throw HTTPDownloadIncompleteResponseError(
-                actualBytes: actualBytes,
-                expectedBytes: expectedBytes
-            )
-        }
-        return actualBytes
-    }
-
     nonisolated static func validatedBrowserCompletedByteCount(
         response: HTTPURLResponse,
         actualBytes: Int64,
@@ -164,12 +111,28 @@ enum DownloadHTTPResponseValidator {
             }
             return total
         }
-        return try validatedCompletedByteCount(
-            response: response,
-            actualBytes: actualBytes,
-            startedFromResumeData: false,
-            resumeOffset: nil
-        )
+        guard actualBytes >= 0 else {
+            throw URLError(.badServerResponse)
+        }
+        guard usesIdentityEncoding(response) else {
+            throw URLError(.cannotDecodeContentData)
+        }
+        guard (200 ... 299).contains(response.statusCode) else {
+            throw HTTPDownloadStatusError(statusCode: response.statusCode)
+        }
+        guard response.statusCode == 200,
+              response.value(forHTTPHeaderField: "Content-Range") == nil else {
+            throw URLError(.badServerResponse)
+        }
+        let expectedBytes = try declaredContentLength(response)
+            ?? (response.expectedContentLength >= 0 ? response.expectedContentLength : nil)
+        if let expectedBytes, expectedBytes != actualBytes {
+            throw HTTPDownloadIncompleteResponseError(
+                actualBytes: actualBytes,
+                expectedBytes: expectedBytes
+            )
+        }
+        return actualBytes
     }
 
     nonisolated static func validatedPartialContentRange(

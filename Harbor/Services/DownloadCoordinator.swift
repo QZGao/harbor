@@ -70,18 +70,15 @@ struct DirectDownloadFailure: Sendable {
 
 struct DirectDownloadPauseResult: Sendable {
     let attemptIdentifier: UUID?
-    let resumeData: Data?
     let ownedRecovery: DirectDownloadRecoverySnapshot?
     let recoveryUnavailableMessage: String?
 
     nonisolated init(
         attemptIdentifier: UUID?,
-        resumeData: Data?,
         ownedRecovery: DirectDownloadRecoverySnapshot?,
         recoveryUnavailableMessage: String? = nil
     ) {
         self.attemptIdentifier = attemptIdentifier
-        self.resumeData = resumeData
         self.ownedRecovery = ownedRecovery
         self.recoveryUnavailableMessage = recoveryUnavailableMessage
     }
@@ -160,7 +157,6 @@ enum DownloadEvent: Sendable {
         id: UUID,
         attemptIdentifier: UUID,
         taskIdentifier: Int,
-        usesOwnedPartial: Bool,
         ownedRecovery: DirectDownloadRecoverySnapshot?,
         resetReason: DirectDownloadRecoveryResetReason?
     )
@@ -206,15 +202,6 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         var fileHandle: FileHandle?
     }
 
-    private enum TaskMode {
-        case legacyDownload(
-            startedFromResumeData: Bool,
-            resumeOffset: Int64?,
-            resumeValidator: String?
-        )
-        case ownedPartial(OwnedPartialState)
-    }
-
     private enum OwnedResponseDisposition {
         case receiveBody(resetReason: DirectDownloadRecoveryResetReason?)
         case finishExistingPartial
@@ -237,7 +224,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         let sourceURL: URL
         let session: URLSession
         let task: URLSessionTask
-        var mode: TaskMode
+        var state: OwnedPartialState
         var speedLimitOverride: TransferLimitOverride
         var transferSample: TransferSample
         var isThrottled = false
@@ -343,7 +330,6 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         id: UUID,
         attemptIdentifier: UUID = UUID(),
         sourceURL: URL,
-        resumeData: Data?,
         speedLimitOverride: TransferLimitOverride = .inherit
     ) throws -> Int {
         guard stateLock.withLock({
@@ -371,47 +357,15 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
                 session.invalidateAndCancel()
             }
         }
-        let task: URLSessionTask
-        let mode: TaskMode
-        let ownedRecovery: DirectDownloadRecoverySnapshot?
-        let resetReason: DirectDownloadRecoveryResetReason?
-
-        if let resumeData {
-            task = session.downloadTask(withResumeData: resumeData)
-            mode = .legacyDownload(
-                startedFromResumeData: true,
-                resumeOffset: Self.legacyResumeByteCount(from: resumeData),
-                resumeValidator: Self.legacyResumeValidator(from: resumeData)
-            )
-            ownedRecovery = nil
-            resetReason = nil
-        } else {
-            let preparation = try recoveryStore.prepareStart(id: id, sourceURL: sourceURL)
-            let request = makeOwnedRequest(
+        let preparation = try recoveryStore.prepareStart(id: id, sourceURL: sourceURL)
+        let task = session.dataTask(
+            with: DirectDownloadResponsePolicy.request(
                 sourceURL: sourceURL,
                 recovery: preparation.snapshot
             )
-            task = session.dataTask(with: request)
-            let recoveredBytes = preparation.snapshot?.bytesWritten ?? 0
-            mode = .ownedPartial(
-                OwnedPartialState(
-                    sourceURL: sourceURL,
-                    resumeOffset: recoveredBytes,
-                    bytesWritten: recoveredBytes,
-                    expectedBytes: preparation.snapshot?.metadata.expectedBytes ?? 0,
-                    declaredExpectedBytes: nil,
-                    suggestedFilename: preparation.snapshot?.metadata.suggestedFilename,
-                    responseMimeType: preparation.snapshot?.metadata.mimeType,
-                    statusCode: nil,
-                    responseRangeEnd: nil,
-                    entityTag: preparation.snapshot?.metadata.entityTag,
-                    lastModified: preparation.snapshot?.metadata.lastModified,
-                    fileHandle: nil
-                )
-            )
-            ownedRecovery = preparation.snapshot
-            resetReason = preparation.resetReason
-        }
+        )
+        let ownedRecovery = preparation.snapshot
+        let recoveredBytes = ownedRecovery?.bytesWritten ?? 0
 
         let key = makeTaskKey(session: session, taskIdentifier: task.taskIdentifier)
         let context = TaskContext(
@@ -420,7 +374,20 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
             sourceURL: sourceURL,
             session: session,
             task: task,
-            mode: mode,
+            state: OwnedPartialState(
+                sourceURL: sourceURL,
+                resumeOffset: recoveredBytes,
+                bytesWritten: recoveredBytes,
+                expectedBytes: ownedRecovery?.metadata.expectedBytes ?? 0,
+                declaredExpectedBytes: nil,
+                suggestedFilename: ownedRecovery?.metadata.suggestedFilename,
+                responseMimeType: ownedRecovery?.metadata.mimeType,
+                statusCode: nil,
+                responseRangeEnd: nil,
+                entityTag: ownedRecovery?.metadata.entityTag,
+                lastModified: ownedRecovery?.metadata.lastModified,
+                fileHandle: nil
+            ),
             speedLimitOverride: speedLimitOverride,
             transferSample: TransferSample(
                 lastTotalBytesWritten: ownedRecovery?.bytesWritten ?? 0,
@@ -443,9 +410,8 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
                 id: id,
                 attemptIdentifier: attemptIdentifier,
                 taskIdentifier: task.taskIdentifier,
-                usesOwnedPartial: resumeData == nil,
                 ownedRecovery: ownedRecovery,
-                resetReason: resetReason
+                resetReason: preparation.resetReason
             )
         )
         // Publish ownership before the task can produce response/progress
@@ -455,68 +421,33 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         return task.taskIdentifier
     }
 
-    /// Stops an active task and returns the resume data only after URLSession has produced it.
-    ///
-    /// Pause and shutdown paths await this form so persistence cannot race the
-    /// asynchronous `cancel(byProducingResumeData:)` callback.
     func pauseDownloadAndWait(id: UUID) async -> DirectDownloadPauseResult {
         guard let context = takeContext(forDownloadID: id, suppressCompletion: true) else {
             return await waitForCompletionPublication(id: id)
         }
 
-        switch context.mode {
-        case .legacyDownload:
-            guard let downloadTask = context.task as? URLSessionDownloadTask else {
-                context.task.cancel()
-                context.session.finishTasksAndInvalidate()
-                return DirectDownloadPauseResult(
-                    attemptIdentifier: context.attemptIdentifier,
-                    resumeData: nil,
-                    ownedRecovery: nil
-                )
-            }
-
-            return await withCheckedContinuation { continuation in
-                downloadTask.cancel(byProducingResumeData: { [session = context.session] resumeData in
-                    session.finishTasksAndInvalidate()
-                    continuation.resume(
-                        returning: DirectDownloadPauseResult(
-                            attemptIdentifier: context.attemptIdentifier,
-                            resumeData: resumeData,
-                            ownedRecovery: nil
-                        )
-                    )
-                })
-            }
-
-        case let .ownedPartial(state):
-            let didPreserveRecovery = closeOwnedFile(
-                in: context,
-                preservingRecovery: true
-            )
-            context.task.cancel()
-            context.session.finishTasksAndInvalidate()
-            let lookup = didPreserveRecovery
-                ? recoveryStore.lookup(id: id, sourceURL: state.sourceURL)
-                : .absent
-            let ownedRecovery: DirectDownloadRecoverySnapshot?
-            let unavailableMessage: String?
-            switch lookup {
-            case let .available(snapshot):
-                ownedRecovery = snapshot
-                unavailableMessage = nil
-            case .absent:
-                ownedRecovery = nil
-                unavailableMessage = nil
-            case let .unavailable(message):
-                ownedRecovery = nil
-                unavailableMessage = message
-            }
+        let didPreserveRecovery = closeOwnedFile(in: context, preservingRecovery: true)
+        context.task.cancel()
+        context.session.finishTasksAndInvalidate()
+        let lookup = didPreserveRecovery
+            ? recoveryStore.lookup(id: id, sourceURL: context.state.sourceURL)
+            : .absent
+        switch lookup {
+        case let .available(snapshot):
             return DirectDownloadPauseResult(
                 attemptIdentifier: context.attemptIdentifier,
-                resumeData: nil,
-                ownedRecovery: ownedRecovery,
-                recoveryUnavailableMessage: unavailableMessage
+                ownedRecovery: snapshot
+            )
+        case .absent:
+            return DirectDownloadPauseResult(
+                attemptIdentifier: context.attemptIdentifier,
+                ownedRecovery: nil
+            )
+        case let .unavailable(message):
+            return DirectDownloadPauseResult(
+                attemptIdentifier: context.attemptIdentifier,
+                ownedRecovery: nil,
+                recoveryUnavailableMessage: message
             )
         }
     }
@@ -538,10 +469,6 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         context.task.cancel()
         context.session.invalidateAndCancel()
         recoveryStore.discard(id: id)
-    }
-
-    func discardRecoveryData(id: UUID) {
-        try? discardRecoveryDataOrThrow(id: id)
     }
 
     func discardRecoveryDataOrThrow(id: UUID) throws {
@@ -600,6 +527,23 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         recoveryStore.lookup(id: id, sourceURL: sourceURL)
     }
 
+    /// Startup-only forwarding into the recovery store's compatibility importer.
+    /// Active direct downloads never consume opaque resume data; after startup,
+    /// the coordinator operates exclusively on Harbor-owned recovery state.
+    func adoptResumeData(
+        _ data: Data,
+        id: UUID,
+        sourceURL: URL,
+        expectedBytes: Int64
+    ) {
+        recoveryStore.adoptResumeData(
+            data,
+            id: id,
+            sourceURL: sourceURL,
+            expectedBytes: expectedBytes
+        )
+    }
+
     private func takeContext(forDownloadID id: UUID, suppressCompletion: Bool) -> TaskContext? {
         stateLock.withLock {
             guard let taskKey = taskKeysByDownloadID.removeValue(forKey: id),
@@ -611,19 +555,6 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
                 suppressedCompletionTaskKeys.insert(taskKey)
             }
 
-            return context
-        }
-    }
-
-    private func takeContext(forTaskKey taskKey: TaskKey) -> TaskContext? {
-        stateLock.withLock {
-            guard let context = contexts.removeValue(forKey: taskKey) else {
-                return nil
-            }
-
-            if taskKeysByDownloadID[context.downloadID] == taskKey {
-                taskKeysByDownloadID.removeValue(forKey: context.downloadID)
-            }
             return context
         }
     }
@@ -646,13 +577,11 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
 
     private func finishCompletionPublication(
         context: TaskContext,
-        resumeData: Data? = nil,
         ownedRecovery: DirectDownloadRecoverySnapshot? = nil,
         recoveryUnavailableMessage: String?
     ) {
         let result = DirectDownloadPauseResult(
             attemptIdentifier: context.attemptIdentifier,
-            resumeData: resumeData,
             ownedRecovery: ownedRecovery,
             recoveryUnavailableMessage: recoveryUnavailableMessage
         )
@@ -672,31 +601,26 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         for context: TaskContext,
         didPreserveRecovery: Bool
     ) -> DirectDownloadPauseResult {
-        guard case let .ownedPartial(state) = context.mode,
-              didPreserveRecovery else {
+        guard didPreserveRecovery else {
             return DirectDownloadPauseResult(
                 attemptIdentifier: context.attemptIdentifier,
-                resumeData: nil,
                 ownedRecovery: nil
             )
         }
-        switch recoveryStore.lookup(id: context.downloadID, sourceURL: state.sourceURL) {
+        switch recoveryStore.lookup(id: context.downloadID, sourceURL: context.state.sourceURL) {
         case let .available(snapshot):
             return DirectDownloadPauseResult(
                 attemptIdentifier: context.attemptIdentifier,
-                resumeData: nil,
                 ownedRecovery: snapshot
             )
         case .absent:
             return DirectDownloadPauseResult(
                 attemptIdentifier: context.attemptIdentifier,
-                resumeData: nil,
                 ownedRecovery: nil
             )
         case let .unavailable(message):
             return DirectDownloadPauseResult(
                 attemptIdentifier: context.attemptIdentifier,
-                resumeData: nil,
                 ownedRecovery: nil,
                 recoveryUnavailableMessage: message
             )
@@ -729,7 +653,6 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
                 continuation.resume(
                     returning: DirectDownloadPauseResult(
                         attemptIdentifier: nil,
-                        resumeData: nil,
                         ownedRecovery: nil
                     )
                 )
@@ -761,7 +684,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         }
     }
 
-    private func shouldIgnoreCompletion(taskKey: TaskKey, error: NSError) -> Bool {
+    private func shouldIgnoreCompletion(taskKey: TaskKey) -> Bool {
         stateLock.withLock {
             suppressedCompletionTaskKeys.remove(taskKey) != nil
         }
@@ -789,16 +712,6 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
 
     private func makeTaskKey(session: URLSession, taskIdentifier: Int) -> TaskKey {
         "\(ObjectIdentifier(session))-\(taskIdentifier)"
-    }
-
-    private func makeOwnedRequest(
-        sourceURL: URL,
-        recovery: DirectDownloadRecoverySnapshot?
-    ) -> URLRequest {
-        DirectDownloadResponsePolicy.request(
-            sourceURL: sourceURL,
-            recovery: recovery
-        )
     }
 
     private func recoveryMetadata(
@@ -917,90 +830,12 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
         }
     }
 
-    nonisolated static func legacyDownloadHTTPFailure(
-        statusCode: Int?,
-        startedFromResumeData: Bool
-    ) -> DirectDownloadFailure? {
-        guard let statusCode, (200 ... 299).contains(statusCode) == false else {
-            return nil
-        }
-
-        return DirectDownloadFailure(
-            error: HTTPDownloadStatusError(statusCode: statusCode),
-            resumeData: nil,
-            wasResuming: startedFromResumeData,
-            httpStatusCode: statusCode
-        )
-    }
-
-    nonisolated static func legacyResumeByteCount(from resumeData: Data) -> Int64? {
-        guard let propertyList = try? PropertyListSerialization.propertyList(
-            from: resumeData,
-            options: [],
-            format: nil
-        ),
-        let dictionary = propertyList as? [String: Any] else {
-            return nil
-        }
-
-        let keys = [
-            "NSURLSessionResumeBytesReceived",
-            "NSURLSessionResumeInfoBytesReceived"
-        ]
-        for key in keys {
-            if let number = dictionary[key] as? NSNumber,
-               number.int64Value >= 0 {
-                return number.int64Value
-            }
-            if let text = dictionary[key] as? String,
-               let value = Int64(text), value >= 0 {
-                return value
-            }
-        }
-        return nil
-    }
-
-    nonisolated static func legacyResumeValidator(from resumeData: Data) -> String? {
-        guard let propertyList = try? PropertyListSerialization.propertyList(
-            from: resumeData,
-            options: [],
-            format: nil
-        ), let dictionary = propertyList as? [String: Any] else {
-            return nil
-        }
-
-        for key in ["NSURLSessionResumeEntityTag", "NSURLSessionResumeInfoEntityTag"] {
-            guard let raw = dictionary[key] as? String else {
-                continue
-            }
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if value.isEmpty == false,
-               value.uppercased().hasPrefix("W/") == false,
-               value.first == "\"",
-               value.last == "\"" {
-                return value
-            }
-        }
-        for key in ["NSURLSessionResumeLastModified", "NSURLSessionResumeInfoLastModified"] {
-            if let raw = dictionary[key] as? String {
-                let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                if value.isEmpty == false {
-                    return value
-                }
-            }
-        }
-        return nil
-    }
-
     @discardableResult
     private func closeOwnedFile(
         in context: TaskContext,
         preservingRecovery: Bool
     ) -> Bool {
-        guard case let .ownedPartial(state) = context.mode else {
-            return true
-        }
-        guard let fileHandle = state.fileHandle else {
+        guard let fileHandle = context.state.fileHandle else {
             return true
         }
 
@@ -1020,8 +855,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
     }
 
     private func sealOwnedFile(in context: TaskContext) throws {
-        guard case let .ownedPartial(state) = context.mode,
-              let fileHandle = state.fileHandle else {
+        guard let fileHandle = context.state.fileHandle else {
             return
         }
         do {
@@ -1035,13 +869,9 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
     }
 
     private func recoverableOwnedByteCount(in context: TaskContext) -> Int64? {
-        guard case let .ownedPartial(state) = context.mode else {
-            return nil
-        }
-
         switch recoveryStore.lookup(
             id: context.downloadID,
-            sourceURL: state.sourceURL
+            sourceURL: context.state.sourceURL
         ) {
         case let .available(snapshot):
             return snapshot.bytesWritten
@@ -1051,7 +881,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
             // The file handle was synchronized before this lookup. Preserve
             // the last byte count instead of converting a transient lookup
             // failure into a destructive fresh retry.
-            return state.bytesWritten > 0 ? state.bytesWritten : nil
+            return context.state.bytesWritten > 0 ? context.state.bytesWritten : nil
         }
     }
 
@@ -1079,38 +909,6 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
                 )
             )
         }
-    }
-
-    private func claimLegacyDownload(
-        at location: URL,
-        context: TaskContext,
-        response: HTTPURLResponse,
-        startedFromResumeData: Bool,
-        resumeOffset: Int64?,
-        resumeValidator: String?
-    ) throws -> CompletedDownloadHandoffClaim {
-        let actualBytes = try fileSize(at: location)
-        let expectedBytes = try DownloadHTTPResponseValidator.validatedCompletedByteCount(
-            response: response,
-            actualBytes: actualBytes,
-            startedFromResumeData: startedFromResumeData,
-            resumeOffset: resumeOffset,
-            resumeValidator: resumeValidator
-        )
-        return try completedHandoffStore.claim(
-            payloadAt: location,
-            manifest: CompletedDownloadHandoffManifest(
-                downloadID: context.downloadID,
-                attemptIdentifier: context.attemptIdentifier,
-                owner: .direct,
-                sourceURL: context.sourceURL,
-                statusCode: response.statusCode,
-                mimeType: response.mimeType,
-                suggestedFilename: response.suggestedFilename,
-                actualBytes: actualBytes,
-                expectedBytes: expectedBytes
-            )
-        )
     }
 
     private func finalizeCompletionClaim(
@@ -1285,62 +1083,7 @@ final class DownloadCoordinator: NSObject, @unchecked Sendable {
 
 }
 
-extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegate, URLSessionTaskDelegate {
-    func urlSession(
-        _ session: URLSession,
-        downloadTask: URLSessionDownloadTask,
-        didWriteData bytesWritten: Int64,
-        totalBytesWritten: Int64,
-        totalBytesExpectedToWrite: Int64
-    ) {
-        if let statusCode = (downloadTask.response as? HTTPURLResponse)?.statusCode,
-           (200 ... 299).contains(statusCode) == false {
-            return
-        }
-
-        let taskKey = makeTaskKey(session: session, taskIdentifier: downloadTask.taskIdentifier)
-        var throttleDelay: TimeInterval?
-
-        guard let context = updateContext(for: taskKey, { context in
-            let now = Date()
-            let elapsed = now.timeIntervalSince(context.transferSample.sampleDate)
-            guard elapsed >= 0.35 else {
-                return
-            }
-
-            let deltaBytes = totalBytesWritten - context.transferSample.lastTotalBytesWritten
-            let speed = elapsed > 0 ? Double(deltaBytes) / elapsed : context.transferSample.speedBytesPerSecond
-            throttleDelay = Self.throttleDelay(
-                deltaBytes: deltaBytes,
-                elapsed: elapsed,
-                activeTransferCount: contexts.count,
-                transferSettings: transferSettings,
-                speedLimitOverride: context.speedLimitOverride
-            )
-            context.transferSample = TransferSample(
-                lastTotalBytesWritten: totalBytesWritten,
-                sampleDate: now,
-                speedBytesPerSecond: speed
-            )
-        }) else {
-            return
-        }
-
-        eventHandler(
-            .progress(
-                id: context.downloadID,
-                attemptIdentifier: context.attemptIdentifier,
-                bytesWritten: totalBytesWritten,
-                expectedBytes: totalBytesExpectedToWrite,
-                speedBytesPerSecond: context.transferSample.speedBytesPerSecond
-            )
-        )
-
-        if let throttleDelay {
-            suspendForThrottle(taskKey: taskKey, delay: throttleDelay)
-        }
-    }
-
+extension DownloadCoordinator: URLSessionDataDelegate {
     func urlSession(
         _ session: URLSession,
         dataTask: URLSessionDataTask,
@@ -1349,14 +1092,8 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
     ) {
         let taskKey = makeTaskKey(session: session, taskIdentifier: dataTask.taskIdentifier)
         guard let handledResponse = mutateContext(for: taskKey, { context in
-            guard case var .ownedPartial(state) = context.mode else {
-                return OwnedResponseDisposition.reject(
-                    error: URLError(.badServerResponse),
-                    statusCode: nil,
-                    wasResuming: false,
-                    requiresFreshStart: false
-                )
-            }
+            var state = context.state
+            defer { context.state = state }
             guard let httpResponse = response as? HTTPURLResponse else {
                 return OwnedResponseDisposition.reject(
                     error: URLError(.badServerResponse),
@@ -1367,7 +1104,6 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
             }
 
             let wasResuming = state.resumeOffset > 0
-            defer { context.mode = .ownedPartial(state) }
 
             let plan: DirectDownloadResponsePolicy.Plan
             do {
@@ -1436,15 +1172,12 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
 
             do {
                 try sealOwnedFile(in: context)
-                guard case let .ownedPartial(state) = context.mode else {
-                    throw URLError(.badServerResponse)
-                }
-                let claim = try claimOwnedPartial(context: context, state: state)
+                let claim = try claimOwnedPartial(context: context, state: context.state)
                 finalizeCompletionClaim(
                     claim,
                     context: context,
                     wasResuming: true,
-                    httpStatusCode: state.statusCode
+                    httpStatusCode: context.state.statusCode
                 )
                 return
             } catch {
@@ -1552,8 +1285,9 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
         )?
 
         guard let context = updateContext(for: taskKey, { context in
-            guard case var .ownedPartial(state) = context.mode,
-                  let fileHandle = state.fileHandle else {
+            var state = context.state
+            defer { context.state = state }
+            guard let fileHandle = state.fileHandle else {
                 writeError = CocoaError(.fileWriteUnknown)
                 return
             }
@@ -1596,7 +1330,6 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
                                     expectedBytes: absoluteByteLimit
                                 )
                             }
-                            context.mode = .ownedPartial(state)
                             return
                         }
                     }
@@ -1633,10 +1366,8 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
                     expectedBytes: state.expectedBytes,
                     speed: context.transferSample.speedBytesPerSecond
                 )
-                context.mode = .ownedPartial(state)
             } catch {
                 writeError = error
-                context.mode = .ownedPartial(state)
             }
         }) else {
             return
@@ -1659,12 +1390,6 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
             )
             failedContext.task.cancel()
             failedContext.session.finishTasksAndInvalidate()
-            let wasResuming: Bool
-            if case let .ownedPartial(state) = failedContext.mode {
-                wasResuming = state.resumeOffset > 0
-            } else {
-                wasResuming = false
-            }
             eventHandler(
                 .failed(
                     id: failedContext.downloadID,
@@ -1672,7 +1397,7 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
                     failure: DirectDownloadFailure(
                         error: writeError,
                         resumeData: nil,
-                        wasResuming: wasResuming,
+                        wasResuming: failedContext.state.resumeOffset > 0,
                         recoverableBytes: didPreserveRecovery
                             ? recoverableOwnedByteCount(in: failedContext)
                             : 0
@@ -1707,88 +1432,17 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
 
     func urlSession(
         _ session: URLSession,
-        downloadTask: URLSessionDownloadTask,
-        didFinishDownloadingTo location: URL
-    ) {
-        let taskKey = makeTaskKey(session: session, taskIdentifier: downloadTask.taskIdentifier)
-        guard let context = beginCompletionPublication(forTaskKey: taskKey) else {
-            return
-        }
-
-        let startedFromResumeData: Bool
-        let resumeOffset: Int64?
-        let resumeValidator: String?
-        if case let .legacyDownload(started, savedOffset, savedValidator) = context.mode {
-            startedFromResumeData = started
-            resumeOffset = savedOffset
-            resumeValidator = savedValidator
-        } else {
-            startedFromResumeData = false
-            resumeOffset = nil
-            resumeValidator = nil
-        }
-        let responseStatusCode = (downloadTask.response as? HTTPURLResponse)?.statusCode
-        do {
-            guard let response = downloadTask.response as? HTTPURLResponse else {
-                throw URLError(.badServerResponse)
-            }
-            let claim = try claimLegacyDownload(
-                at: location,
-                context: context,
-                response: response,
-                startedFromResumeData: startedFromResumeData,
-                resumeOffset: resumeOffset,
-                resumeValidator: resumeValidator
-            )
-
-            finalizeCompletionClaim(
-                claim,
-                context: context,
-                wasResuming: startedFromResumeData,
-                httpStatusCode: responseStatusCode
-            )
-            return
-        } catch {
-            var publicationFailureMessage: String?
-            if completedHandoffStore.ownsAttempt(
-                downloadID: context.downloadID,
-                attemptIdentifier: context.attemptIdentifier
-            ) {
-                publicationFailureMessage = error.localizedDescription
-            }
-            eventHandler(
-                .failed(
-                    id: context.downloadID,
-                    attemptIdentifier: context.attemptIdentifier,
-                    failure: DirectDownloadFailure(
-                        error: error,
-                        resumeData: nil,
-                        wasResuming: startedFromResumeData,
-                        httpStatusCode: responseStatusCode
-                    )
-                )
-            )
-            finishCompletionPublication(
-                context: context,
-                recoveryUnavailableMessage: publicationFailureMessage
-            )
-            context.session.finishTasksAndInvalidate()
-        }
-    }
-
-    func urlSession(
-        _ session: URLSession,
         task: URLSessionTask,
         willPerformHTTPRedirection response: HTTPURLResponse,
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
         let taskKey = makeTaskKey(session: session, taskIdentifier: task.taskIdentifier)
-        guard let context = stateLock.withLock({ contexts[taskKey] }),
-              case let .ownedPartial(state) = context.mode else {
+        guard let context = stateLock.withLock({ contexts[taskKey] }) else {
             completionHandler(request)
             return
         }
+        let state = context.state
 
         var redirectedRequest = request
         redirectedRequest.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
@@ -1818,7 +1472,7 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
         let taskKey = makeTaskKey(session: session, taskIdentifier: task.taskIdentifier)
         if let error {
             let nsError = error as NSError
-            if shouldIgnoreCompletion(taskKey: taskKey, error: nsError) {
+            if shouldIgnoreCompletion(taskKey: taskKey) {
                 return
             }
 
@@ -1830,29 +1484,10 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
                 in: context,
                 preservingRecovery: true
             )
-            let resumeData = nsError.userInfo[NSURLSessionDownloadTaskResumeData] as? Data
-            let wasResuming: Bool
-            let recoverableBytes: Int64?
-            let pauseResult: DirectDownloadPauseResult
-            switch context.mode {
-            case let .legacyDownload(startedFromResumeData, _, _):
-                wasResuming = startedFromResumeData
-                recoverableBytes = nil
-                pauseResult = DirectDownloadPauseResult(
-                    attemptIdentifier: context.attemptIdentifier,
-                    resumeData: resumeData,
-                    ownedRecovery: nil
-                )
-            case let .ownedPartial(state):
-                wasResuming = state.resumeOffset > 0
-                recoverableBytes = didPreserveRecovery
-                    ? recoverableOwnedByteCount(in: context)
-                    : 0
-                pauseResult = ownedPauseResult(
-                    for: context,
-                    didPreserveRecovery: didPreserveRecovery
-                )
-            }
+            let pauseResult = ownedPauseResult(
+                for: context,
+                didPreserveRecovery: didPreserveRecovery
+            )
 
             eventHandler(
                 .failed(
@@ -1860,15 +1495,16 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
                     attemptIdentifier: context.attemptIdentifier,
                     failure: DirectDownloadFailure(
                         error: nsError,
-                        resumeData: resumeData,
-                        wasResuming: wasResuming,
-                        recoverableBytes: recoverableBytes
+                        resumeData: nil,
+                        wasResuming: context.state.resumeOffset > 0,
+                        recoverableBytes: didPreserveRecovery
+                            ? recoverableOwnedByteCount(in: context)
+                            : 0
                     )
                 )
             )
             finishCompletionPublication(
                 context: context,
-                resumeData: pauseResult.resumeData,
                 ownedRecovery: pauseResult.ownedRecovery,
                 recoveryUnavailableMessage: pauseResult.recoveryUnavailableMessage
             )
@@ -1876,10 +1512,10 @@ extension DownloadCoordinator: URLSessionDataDelegate, URLSessionDownloadDelegat
             return
         }
 
-        guard let context = beginCompletionPublication(forTaskKey: taskKey),
-              case let .ownedPartial(state) = context.mode else {
+        guard let context = beginCompletionPublication(forTaskKey: taskKey) else {
             return
         }
+        let state = context.state
 
         do {
             try sealOwnedFile(in: context)
