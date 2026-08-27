@@ -275,7 +275,8 @@ final class HarborModelAndSafetyTests: XCTestCase {
             ffmpegURL: URL(fileURLWithPath: "/tmp/ffmpeg"),
             ffprobeURL: URL(fileURLWithPath: "/tmp/ffprobe")
         )
-        let sourceURL = try XCTUnwrap(URL(string: "https://example.com/video"))
+        let formatFixture = makeMediaFormatTestFixture()
+        let sourceURL = formatFixture.sourceURL
         let destinationURL = URL(fileURLWithPath: "/tmp/downloads", isDirectory: true)
         let temporaryURL = URL(fileURLWithPath: "/tmp/media", isDirectory: true)
         let completionReceiptURL = URL(
@@ -397,58 +398,13 @@ final class HarborModelAndSafetyTests: XCTestCase {
             "/tmp/media%%owned/final-paths.jsonl"
         )
 
-        let videoFormat = MediaDownloadFormatOption(
-            formatID: "137",
-            container: "mp4",
-            videoCodec: "avc1.640028",
-            audioCodec: nil,
-            width: 1_920,
-            height: 1_080,
-            framesPerSecond: 30,
-            dynamicRange: "SDR",
-            bitrateKbps: 4_500,
-            estimatedBytes: 9_000_000
-        )
-        let audioFormat = MediaDownloadFormatOption(
-            formatID: "140",
-            container: "m4a",
-            videoCodec: nil,
-            audioCodec: "mp4a.40.2",
-            width: nil,
-            height: nil,
-            framesPerSecond: nil,
-            dynamicRange: nil,
-            bitrateKbps: 128,
-            estimatedBytes: 1_000_000,
-            language: "en",
-            formatNote: "English (Original)",
-            audioChannels: 2,
-            languagePreference: 10
-        )
-        let metadata = MediaDownloadMetadata(
-            title: "Video",
-            platform: "Test",
-            extractorKey: "Test",
-            thumbnailURL: nil,
-            webpageURL: sourceURL,
-            expectedBytes: 10_000_000,
-            mediaType: .video,
-            entryCount: 1,
-            capabilities: MediaDownloadCapabilities(
-                formatOptions: [videoFormat, audioFormat]
-            )
-        )
-        let selection = MediaDownloadFormatSelection(
-            format: videoFormat,
-            audioFormat: audioFormat
-        )
         let selectedArguments = try MediaDownloadService.downloadArguments(
             runtime: runtime,
             sourceURL: sourceURL,
             destinationFolder: destinationURL,
             temporaryFolder: temporaryURL,
-            metadata: metadata.persistenceSnapshot,
-            formatPreference: .specific(selection),
+            metadata: formatFixture.metadata.persistenceSnapshot,
+            formatPreference: .specific(formatFixture.selection),
             completionReceiptURL: temporaryURL.appendingPathComponent("final-paths.jsonl"),
             speedLimitBytesPerSecond: 345_678
         )
@@ -464,13 +420,13 @@ final class HarborModelAndSafetyTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            selection.displaySummary,
+            formatFixture.selection.displaySummary,
             "1080p • MP4 • AVC1 + English (Original)"
         )
         XCTAssertEqual(
-            MediaDownloadFormatPreference.specific(selection)
+            MediaDownloadFormatPreference.specific(formatFixture.selection)
                 .initialExpectedBytes(metadataEstimate: 243_768_398),
-            selection.estimatedBytes
+            formatFixture.selection.estimatedBytes
         )
         XCTAssertEqual(
             MediaDownloadFormatPreference.bestAvailable
@@ -480,70 +436,25 @@ final class HarborModelAndSafetyTests: XCTestCase {
     }
 
     func testMediaRecordPersistsSelectionWithoutFormatCatalog() throws {
-        let sourceURL = try XCTUnwrap(URL(string: "https://example.com/video"))
-        let videoFormat = MediaDownloadFormatOption(
-            formatID: "137",
-            container: "mp4",
-            videoCodec: "avc1.640028",
-            audioCodec: nil,
-            width: 1_920,
-            height: 1_080,
-            framesPerSecond: 30,
-            dynamicRange: "SDR",
-            bitrateKbps: 4_500,
-            estimatedBytes: 9_000_000
-        )
-        let audioFormat = MediaDownloadFormatOption(
-            formatID: "140",
-            container: "m4a",
-            videoCodec: nil,
-            audioCodec: "mp4a.40.2",
-            width: nil,
-            height: nil,
-            framesPerSecond: nil,
-            dynamicRange: nil,
-            bitrateKbps: 128,
-            estimatedBytes: 1_000_000,
-            language: "en",
-            formatNote: "English (Original)",
-            audioChannels: 2,
-            languagePreference: 10
-        )
-        let metadata = MediaDownloadMetadata(
-            title: "Video",
-            platform: "Test",
-            extractorKey: "Test",
-            thumbnailURL: nil,
-            webpageURL: sourceURL,
-            expectedBytes: 10_000_000,
-            mediaType: .video,
-            entryCount: 1,
-            capabilities: MediaDownloadCapabilities(
-                formatOptions: [videoFormat, audioFormat]
-            )
-        )
-        let selection = MediaDownloadFormatSelection(
-            format: videoFormat,
-            audioFormat: audioFormat
-        )
+        let fixture = makeMediaFormatTestFixture()
         let item = DownloadItem(
-            sourceURL: sourceURL,
+            sourceURL: fixture.sourceURL,
             sourceKind: .mediaURL,
             backend: .ytDlp,
             preferredFilename: nil,
             destinationFolderPath: "/tmp/downloads",
             status: .paused,
-            mediaMetadata: metadata,
-            mediaFormatPreference: .specific(selection)
+            mediaMetadata: fixture.metadata,
+            mediaFormatPreference: .specific(fixture.selection)
         )
 
         let record = item.makeRecord()
 
         XCTAssertEqual(record.mediaMetadata?.capabilities, .unavailable)
-        XCTAssertEqual(record.mediaFormatPreference, .specific(selection))
+        XCTAssertEqual(record.mediaFormatPreference, .specific(fixture.selection))
         XCTAssertEqual(
             item.mediaMetadata?.capabilities.formatOptions,
-            [videoFormat, audioFormat]
+            [fixture.videoFormat, fixture.audioFormat]
         )
 
         let encodedRecord = try JSONEncoder().encode(record)

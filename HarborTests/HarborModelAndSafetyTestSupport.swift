@@ -2,6 +2,64 @@ import Foundation
 import XCTest
 @testable import Harbor
 
+nonisolated struct MediaFormatTestFixture {
+    let sourceURL: URL
+    let videoFormat: MediaDownloadFormatOption
+    let audioFormat: MediaDownloadFormatOption
+    let metadata: MediaDownloadMetadata
+    let selection: MediaDownloadFormatSelection
+}
+
+nonisolated func makeMediaFormatTestFixture() -> MediaFormatTestFixture {
+    let sourceURL = URL(string: "https://example.com/video")!
+    let videoFormat = MediaDownloadFormatOption(
+        formatID: "137",
+        container: "mp4",
+        videoCodec: "avc1.640028",
+        audioCodec: nil,
+        width: 1_920,
+        height: 1_080,
+        framesPerSecond: 30,
+        dynamicRange: "SDR",
+        bitrateKbps: 4_500,
+        estimatedBytes: 9_000_000
+    )
+    let audioFormat = MediaDownloadFormatOption(
+        formatID: "140",
+        container: "m4a",
+        videoCodec: nil,
+        audioCodec: "mp4a.40.2",
+        width: nil,
+        height: nil,
+        framesPerSecond: nil,
+        dynamicRange: nil,
+        bitrateKbps: 128,
+        estimatedBytes: 1_000_000,
+        language: "en",
+        formatNote: "English (Original)",
+        audioChannels: 2,
+        languagePreference: 10
+    )
+    let metadata = MediaDownloadMetadata(
+        title: "Video",
+        platform: "Test",
+        extractorKey: "Test",
+        thumbnailURL: nil,
+        webpageURL: sourceURL,
+        expectedBytes: 10_000_000,
+        mediaType: .video,
+        entryCount: 1,
+        capabilities: MediaDownloadCapabilities(formatOptions: [videoFormat, audioFormat])
+    )
+    return MediaFormatTestFixture(
+        sourceURL: sourceURL,
+        videoFormat: videoFormat,
+        audioFormat: audioFormat,
+        metadata: metadata,
+        selection: MediaDownloadFormatSelection(format: videoFormat, audioFormat: audioFormat)
+    )
+}
+
 final class ConcurrentMoveResults: @unchecked Sendable {
     struct Snapshot {
         let successfulIndices: [Int]

@@ -2,27 +2,8 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-build_dir="${TMPDIR:-/tmp}/harbor-media-tests"
-module_cache="${build_dir}/ModuleCache"
-binary="${build_dir}/MediaRuntimeSmokeTests"
 media_runtime_root="${project_dir}/Vendor/MediaRuntime"
 torrent_runtime_root="${project_dir}/Vendor/TorrentRuntime"
-
-rm -rf "$build_dir"
-mkdir -p "$build_dir" "$module_cache"
-
-swiftc \
-  -module-cache-path "$module_cache" \
-  "${project_dir}/Harbor/Models/MediaDownloadMetadata.swift" \
-  "${project_dir}/Harbor/Services/DurableFileSystem.swift" \
-  "${project_dir}/Harbor/Services/HarborApplicationSupport.swift" \
-  "${project_dir}/Harbor/Services/ManagedChildProcess.swift" \
-  "${project_dir}/Harbor/Services/MediaRuntimeResolver.swift" \
-  "${project_dir}/Harbor/Services/MediaDownloadService.swift" \
-  "${project_dir}/Tests/MediaRuntimeSmokeTests.swift" \
-  -o "$binary"
-
-"$binary"
 
 run_for_arch() {
   local architecture="$1"

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import Harbor
@@ -381,6 +382,52 @@ extension HarborModelAndSafetyTests {
         XCTAssertEqual(snapshot.stdoutAtTermination, snapshot.stdout)
         XCTAssertEqual(snapshot.stderrAtTermination, snapshot.stderr)
         XCTAssertTrue(snapshot.termination?.isSuccess == true)
+        withExtendedLifetime(process) {}
+    }
+
+    func testManagedChildProcessTerminatesProcessGroup() async throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HarborProcessGroupTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let childPIDURL = temporaryDirectory.appendingPathComponent("child.pid")
+        let state = ManagedProcessTestState()
+        let terminated = expectation(description: "managed process group terminated")
+        let process = try ManagedChildProcess(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "sleep 30 & echo $! > '\(childPIDURL.path)'; wait"],
+            environment: ProcessInfo.processInfo.environment,
+            onStdout: { state.appendStdout($0) },
+            onStderr: { state.appendStderr($0) },
+            onTermination: { termination in
+                state.recordTermination(termination)
+                terminated.fulfill()
+            }
+        )
+        defer { process.terminate(grace: 0) }
+
+        var childPID: pid_t?
+        for _ in 0 ..< 40 {
+            if let text = try? String(contentsOf: childPIDURL, encoding: .utf8),
+               let parsedPID = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                childPID = parsedPID
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let unwrappedChildPID = try XCTUnwrap(childPID)
+
+        process.terminate(grace: 0.2)
+        await fulfillment(of: [terminated], timeout: 4)
+        try await Task.sleep(for: .milliseconds(400))
+
+        let childStillExists = kill(unwrappedChildPID, 0) == 0
+        if childStillExists {
+            _ = kill(unwrappedChildPID, SIGKILL)
+        }
+        XCTAssertFalse(childStillExists)
+        XCTAssertNotNil(state.snapshot.termination)
         withExtendedLifetime(process) {}
     }
 
