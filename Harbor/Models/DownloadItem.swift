@@ -329,45 +329,6 @@ struct DownloadRecord: Codable, Sendable {
         self.activityEvents = try container.decodeIfPresent([DownloadActivityEvent].self, forKey: .activityEvents) ?? []
     }
 
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(id, forKey: .id)
-        try container.encode(sourceURL, forKey: .sourceURL)
-        try container.encode(sourceKind, forKey: .sourceKind)
-        try container.encode(backend, forKey: .backend)
-        try container.encode(preferredFilename, forKey: .preferredFilename)
-        try container.encode(destinationFolderPath, forKey: .destinationFolderPath)
-        try container.encode(fileLocationPath, forKey: .fileLocationPath)
-        try container.encode(status, forKey: .status)
-        try container.encode(progress, forKey: .progress)
-        try container.encode(bytesWritten, forKey: .bytesWritten)
-        try container.encode(expectedBytes, forKey: .expectedBytes)
-        try container.encode(uploadedBytes, forKey: .uploadedBytes)
-        try container.encode(createdAt, forKey: .createdAt)
-        try container.encode(startedAt, forKey: .startedAt)
-        try container.encode(finishedAt, forKey: .finishedAt)
-        try container.encode(updatedAt, forKey: .updatedAt)
-        try container.encode(lastError, forKey: .lastError)
-        try container.encode(resumeData, forKey: .resumeData)
-        try container.encode(browserResumeData, forKey: .browserResumeData)
-        try container.encode(backendIdentifier, forKey: .backendIdentifier)
-        try container.encode(metadataName, forKey: .metadataName)
-        try container.encode(mediaMetadata, forKey: .mediaMetadata)
-        try container.encode(mediaFormatPreference, forKey: .mediaFormatPreference)
-        try container.encode(requiresMediaRecoveryReset, forKey: .requiresMediaRecoveryReset)
-        try container.encode(mediaOutputConflictIdentifier, forKey: .mediaOutputConflictIdentifier)
-        try container.encode(downloadLimitOverride, forKey: .downloadLimitOverride)
-        try container.encode(uploadLimitOverride, forKey: .uploadLimitOverride)
-        try container.encode(torrentFingerprint, forKey: .torrentFingerprint)
-        try container.encode(torrentSourceFingerprint, forKey: .torrentSourceFingerprint)
-        try container.encode(managedTorrentSourcePath, forKey: .managedTorrentSourcePath)
-        try container.encode(torrentPayloadPaths, forKey: .torrentPayloadPaths)
-        try container.encode(shouldSeedAfterDownload, forKey: .shouldSeedAfterDownload)
-        try container.encode(removeOriginalTorrentAfterImport, forKey: .removeOriginalTorrentAfterImport)
-        try container.encode(completionNotificationDelivered, forKey: .completionNotificationDelivered)
-        try container.encode(activityEvents, forKey: .activityEvents)
-    }
-
     private static func shouldSeedLegacyTorrent(
         backend: DownloadBackend,
         sourceKind: DownloadSourceKind,

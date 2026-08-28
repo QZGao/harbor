@@ -423,6 +423,21 @@ final class HarborModelAndSafetyTests: XCTestCase {
             formatFixture.selection.displaySummary,
             "1080p • MP4 • AVC1 + English (Original)"
         )
+        let capabilities = formatFixture.metadata.capabilities
+        let preference = MediaDownloadFormatPreference.specific(formatFixture.selection)
+        XCTAssertEqual(
+            capabilities.preference(selectingPrimaryFormatID: "137")?.selection,
+            formatFixture.selection
+        )
+        XCTAssertEqual(capabilities.preference(selectingPrimaryFormatID: nil), .bestAvailable)
+        let unavailable = MediaDownloadFormatPreference.specific(
+            MediaDownloadFormatSelection(legacySelector: "missing")
+        )
+        XCTAssertEqual(
+            [preference, unavailable].map { capabilities.isSelectionUnavailable(in: $0) },
+            [false, true]
+        )
+        XCTAssertEqual(capabilities.unavailablePrimaryFormatID(in: unavailable), "missing")
         XCTAssertEqual(
             MediaDownloadFormatPreference.specific(formatFixture.selection)
                 .initialExpectedBytes(metadataEstimate: 243_768_398),

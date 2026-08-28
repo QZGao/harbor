@@ -134,7 +134,7 @@ private struct MediaFormatRecoverySection: View {
     var body: some View {
         DownloadDetailSection(title: "Media Format") {
             VStack(alignment: .leading, spacing: 12) {
-                if selectedFormatIsUnavailable {
+                if capabilities.isSelectionUnavailable(in: item.mediaFormatPreference) {
                     DownloadCallout(
                         title: "Format No Longer Available",
                         message: "Choose another format, then retry the download.",
@@ -144,9 +144,10 @@ private struct MediaFormatRecoverySection: View {
                 }
 
                 Picker("Format", selection: primaryFormatSelection) {
-                    if selectedPrimaryFormatIsUnavailable,
-                       let selection = selectedFormatSelection,
-                       let primaryFormatID {
+                    if let primaryFormatID = capabilities.unavailablePrimaryFormatID(
+                        in: item.mediaFormatPreference
+                    ),
+                       let selection = item.mediaFormatPreference?.selection {
                         Text(selection.displaySummary ?? "Unavailable Format")
                             .tag(Optional(primaryFormatID))
                             .disabled(true)
@@ -156,7 +157,7 @@ private struct MediaFormatRecoverySection: View {
                         .tag(String?.none)
 
                     ForEach(formatOptions) { format in
-                        Text(formatTitle(format))
+                        Text(format.compactFormatTitle)
                             .tag(Optional(format.id))
                     }
                 }
@@ -183,7 +184,7 @@ private struct MediaFormatRecoverySection: View {
                                     .tag(String?.none)
 
                                 ForEach(audioFormatOptions) { audioFormat in
-                                    Text(audioFormatTitle(audioFormat))
+                                    Text(audioFormat.audioFormatTitle)
                                         .tag(Optional(audioFormat.id))
                                 }
                             }
@@ -197,7 +198,8 @@ private struct MediaFormatRecoverySection: View {
                         }
                     }
 
-                    if let mergeOutputFormat = selectedFormatSelection?.mergeOutputFormat {
+                    if let mergeOutputFormat = item.mediaFormatPreference?
+                        .selection?.mergeOutputFormat {
                         LabeledContent("Output") {
                             Text(mergeOutputFormat.uppercased())
                                 .foregroundStyle(.secondary)
@@ -214,51 +216,34 @@ private struct MediaFormatRecoverySection: View {
     }
 
     private var formatOptions: [MediaDownloadFormatOption] {
-        item.mediaMetadata?.capabilities.formatOptions ?? []
+        capabilities.formatOptions
     }
 
     private var audioFormatOptions: [MediaDownloadFormatOption] {
-        item.mediaMetadata?.capabilities.audioFormatOptions ?? []
+        capabilities.audioFormatOptions
     }
 
-    private var selectedFormatSelection: MediaDownloadFormatSelection? {
-        guard case let .specific(selection)? = item.mediaFormatPreference else {
-            return nil
-        }
-
-        return selection
-    }
-
-    private var primaryFormatID: String? {
-        selectedFormatSelection?.formatID ?? selectedFormatSelection?.selector
+    private var capabilities: MediaDownloadCapabilities {
+        item.mediaMetadata?.capabilities ?? .unavailable
     }
 
     private var selectedFormat: MediaDownloadFormatOption? {
-        guard let formatID = selectedFormatSelection?.formatID else {
-            return nil
-        }
-
-        return item.mediaMetadata?.capabilities.formatOption(id: formatID)
+        capabilities.selectedFormat(in: item.mediaFormatPreference)
     }
 
     private var primaryFormatSelection: Binding<String?> {
         Binding(
             get: {
-                primaryFormatID
+                item.mediaFormatPreference?.selection?.primaryFormatID
             },
             set: { formatID in
-                guard let formatID else {
-                    center.setMediaFormatPreference(.bestAvailable, for: item.id)
+                guard let preference = capabilities.preference(
+                    selectingPrimaryFormatID: formatID
+                ) else {
                     return
                 }
-
-                guard let capabilities = item.mediaMetadata?.capabilities,
-                      let format = capabilities.formatOption(id: formatID) else {
-                    return
-                }
-
                 center.setMediaFormatPreference(
-                    .specific(capabilities.defaultSelection(for: format)),
+                    preference,
                     for: item.id
                 )
             }
@@ -268,155 +253,31 @@ private struct MediaFormatRecoverySection: View {
     private var audioFormatSelection: Binding<String?> {
         Binding(
             get: {
-                selectedFormatSelection?.audioFormatID
+                item.mediaFormatPreference?.selection?.audioFormatID
             },
             set: { audioFormatID in
-                guard let capabilities = item.mediaMetadata?.capabilities,
-                      let selectedFormat,
-                      let selection = capabilities.selection(
-                          for: selectedFormat,
-                          audioFormatID: audioFormatID
-                      ) else {
+                guard let preference = capabilities.preference(
+                    item.mediaFormatPreference,
+                    selectingAudioFormatID: audioFormatID
+                ) else {
                     return
                 }
-
                 center.setMediaFormatPreference(
-                    .specific(selection),
+                    preference,
                     for: item.id
                 )
             }
         )
     }
 
-    private var unavailablePreference: MediaDownloadFormatPreference? {
-        guard case let .specific(selection)? = item.mediaFormatPreference else {
-            return nil
-        }
-
-        if item.mediaMetadata?.capabilities.resolvedSelection(
-            matching: selection
-        ) != nil {
-            return nil
-        }
-
-        return .specific(selection)
-    }
-
-    private var selectedFormatIsUnavailable: Bool {
-        unavailablePreference != nil
-    }
-
-    private var selectedPrimaryFormatIsUnavailable: Bool {
-        guard let primaryFormatID else {
-            return false
-        }
-
-        return formatOptions.contains(where: { $0.id == primaryFormatID }) == false
-    }
-
     private var unavailableAudioFormatID: String? {
-        guard let audioFormatID = selectedFormatSelection?.audioFormatID,
-              audioFormatOptions.contains(where: { $0.id == audioFormatID }) == false else {
-            return nil
-        }
-
-        return audioFormatID
+        capabilities.unavailableAudioFormatID(in: item.mediaFormatPreference)
     }
 
     private var shouldRefreshFormats: Bool {
         formatOptions.isEmpty
     }
 
-    private func formatTitle(_ format: MediaDownloadFormatOption) -> String {
-        var components: [String] = []
-
-        if let height = format.height {
-            components.append("\(height)p")
-        } else if let width = format.width {
-            components.append("\(width) px")
-        } else if format.videoCodec != nil {
-            components.append("Video")
-        } else if format.audioCodec != nil {
-            components.append("Audio")
-        } else {
-            components.append("Media")
-        }
-
-        components.append(format.container.uppercased())
-
-        if format.hasAudio,
-           let language = format.language?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           language.isEmpty == false {
-            components.append(language.uppercased())
-        }
-
-        if format.hasAudio,
-           let formatNote = format.formatNote?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           formatNote.isEmpty == false {
-            components.append(formatNote)
-        }
-
-        if let codec = format.videoCodec ?? format.audioCodec,
-           let codecFamily = codec.split(separator: ".").first {
-            components.append(codecFamily.uppercased())
-        }
-
-        if let bitrateKbps = format.bitrateKbps,
-           bitrateKbps.isFinite,
-           bitrateKbps > 0 {
-            components.append(
-                "\(bitrateKbps.formatted(.number.precision(.fractionLength(0)))) kbps"
-            )
-        }
-
-        return components.joined(separator: " • ")
-    }
-
-    private func audioFormatTitle(_ format: MediaDownloadFormatOption) -> String {
-        var components: [String] = []
-
-        if let language = format.language?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           language.isEmpty == false {
-            components.append(language.uppercased())
-        }
-
-        if let formatNote = format.formatNote?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           formatNote.isEmpty == false {
-            components.append(formatNote)
-        }
-
-        components.append(format.container.uppercased())
-
-        if let codec = format.audioCodec,
-           let codecFamily = codec.split(separator: ".").first {
-            components.append(codecFamily.uppercased())
-        }
-
-        if let bitrateKbps = format.bitrateKbps,
-           bitrateKbps.isFinite,
-           bitrateKbps > 0 {
-            components.append(
-                "\(bitrateKbps.formatted(.number.precision(.fractionLength(0)))) kbps"
-            )
-        }
-
-        if let audioChannels = format.audioChannels, audioChannels > 0 {
-            switch audioChannels {
-            case 1:
-                components.append("Mono")
-            case 2:
-                components.append("Stereo")
-            default:
-                components.append("\(audioChannels) channels")
-            }
-        }
-
-        return components.joined(separator: " • ")
-    }
 }
 
 private struct DownloadHeader: View {
