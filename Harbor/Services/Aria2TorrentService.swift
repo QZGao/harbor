@@ -1604,11 +1604,15 @@ actor Aria2TorrentService {
         // separate ps snapshot. Keep every identity check exact while giving
         // macOS a short, bounded window to publish the launched process.
         for attempt in 0 ..< 20 {
-            verifiedDaemon = try runningDaemons(matching: binaryURL.path).first(where: {
-                $0.pid == process.processIdentifier
-                    && daemonUsesHarborSession($0, sessionFileURL: sessionFileURL)
-                    && $0.command.contains("--rpc-listen-port=\(rpcPort)")
-            })
+            verifiedDaemon = try runningDaemon(
+                processIdentifier: process.processIdentifier,
+                matching: binaryURL.path
+            ).flatMap { daemon in
+                daemonUsesHarborSession(daemon, sessionFileURL: sessionFileURL)
+                    && daemon.command.contains("--rpc-listen-port=\(rpcPort)")
+                    ? daemon
+                    : nil
+            }
             if verifiedDaemon != nil || process.isRunning == false {
                 break
             }
@@ -1691,10 +1695,36 @@ actor Aria2TorrentService {
     }
 
     private func runningDaemons(matching binaryPath: String) throws -> [RunningDaemon] {
+        try processListOutput(arguments: [
+            "-axo", "pid=,ppid=,lstart=,command=", "-ww"
+        ])
+        .split(separator: "\n")
+        .compactMap { line in
+            daemon(from: String(line), binaryPath: binaryPath)
+        }
+    }
+
+    private func runningDaemon(
+        processIdentifier: pid_t,
+        matching binaryPath: String
+    ) throws -> RunningDaemon? {
+        let output = try processListOutput(arguments: [
+            "-p", "\(processIdentifier)",
+            "-o", "pid=,ppid=,lstart=,command=",
+            "-ww"
+        ])
+        return output.split(separator: "\n")
+        .compactMap { line in
+            daemon(from: String(line), binaryPath: binaryPath)
+        }
+        .first
+    }
+
+    private func processListOutput(arguments: [String]) throws -> String {
         let process = Process()
         let outputPipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-axo", "pid=,ppid=,lstart=,command=", "-ww"]
+        process.arguments = arguments
         process.standardOutput = outputPipe
         process.standardError = Pipe()
 
@@ -1723,10 +1753,6 @@ actor Aria2TorrentService {
         }
 
         return output
-            .split(separator: "\n")
-            .compactMap { line in
-                daemon(from: String(line), binaryPath: binaryPath)
-            }
     }
 
     private func daemon(from processLine: String, binaryPath: String) -> RunningDaemon? {
@@ -1742,6 +1768,7 @@ actor Aria2TorrentService {
 
         let startSignature = parts[2 ... 6].joined(separator: " ")
         let command = String(parts[7])
+            .trimmingCharacters(in: .whitespaces)
         guard command.contains("--enable-rpc=true"),
               isHarborManagedDaemon(command: command, binaryPath: binaryPath) else {
             return nil
