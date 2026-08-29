@@ -47,7 +47,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "$APP_SUPPORT_DIR" "$DOWNLOAD_DIR"
-printf '' > "$TORRENT_FILE"
+# A valid two-file torrent reaches the same import and sheet path used by the
+# selective-download preview. Keep this fixture self-contained and offline.
+printf '%s' 'd4:infod5:filesld6:lengthi7e4:pathl8:Docs.txteed6:lengthi11e4:pathl9:Video.mp4eee4:name11:HarborSmoke12:piece lengthi16384e6:pieces20:11111111111111111111ee' > "$TORRENT_FILE"
 
 assert_harbor_alive() {
   if ! kill -0 "$OPEN_WAIT_PID" >/dev/null 2>&1; then
@@ -69,12 +71,22 @@ assert_harbor_alive
 
 MEDIA_ARCH="$(uname -m)"
 YTDLP_PATH="$APP_PATH/Contents/Resources/MediaRuntime/$MEDIA_ARCH/bin/yt-dlp"
+ARIA2_PATH="$APP_PATH/Contents/Resources/TorrentRuntime/$MEDIA_ARCH/bin/aria2c"
 
 if [ -x "$YTDLP_PATH" ]; then
   echo "Testing bundled yt-dlp helper..."
   "$YTDLP_PATH" --version >/dev/null
 else
   echo "Expected bundled yt-dlp helper at: $YTDLP_PATH" >&2
+  exit 1
+fi
+
+if [ -x "$ARIA2_PATH" ]; then
+  echo "Testing bundled aria2 helper and torrent fixture..."
+  "$ARIA2_PATH" --version >/dev/null
+  "$ARIA2_PATH" --show-files "$TORRENT_FILE" >/dev/null
+else
+  echo "Expected bundled aria2 helper at: $ARIA2_PATH" >&2
   exit 1
 fi
 

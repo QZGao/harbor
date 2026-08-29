@@ -8,6 +8,9 @@ struct AddDownloadRequest: Sendable {
     let shouldStartImmediately: Bool
     let mediaMetadata: MediaDownloadMetadata?
     let mediaFormatPreference: MediaDownloadFormatPreference?
+    let torrentFileSelection: TorrentFileSelection?
+    let preparedTorrentMetainfo: Data?
+    let torrentMetadataName: String?
 
     init(
         sourceKind: DownloadSourceKind,
@@ -16,7 +19,10 @@ struct AddDownloadRequest: Sendable {
         destinationFolder: URL,
         shouldStartImmediately: Bool,
         mediaMetadata: MediaDownloadMetadata? = nil,
-        mediaFormatPreference: MediaDownloadFormatPreference? = nil
+        mediaFormatPreference: MediaDownloadFormatPreference? = nil,
+        torrentFileSelection: TorrentFileSelection? = nil,
+        preparedTorrentMetainfo: Data? = nil,
+        torrentMetadataName: String? = nil
     ) {
         self.sourceKind = sourceKind
         self.sourceURL = sourceURL
@@ -25,5 +31,8 @@ struct AddDownloadRequest: Sendable {
         self.shouldStartImmediately = shouldStartImmediately
         self.mediaMetadata = mediaMetadata
         self.mediaFormatPreference = mediaFormatPreference
+        self.torrentFileSelection = torrentFileSelection
+        self.preparedTorrentMetainfo = preparedTorrentMetainfo
+        self.torrentMetadataName = torrentMetadataName
     }
 }

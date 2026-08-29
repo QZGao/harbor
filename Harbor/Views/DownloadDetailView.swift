@@ -826,6 +826,15 @@ private struct DownloadStorageSection: View {
             VStack(spacing: 0) {
                 DownloadValueRow(title: "Destination", value: item.destinationFolderPath)
 
+                if let selectionText = item.partialTorrentSelectionText,
+                   let selection = item.torrentFileSelection {
+                    Divider()
+                    DownloadValueRow(
+                        title: "Selected Files",
+                        value: "\(selectionText) • \(DownloadFormatting.byteString(selection.selectedBytes))"
+                    )
+                }
+
                 if let fileLocationPath = item.fileLocationPath {
                     Divider()
                     DownloadValueRow(title: "Saved File", value: fileLocationPath)

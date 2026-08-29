@@ -62,6 +62,12 @@ struct RootView: View {
                 draft: draft,
                 mediaPreviewProvider: { url in
                     try await center.previewMediaDownload(for: url)
+                },
+                torrentPreviewProvider: { sourceKind, url in
+                    try await center.previewTorrentContents(
+                        sourceKind: sourceKind,
+                        sourceURL: url
+                    )
                 }
             ) { requests in
                 center.queueDownloads(requests)

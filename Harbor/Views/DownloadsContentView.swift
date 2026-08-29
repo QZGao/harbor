@@ -249,7 +249,7 @@ private struct DownloadNameCell: View {
                     .fontWeight(.medium)
                     .lineLimit(1)
 
-                Text(item.sourceDisplayText)
+                Text(item.partialTorrentSelectionText ?? item.sourceDisplayText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)

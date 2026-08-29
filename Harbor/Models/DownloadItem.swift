@@ -146,6 +146,7 @@ struct DownloadRecord: Codable, Sendable {
     let torrentFingerprint: String?
     let torrentSourceFingerprint: String?
     let managedTorrentSourcePath: String?
+    let torrentFileSelection: TorrentFileSelection?
     let torrentPayloadPaths: [String]
     let shouldSeedAfterDownload: Bool
     let removeOriginalTorrentAfterImport: Bool
@@ -183,6 +184,7 @@ struct DownloadRecord: Codable, Sendable {
         case torrentFingerprint
         case torrentSourceFingerprint
         case managedTorrentSourcePath
+        case torrentFileSelection
         case torrentPayloadPaths
         case shouldSeedAfterDownload
         case removeOriginalTorrentAfterImport
@@ -221,6 +223,7 @@ struct DownloadRecord: Codable, Sendable {
         torrentFingerprint: String? = nil,
         torrentSourceFingerprint: String? = nil,
         managedTorrentSourcePath: String? = nil,
+        torrentFileSelection: TorrentFileSelection? = nil,
         torrentPayloadPaths: [String] = [],
         shouldSeedAfterDownload: Bool? = nil,
         removeOriginalTorrentAfterImport: Bool = false,
@@ -257,6 +260,7 @@ struct DownloadRecord: Codable, Sendable {
         self.torrentFingerprint = torrentFingerprint
         self.torrentSourceFingerprint = torrentSourceFingerprint
         self.managedTorrentSourcePath = managedTorrentSourcePath
+        self.torrentFileSelection = torrentFileSelection
         self.torrentPayloadPaths = torrentPayloadPaths
         self.shouldSeedAfterDownload = shouldSeedAfterDownload
             ?? (backend == .aria2 || sourceKind == .magnetLink || sourceKind == .torrentFile)
@@ -309,6 +313,7 @@ struct DownloadRecord: Codable, Sendable {
         self.torrentFingerprint = try container.decodeIfPresent(String.self, forKey: .torrentFingerprint)
         self.torrentSourceFingerprint = try container.decodeIfPresent(String.self, forKey: .torrentSourceFingerprint)
         self.managedTorrentSourcePath = try container.decodeIfPresent(String.self, forKey: .managedTorrentSourcePath)
+        self.torrentFileSelection = try container.decodeIfPresent(TorrentFileSelection.self, forKey: .torrentFileSelection)
         self.torrentPayloadPaths = try container.decodeIfPresent([String].self, forKey: .torrentPayloadPaths) ?? []
         self.shouldSeedAfterDownload = try container.decodeIfPresent(
             Bool.self,
@@ -377,6 +382,7 @@ final class DownloadItem: Identifiable {
     var torrentFingerprint: String?
     var torrentSourceFingerprint: String?
     var managedTorrentSourcePath: String?
+    var torrentFileSelection: TorrentFileSelection?
     var torrentPayloadPaths: [String]
     var shouldSeedAfterDownload: Bool
     var removeOriginalTorrentAfterImport: Bool
@@ -417,6 +423,7 @@ final class DownloadItem: Identifiable {
         torrentFingerprint: String? = nil,
         torrentSourceFingerprint: String? = nil,
         managedTorrentSourcePath: String? = nil,
+        torrentFileSelection: TorrentFileSelection? = nil,
         torrentPayloadPaths: [String] = [],
         shouldSeedAfterDownload: Bool? = nil,
         removeOriginalTorrentAfterImport: Bool = false,
@@ -456,6 +463,7 @@ final class DownloadItem: Identifiable {
         self.torrentFingerprint = torrentFingerprint
         self.torrentSourceFingerprint = torrentSourceFingerprint
         self.managedTorrentSourcePath = managedTorrentSourcePath
+        self.torrentFileSelection = torrentFileSelection
         self.torrentPayloadPaths = torrentPayloadPaths
         self.shouldSeedAfterDownload = shouldSeedAfterDownload
             ?? (backend == .aria2 || sourceKind == .magnetLink || sourceKind == .torrentFile)
@@ -506,6 +514,7 @@ final class DownloadItem: Identifiable {
             torrentFingerprint: record.torrentFingerprint,
             torrentSourceFingerprint: record.torrentSourceFingerprint,
             managedTorrentSourcePath: record.managedTorrentSourcePath,
+            torrentFileSelection: record.torrentFileSelection,
             torrentPayloadPaths: record.torrentPayloadPaths,
             shouldSeedAfterDownload: record.shouldSeedAfterDownload,
             removeOriginalTorrentAfterImport: record.removeOriginalTorrentAfterImport,
@@ -545,6 +554,7 @@ final class DownloadItem: Identifiable {
         uploadLimitOverride = record.uploadLimitOverride
         torrentFingerprint = record.torrentFingerprint
         managedTorrentSourcePath = record.managedTorrentSourcePath
+        torrentFileSelection = record.torrentFileSelection
         torrentPayloadPaths = record.torrentPayloadPaths
         shouldSeedAfterDownload = record.shouldSeedAfterDownload
         removeOriginalTorrentAfterImport = record.removeOriginalTorrentAfterImport
@@ -650,6 +660,23 @@ final class DownloadItem: Identifiable {
 
     var sourceDisplayText: String {
         sourceURL.isFileURL ? sourceURL.path : sourceURL.absoluteString
+    }
+
+    var partialTorrentSelectionText: String? {
+        guard let torrentFileSelection,
+              torrentFileSelection.isPartial else {
+            return nil
+        }
+        let template = String(
+            localized: "torrent.selection.summary",
+            defaultValue: "%d of %d files selected",
+            comment: "Summary for a torrent download that includes only some files. Parameters are selected count and total count."
+        )
+        return String(
+            format: template,
+            torrentFileSelection.selectedFileCount,
+            torrentFileSelection.totalFileCount
+        )
     }
 
     var sourceBadgeTitle: LocalizedStringResource {
@@ -775,6 +802,7 @@ final class DownloadItem: Identifiable {
             torrentFingerprint: torrentFingerprint,
             torrentSourceFingerprint: torrentSourceFingerprint,
             managedTorrentSourcePath: managedTorrentSourcePath,
+            torrentFileSelection: torrentFileSelection,
             torrentPayloadPaths: torrentPayloadPaths,
             shouldSeedAfterDownload: shouldSeedAfterDownload,
             removeOriginalTorrentAfterImport: removeOriginalTorrentAfterImport,

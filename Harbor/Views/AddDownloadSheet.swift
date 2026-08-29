@@ -2,6 +2,13 @@ import AppKit
 import SwiftUI
 
 struct AddDownloadSheet: View {
+    private struct TorrentPreviewSource: Identifiable {
+        let sourceKind: DownloadSourceKind
+        let sourceURL: URL
+
+        var id: String { "\(sourceKind.rawValue):\(sourceURL.absoluteString)" }
+    }
+
     private enum Layout {
         static let groupedFormHorizontalExpansion: CGFloat = 20
     }
@@ -12,6 +19,7 @@ struct AddDownloadSheet: View {
 
     let settings: AppSettingsStore
     let mediaPreviewProvider: @MainActor (URL) async throws -> MediaDownloadMetadata?
+    let torrentPreviewProvider: @MainActor (DownloadSourceKind, URL) async throws -> TorrentContentsPreview
     let onSubmit: @MainActor ([AddDownloadRequest]) -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -32,15 +40,20 @@ struct AddDownloadSheet: View {
     @State private var isSubmitting = false
     @State private var mediaPreviewTask: Task<Void, Never>?
     @State private var mediaPreviewGeneration = 0
+    @State private var torrentPreviewSource: TorrentPreviewSource?
 
     init(
         settings: AppSettingsStore,
         draft: AddDownloadSheetDraft,
         mediaPreviewProvider: @escaping @MainActor (URL) async throws -> MediaDownloadMetadata? = { _ in nil },
+        torrentPreviewProvider: @escaping @MainActor (DownloadSourceKind, URL) async throws -> TorrentContentsPreview = { _, _ in
+            throw TorrentEngineError.invalidSource
+        },
         onSubmit: @escaping @MainActor ([AddDownloadRequest]) -> Void
     ) {
         self.settings = settings
         self.mediaPreviewProvider = mediaPreviewProvider
+        self.torrentPreviewProvider = torrentPreviewProvider
         self.onSubmit = onSubmit
         _entryMode = State(initialValue: draft.entryMode)
         _sourceURLText = State(initialValue: draft.sourceURLText)
@@ -130,6 +143,12 @@ struct AddDownloadSheet: View {
                 }
                 .keyboardShortcut(.cancelAction)
 
+                if let torrentPreviewCandidate {
+                    Button("Preview") {
+                        torrentPreviewSource = torrentPreviewCandidate
+                    }
+                }
+
                 Button(addButtonTitle) {
                     Task {
                         await submit()
@@ -163,6 +182,59 @@ struct AddDownloadSheet: View {
             }
             updateDestinationForDetectedSourceIfNeeded()
         }
+        .sheet(item: $torrentPreviewSource) { source in
+            TorrentContentsSelectionSheet(
+                loadPreview: {
+                    try await torrentPreviewProvider(source.sourceKind, source.sourceURL)
+                },
+                onAdd: { preview, selection in
+                    submitTorrentPreview(
+                        source: source,
+                        preview: preview,
+                        selection: selection
+                    )
+                }
+            )
+        }
+    }
+
+    private var torrentPreviewCandidate: TorrentPreviewSource? {
+        switch entryMode {
+        case .torrentFile:
+            guard let torrentFileURL,
+                  DownloadSourceKind.detect(from: torrentFileURL) == .torrentFile else {
+                return nil
+            }
+            return TorrentPreviewSource(sourceKind: .torrentFile, sourceURL: torrentFileURL)
+        case .linkOrMagnet:
+            guard isBatchEntry == false,
+                  let parsedLinkURL,
+                  let sourceKind = DownloadSourceKind.detect(from: parsedLinkURL),
+                  sourceKind == .torrentFile || sourceKind == .magnetLink else {
+                return nil
+            }
+            return TorrentPreviewSource(sourceKind: sourceKind, sourceURL: parsedLinkURL)
+        }
+    }
+
+    @MainActor
+    private func submitTorrentPreview(
+        source: TorrentPreviewSource,
+        preview: TorrentContentsPreview,
+        selection: TorrentFileSelection?
+    ) {
+        let request = AddDownloadRequest(
+            sourceKind: source.sourceKind,
+            sourceURL: source.sourceURL,
+            customFilename: nil,
+            destinationFolder: URL(fileURLWithPath: destinationPath, isDirectory: true),
+            shouldStartImmediately: shouldStartImmediately,
+            torrentFileSelection: selection,
+            preparedTorrentMetainfo: preview.metainfoData,
+            torrentMetadataName: preview.name
+        )
+        onSubmit([request])
+        dismiss()
     }
 
     @ViewBuilder

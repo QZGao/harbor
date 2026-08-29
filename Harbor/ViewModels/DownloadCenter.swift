@@ -2376,6 +2376,17 @@ final class DownloadCenter {
         return try await mediaService.metadata(for: url)
     }
 
+    func previewTorrentContents(
+        sourceKind: DownloadSourceKind,
+        sourceURL: URL
+    ) async throws -> TorrentContentsPreview {
+        try await TorrentContentsPreviewService().preview(
+            sourceKind: sourceKind,
+            sourceURL: sourceURL,
+            torrentService: torrentService
+        )
+    }
+
     func refreshMediaFormats(for id: UUID) async {
         guard let currentItem = item(for: id),
               currentItem.backend == .ytDlp,
@@ -2412,7 +2423,7 @@ final class DownloadCenter {
             return
         }
 
-        if request.sourceKind == .torrentFile {
+        if request.sourceKind == .torrentFile || request.preparedTorrentMetainfo != nil {
             Task { @MainActor [weak self] in
                 await self?.prepareAndQueueTorrent(request, isWatchedImport: false)
             }
@@ -2446,18 +2457,21 @@ final class DownloadCenter {
             preferredFilename: preferredFilename,
             destinationFolderPath: request.destinationFolder.path,
             status: request.shouldStartImmediately ? .queued : .paused,
-            metadataName: request.mediaMetadata?.title,
+            metadataName: request.torrentMetadataName ?? request.mediaMetadata?.title,
             mediaMetadata: request.mediaMetadata,
             mediaFormatPreference: request.mediaFormatPreference,
             torrentFingerprint: managedTorrentSource?.fingerprint
                 ?? Self.normalizedMagnetInfoHash(for: request),
             torrentSourceFingerprint: managedTorrentSource?.sourceFingerprint,
             managedTorrentSourcePath: managedTorrentSource?.managedURL.path,
+            torrentFileSelection: request.torrentFileSelection,
             shouldSeedAfterDownload: backend == .aria2 ? settings.seedNewTorrents : false
         )
 
-        if request.sourceKind == .magnetLink {
-            item.metadataName = MagnetLinkMetadata(url: request.sourceURL).displayName
+        if request.sourceKind == .magnetLink,
+           item.metadataName == nil,
+           let magnetDisplayName = MagnetLinkMetadata(url: request.sourceURL).displayName {
+            item.metadataName = magnetDisplayName
         }
 
         downloads.insert(item, at: 0)
@@ -2478,7 +2492,24 @@ final class DownloadCenter {
     ) async {
         do {
             let managedSource: ManagedTorrentSource
-            if request.sourceURL.isFileURL {
+            if let preparedTorrentMetainfo = request.preparedTorrentMetainfo {
+                _ = try TorrentMetainfoParser.preview(from: preparedTorrentMetainfo)
+                if request.sourceKind == .magnetLink {
+                    guard let expectedInfoHash = ManagedTorrentSourceStore.normalizedInfoHash(
+                        MagnetLinkMetadata(url: request.sourceURL).infoHash
+                    ) else {
+                        throw TorrentMetainfoError.malformed
+                    }
+                    let actualInfoHash = ManagedTorrentSourceStore.fingerprint(for: preparedTorrentMetainfo)
+                    guard actualInfoHash == expectedInfoHash else {
+                        throw TorrentMetainfoError.malformed
+                    }
+                }
+                managedSource = try await managedTorrentSourceStore.prepareTorrentData(
+                    preparedTorrentMetainfo,
+                    originalURL: request.sourceURL
+                )
+            } else if request.sourceURL.isFileURL {
                 managedSource = try await managedTorrentSourceStore.prepareLocalTorrent(
                     at: request.sourceURL,
                     originalURL: request.sourceURL
@@ -5802,7 +5833,8 @@ final class DownloadCenter {
             ),
             shouldSeed: item.shouldSeedAfterDownload,
             seedRatioLimit: settings.seedingRatioLimit,
-            verifyExistingData: item.finishedAt != nil
+            verifyExistingData: item.finishedAt != nil,
+            selectedFileIndexes: item.torrentFileSelection?.selectedIndexes
         )
     }
 

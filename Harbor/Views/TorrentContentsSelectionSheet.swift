@@ -1,0 +1,170 @@
+import SwiftUI
+
+struct TorrentContentsSelectionSheet: View {
+    let loadPreview: @MainActor () async throws -> TorrentContentsPreview
+    let onAdd: @MainActor (TorrentContentsPreview, TorrentFileSelection?) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var preview: TorrentContentsPreview?
+    @State private var selectedIndexes: Set<Int> = []
+    @State private var errorMessage: String?
+    @State private var loadGeneration = 0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            header
+
+            Group {
+                if let preview {
+                    contentsTable(preview)
+                } else if let errorMessage {
+                    ContentUnavailableView {
+                        Label("Couldn’t Preview Torrent", systemImage: "exclamationmark.triangle")
+                    } description: {
+                        Text(errorMessage)
+                    } actions: {
+                        Button("Try Again") {
+                            loadGeneration += 1
+                        }
+                    }
+                } else {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text("Fetching torrent metadata…")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .frame(minHeight: 320)
+
+            footer
+        }
+        .padding(20)
+        .frame(minWidth: 640, idealWidth: 720, minHeight: 460, idealHeight: 560)
+        .task(id: loadGeneration) {
+            await load()
+        }
+    }
+
+    @ViewBuilder
+    private var header: some View {
+        if let preview {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(preview.name)
+                    .font(.title2.weight(.semibold))
+                    .lineLimit(2)
+                Text("\(preview.files.count) files • \(DownloadFormatting.byteString(preview.totalBytes))")
+                    .foregroundStyle(.secondary)
+            }
+        } else {
+            Text("Torrent Contents")
+                .font(.title2.weight(.semibold))
+        }
+    }
+
+    private func contentsTable(_ preview: TorrentContentsPreview) -> some View {
+        // TODO: Add native folder-level tri-state selection if Harbor later exposes a tree view.
+        Table(preview.files) {
+            TableColumn("") { file in
+                Toggle("Select \(file.path)", isOn: selectionBinding(for: file.index))
+                    .labelsHidden()
+            }
+            .width(28)
+
+            TableColumn("File") { file in
+                Text(file.path)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(file.path)
+            }
+
+            TableColumn("Size") { file in
+                Text(DownloadFormatting.byteString(file.byteCount))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            .width(min: 90, ideal: 110, max: 140)
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 10) {
+            if let preview {
+                Button("Select All") {
+                    selectedIndexes = Set(preview.files.map(\.index))
+                }
+                .disabled(selectedIndexes.count == preview.files.count)
+
+                Button("Select None") {
+                    selectedIndexes.removeAll()
+                }
+                .disabled(selectedIndexes.isEmpty)
+
+                Text(selectionSummary(in: preview))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+
+            Spacer()
+
+            Button("Cancel") {
+                dismiss()
+            }
+            .keyboardShortcut(.cancelAction)
+
+            Button("Add Download") {
+                guard let preview else {
+                    return
+                }
+                onAdd(
+                    preview,
+                    TorrentFileSelection.partial(
+                        selectedIndexes: selectedIndexes,
+                        in: preview
+                    )
+                )
+                dismiss()
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(preview == nil || selectedIndexes.isEmpty)
+        }
+    }
+
+    private func selectionBinding(for index: Int) -> Binding<Bool> {
+        Binding(
+            get: { selectedIndexes.contains(index) },
+            set: { isSelected in
+                if isSelected {
+                    selectedIndexes.insert(index)
+                } else {
+                    selectedIndexes.remove(index)
+                }
+            }
+        )
+    }
+
+    private func selectionSummary(in preview: TorrentContentsPreview) -> String {
+        let selectedBytes = preview.files
+            .filter { selectedIndexes.contains($0.index) }
+            .reduce(0) { $0 + $1.byteCount }
+        return "\(selectedIndexes.count) of \(preview.files.count) selected • \(DownloadFormatting.byteString(selectedBytes))"
+    }
+
+    @MainActor
+    private func load() async {
+        preview = nil
+        errorMessage = nil
+        do {
+            let loadedPreview = try await loadPreview()
+            try Task.checkCancellation()
+            preview = loadedPreview
+            selectedIndexes = Set(loadedPreview.files.map(\.index))
+        } catch is CancellationError {
+            return
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+}

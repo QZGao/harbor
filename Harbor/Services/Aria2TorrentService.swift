@@ -93,19 +93,39 @@ struct TorrentTransferOptions: Equatable, Sendable {
     let shouldSeed: Bool
     let seedRatioLimit: Double?
     let verifyExistingData: Bool
+    let selectedFileIndexes: [Int]?
 
     init(
         downloadLimitBytesPerSecond: Int64?,
         uploadLimitBytesPerSecond: Int64?,
         shouldSeed: Bool,
         seedRatioLimit: Double? = nil,
-        verifyExistingData: Bool = false
+        verifyExistingData: Bool = false,
+        selectedFileIndexes: [Int]? = nil
     ) {
         self.downloadLimitBytesPerSecond = downloadLimitBytesPerSecond
         self.uploadLimitBytesPerSecond = uploadLimitBytesPerSecond
         self.shouldSeed = shouldSeed
         self.seedRatioLimit = seedRatioLimit
         self.verifyExistingData = verifyExistingData
+        self.selectedFileIndexes = selectedFileIndexes
+    }
+}
+
+private enum TorrentPreviewError: LocalizedError {
+    case invalidMagnet
+    case metadataUnavailable(String?)
+    case fingerprintMismatch
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidMagnet:
+            "The magnet link does not include a supported BitTorrent info hash."
+        case let .metadataUnavailable(detail):
+            detail ?? "Harbor could not resolve metadata for this magnet link."
+        case .fingerprintMismatch:
+            "The resolved torrent metadata does not match the magnet link."
+        }
     }
 }
 
@@ -475,6 +495,96 @@ actor Aria2TorrentService {
         return returnedGID
     }
 
+    func previewMagnetMetainfo(at sourceURL: URL) async throws -> Data {
+        guard let expectedInfoHash = ManagedTorrentSourceStore.normalizedInfoHash(
+            MagnetLinkMetadata(url: sourceURL).infoHash
+        ) else {
+            throw TorrentPreviewError.invalidMagnet
+        }
+
+        let previewDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HarborTorrentPreview", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: previewDirectory,
+            withIntermediateDirectories: true
+        )
+
+        let gid = Self.makeSubmissionGID()
+        do {
+            try await ensureDaemonRunning()
+            let options = [
+                "gid": gid,
+                "dir": previewDirectory.path,
+                "pause": "false",
+                "pause-metadata": "true",
+                "bt-metadata-only": "true",
+                "bt-save-metadata": "true",
+                "seed-time": "0"
+            ]
+            let returnedGID = try await submitDownload(
+                method: "aria2.addUri",
+                params: [
+                    authorizedToken(),
+                    [sourceURL.absoluteString],
+                    options
+                ],
+                gid: gid
+            )
+            guard returnedGID == gid else {
+                throw TorrentEngineError.invalidResponse
+            }
+
+            let expectedMetadataURL = previewDirectory
+                .appendingPathComponent("\(expectedInfoHash).torrent", isDirectory: false)
+
+            while true {
+                try Task.checkCancellation()
+
+                let metadataURL: URL? = if FileManager.default.fileExists(
+                    atPath: expectedMetadataURL.path
+                ) {
+                    expectedMetadataURL
+                } else {
+                    try FileManager.default.contentsOfDirectory(
+                        at: previewDirectory,
+                        includingPropertiesForKeys: nil
+                    ).first { $0.pathExtension.lowercased() == "torrent" }
+                }
+
+                if let metadataURL {
+                    let data = try Data(contentsOf: metadataURL, options: .mappedIfSafe)
+                    let preview = try TorrentMetainfoParser.preview(from: data)
+                    guard preview.infoHash == expectedInfoHash else {
+                        throw TorrentPreviewError.fingerprintMismatch
+                    }
+                    await cleanupTorrentPreview(gid: gid, directoryURL: previewDirectory)
+                    return data
+                }
+
+                let snapshot = try await status(for: gid)
+                if snapshot.status == "error" || snapshot.status == "removed" {
+                    throw TorrentPreviewError.metadataUnavailable(snapshot.errorMessage)
+                }
+
+                try await Task.sleep(for: .milliseconds(250))
+            }
+        } catch {
+            await cleanupTorrentPreview(gid: gid, directoryURL: previewDirectory)
+            throw error
+        }
+    }
+
+    private func cleanupTorrentPreview(gid: String, directoryURL: URL) async {
+        // A fresh task does not inherit caller cancellation, so a dismissed
+        // selector still removes its temporary aria2 job and durable session entry.
+        let cleanupTask = Task {
+            try? await removeAndConfirmStopped(gid: gid)
+        }
+        await cleanupTask.value
+        try? FileManager.default.removeItem(at: directoryURL)
+    }
+
     func pause(gid: String) async throws {
         let lineage = try await followedStatus(for: gid)
         guard lineage.currentSnapshot.status == "active"
@@ -688,6 +798,7 @@ actor Aria2TorrentService {
         )
 
         let filePaths = payload.files?
+            .filter { $0.selected != "false" }
             .compactMap(\.path)
             .filter { $0.isEmpty == false } ?? []
 
@@ -1055,7 +1166,35 @@ actor Aria2TorrentService {
             options["auto-file-renaming"] = "false"
         }
 
+        if let selectedFileIndexes = transferOptions?.selectedFileIndexes,
+           let selection = selectFileOption(from: selectedFileIndexes) {
+            options["select-file"] = selection
+        }
+
         return options
+    }
+
+    nonisolated static func selectFileOption(from indexes: [Int]) -> String? {
+        let indexes = Array(Set(indexes.filter { $0 > 0 })).sorted()
+        guard let first = indexes.first else {
+            return nil
+        }
+
+        var ranges: [String] = []
+        var rangeStart = first
+        var previous = first
+
+        for index in indexes.dropFirst() {
+            if index == previous + 1 {
+                previous = index
+                continue
+            }
+            ranges.append(rangeStart == previous ? "\(rangeStart)" : "\(rangeStart)-\(previous)")
+            rangeStart = index
+            previous = index
+        }
+        ranges.append(rangeStart == previous ? "\(rangeStart)" : "\(rangeStart)-\(previous)")
+        return ranges.joined(separator: ",")
     }
 
     private func globalOptions(_ transferSettings: DownloadTransferSettings) -> [String: String] {
