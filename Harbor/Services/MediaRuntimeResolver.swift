@@ -16,7 +16,7 @@ struct MediaRuntimeResolver {
         nonisolated init(
             fileManager: FileManager = .default,
             environment: [String: String] = ProcessInfo.processInfo.environment,
-            bundledResourceRoots: [URL] = Self.defaultBundledResourceRoots(),
+            bundledResourceRoots: [URL] = HarborApplicationSupport.bundledResourceRoots(),
             candidateDirectories: [String] = Self.defaultCandidateDirectories
         ) {
             self.fileManager = fileManager
@@ -31,23 +31,6 @@ struct MediaRuntimeResolver {
             "/opt/local/bin"
         ]
 
-        nonisolated private static func defaultBundledResourceRoots() -> [URL] {
-            var roots: [URL] = []
-            var seenPaths = Set<String>()
-
-            for resourceURL in [
-                Bundle.main.resourceURL,
-                Bundle(for: BundleToken.self).resourceURL
-            ].compactMap({ $0 }) {
-                guard seenPaths.insert(resourceURL.path).inserted else {
-                    continue
-                }
-
-                roots.append(resourceURL)
-            }
-
-            return roots
-        }
     }
 
     nonisolated static let installHint = "Harbor couldn’t find its bundled media engine. Reinstall the app, or set `YTDLP_PATH`, `FFMPEG_PATH`, and `FFPROBE_PATH` to compatible binaries."
@@ -68,7 +51,7 @@ struct MediaRuntimeResolver {
         for root in context.bundledResourceRoots {
             let binDirectory = root
                 .appendingPathComponent("MediaRuntime", isDirectory: true)
-                .appendingPathComponent(runtimeArchitectureName, isDirectory: true)
+                .appendingPathComponent(HarborApplicationSupport.architectureName, isDirectory: true)
                 .appendingPathComponent("bin", isDirectory: true)
 
             if let resolution = resolution(in: binDirectory, fileManager: context.fileManager) {
@@ -135,15 +118,4 @@ struct MediaRuntimeResolver {
         )
     }
 
-    private nonisolated static var runtimeArchitectureName: String {
-        #if arch(arm64)
-        "arm64"
-        #elseif arch(x86_64)
-        "x86_64"
-        #else
-        "unsupported"
-        #endif
-    }
 }
-
-private final class BundleToken: NSObject {}

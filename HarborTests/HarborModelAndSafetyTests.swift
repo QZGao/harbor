@@ -15,17 +15,41 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertTrue(schemes.contains("harbor"))
     }
 
-    func testExternalHTTPSourcePrefillsAddSheetWithDefaultDestination() throws {
+    func testExternalHTTPSourcePrefillsAddSheetWithDefaultDestination() async throws {
+        let fileManager = FileManager.default
+        let testRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborExternalSourceTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: testRoot) }
+
         let settings = HarborPreviewFixtures.makeSettings()
-        let center = DownloadCenter(settings: settings)
+        let center = DownloadCenter(
+            settings: settings,
+            persistence: DownloadPersistence(
+                directoryURL: testRoot.appendingPathComponent("Persistence", isDirectory: true)
+            ),
+            directRecoveryDirectoryURL: testRoot.appendingPathComponent("DirectRecovery", isDirectory: true),
+            completedHandoffDirectoryURL: testRoot.appendingPathComponent("Handoffs", isDirectory: true),
+            browserRecoveryDirectoryURL: testRoot.appendingPathComponent("BrowserRecovery", isDirectory: true),
+            managedTorrentSourceStore: ManagedTorrentSourceStore(
+                fileManager: fileManager,
+                directoryURL: testRoot.appendingPathComponent("ManagedTorrents", isDirectory: true)
+            ),
+            mediaService: MediaDownloadService(
+                eventHandler: { _, _ in },
+                fileManager: fileManager,
+                temporaryRoot: testRoot.appendingPathComponent("MediaRecovery", isDirectory: true)
+            )
+        )
         let sourceURL = try XCTUnwrap(URL(string: "https://example.com/file.zip"))
 
         center.receiveExternalAddSources([sourceURL])
+        await center.initializeIfNeeded()
 
         let draft = try XCTUnwrap(center.addSheetDraft)
         XCTAssertEqual(draft.entryMode, .linkOrMagnet)
         XCTAssertEqual(draft.sourceURLText, sourceURL.absoluteString)
         XCTAssertEqual(draft.destinationFolderURL, settings.defaultDestinationURL)
+        await center.shutdownForTermination()
     }
 
     func testDownloadedPayloadClassifierDetectsTorrentResponses() {
@@ -251,9 +275,13 @@ final class HarborModelAndSafetyTests: XCTestCase {
             ffmpegURL: URL(fileURLWithPath: "/tmp/ffmpeg"),
             ffprobeURL: URL(fileURLWithPath: "/tmp/ffprobe")
         )
-        let sourceURL = try XCTUnwrap(URL(string: "https://example.com/video"))
+        let formatFixture = makeMediaFormatTestFixture()
+        let sourceURL = formatFixture.sourceURL
         let destinationURL = URL(fileURLWithPath: "/tmp/downloads", isDirectory: true)
         let temporaryURL = URL(fileURLWithPath: "/tmp/media", isDirectory: true)
+        let completionReceiptURL = URL(
+            fileURLWithPath: "/tmp/media%owned/final-paths.jsonl"
+        )
 
         let limitedArguments = try MediaDownloadService.downloadArguments(
             runtime: runtime,
@@ -262,6 +290,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
             temporaryFolder: temporaryURL,
             metadata: nil,
             formatPreference: .bestAvailable,
+            completionReceiptURL: completionReceiptURL,
             speedLimitBytesPerSecond: 345_678
         )
         let unlimitedArguments = try MediaDownloadService.downloadArguments(
@@ -271,6 +300,19 @@ final class HarborModelAndSafetyTests: XCTestCase {
             temporaryFolder: temporaryURL,
             metadata: nil,
             formatPreference: .bestAvailable,
+            completionReceiptURL: completionReceiptURL,
+            speedLimitBytesPerSecond: nil
+        )
+        let outputConflictIdentifier = UUID()
+        let collisionSafeArguments = try MediaDownloadService.downloadArguments(
+            runtime: runtime,
+            sourceURL: sourceURL,
+            destinationFolder: destinationURL,
+            temporaryFolder: temporaryURL,
+            metadata: nil,
+            formatPreference: .bestAvailable,
+            outputConflictIdentifier: outputConflictIdentifier,
+            completionReceiptURL: completionReceiptURL,
             speedLimitBytesPerSecond: nil
         )
 
@@ -281,59 +323,89 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertFalse(unlimitedArguments.contains("--limit-rate"))
         XCTAssertFalse(limitedArguments.contains("--format"))
         XCTAssertFalse(unlimitedArguments.contains("--format"))
-
-        let videoFormat = MediaDownloadFormatOption(
-            formatID: "137",
-            container: "mp4",
-            videoCodec: "avc1.640028",
-            audioCodec: nil,
-            width: 1_920,
-            height: 1_080,
-            framesPerSecond: 30,
-            dynamicRange: "SDR",
-            bitrateKbps: 4_500,
-            estimatedBytes: 9_000_000
+        let collisionOutputIndex = try XCTUnwrap(
+            collisionSafeArguments.firstIndex(of: "--output")
         )
-        let audioFormat = MediaDownloadFormatOption(
-            formatID: "140",
-            container: "m4a",
-            videoCodec: nil,
-            audioCodec: "mp4a.40.2",
-            width: nil,
-            height: nil,
-            framesPerSecond: nil,
-            dynamicRange: nil,
-            bitrateKbps: 128,
-            estimatedBytes: 1_000_000,
-            language: "en",
-            formatNote: "English (Original)",
-            audioChannels: 2,
-            languagePreference: 10
+        XCTAssertEqual(
+            collisionSafeArguments[collisionSafeArguments.index(after: collisionOutputIndex)],
+            "%(title).180B [%(id)s] [Harbor \(outputConflictIdentifier.uuidString)].%(ext)s"
         )
-        let metadata = MediaDownloadMetadata(
-            title: "Video",
-            platform: "Test",
-            extractorKey: "Test",
-            thumbnailURL: nil,
-            webpageURL: sourceURL,
-            expectedBytes: 10_000_000,
-            mediaType: .video,
-            entryCount: 1,
-            capabilities: MediaDownloadCapabilities(
-                formatOptions: [videoFormat, audioFormat]
+        let concurrentDownloadID = UUID()
+        XCTAssertNil(
+            MediaDownloadService.outputIdentifier(
+                requested: nil,
+                downloadID: concurrentDownloadID,
+                hasCompetingDestination: false
             )
         )
-        let selection = MediaDownloadFormatSelection(
-            format: videoFormat,
-            audioFormat: audioFormat
+        XCTAssertEqual(
+            MediaDownloadService.outputIdentifier(
+                requested: nil,
+                downloadID: concurrentDownloadID,
+                hasCompetingDestination: true
+            ),
+            concurrentDownloadID
         )
+        XCTAssertEqual(
+            MediaDownloadService.outputIdentifier(
+                requested: outputConflictIdentifier,
+                downloadID: concurrentDownloadID,
+                hasCompetingDestination: true
+            ),
+            outputConflictIdentifier
+        )
+
+        let retryValues = zip(limitedArguments, limitedArguments.dropFirst())
+            .filter { $0.0 == "--retry-sleep" }
+            .map(\.1)
+        XCTAssertEqual(
+            retryValues,
+            [
+                "http:exp=2:60",
+                "fragment:exp=2:60",
+                "file_access:exp=2:60",
+                "extractor:exp=2:60"
+            ]
+        )
+        func value(after option: String) -> String? {
+            guard let optionIndex = limitedArguments.firstIndex(of: option) else {
+                return nil
+            }
+
+            let valueIndex = limitedArguments.index(after: optionIndex)
+            return limitedArguments.indices.contains(valueIndex)
+                ? limitedArguments[valueIndex]
+                : nil
+        }
+        XCTAssertEqual(value(after: "--retries"), "10")
+        XCTAssertEqual(value(after: "--fragment-retries"), "10")
+        XCTAssertEqual(value(after: "--file-access-retries"), "3")
+        XCTAssertEqual(value(after: "--extractor-retries"), "3")
+        let printToFileIndex = try XCTUnwrap(
+            limitedArguments.firstIndex(of: "--print-to-file")
+        )
+        XCTAssertFalse(limitedArguments.contains("--print"))
+        XCTAssertEqual(
+            limitedArguments[limitedArguments.index(after: printToFileIndex)],
+            "after_move:harbor-file:%(filepath)j"
+        )
+        let receiptPathIndex = limitedArguments.index(
+            printToFileIndex,
+            offsetBy: 2
+        )
+        XCTAssertEqual(
+            limitedArguments[receiptPathIndex],
+            "/tmp/media%%owned/final-paths.jsonl"
+        )
+
         let selectedArguments = try MediaDownloadService.downloadArguments(
             runtime: runtime,
             sourceURL: sourceURL,
             destinationFolder: destinationURL,
             temporaryFolder: temporaryURL,
-            metadata: metadata.persistenceSnapshot,
-            formatPreference: .specific(selection),
+            metadata: formatFixture.metadata.persistenceSnapshot,
+            formatPreference: .specific(formatFixture.selection),
+            completionReceiptURL: temporaryURL.appendingPathComponent("final-paths.jsonl"),
             speedLimitBytesPerSecond: 345_678
         )
 
@@ -348,13 +420,28 @@ final class HarborModelAndSafetyTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            selection.displaySummary,
+            formatFixture.selection.displaySummary,
             "1080p • MP4 • AVC1 + English (Original)"
         )
+        let capabilities = formatFixture.metadata.capabilities
+        let preference = MediaDownloadFormatPreference.specific(formatFixture.selection)
         XCTAssertEqual(
-            MediaDownloadFormatPreference.specific(selection)
+            capabilities.preference(selectingPrimaryFormatID: "137")?.selection,
+            formatFixture.selection
+        )
+        XCTAssertEqual(capabilities.preference(selectingPrimaryFormatID: nil), .bestAvailable)
+        let unavailable = MediaDownloadFormatPreference.specific(
+            MediaDownloadFormatSelection(legacySelector: "missing")
+        )
+        XCTAssertEqual(
+            [preference, unavailable].map { capabilities.isSelectionUnavailable(in: $0) },
+            [false, true]
+        )
+        XCTAssertEqual(capabilities.unavailablePrimaryFormatID(in: unavailable), "missing")
+        XCTAssertEqual(
+            MediaDownloadFormatPreference.specific(formatFixture.selection)
                 .initialExpectedBytes(metadataEstimate: 243_768_398),
-            selection.estimatedBytes
+            formatFixture.selection.estimatedBytes
         )
         XCTAssertEqual(
             MediaDownloadFormatPreference.bestAvailable
@@ -364,70 +451,25 @@ final class HarborModelAndSafetyTests: XCTestCase {
     }
 
     func testMediaRecordPersistsSelectionWithoutFormatCatalog() throws {
-        let sourceURL = try XCTUnwrap(URL(string: "https://example.com/video"))
-        let videoFormat = MediaDownloadFormatOption(
-            formatID: "137",
-            container: "mp4",
-            videoCodec: "avc1.640028",
-            audioCodec: nil,
-            width: 1_920,
-            height: 1_080,
-            framesPerSecond: 30,
-            dynamicRange: "SDR",
-            bitrateKbps: 4_500,
-            estimatedBytes: 9_000_000
-        )
-        let audioFormat = MediaDownloadFormatOption(
-            formatID: "140",
-            container: "m4a",
-            videoCodec: nil,
-            audioCodec: "mp4a.40.2",
-            width: nil,
-            height: nil,
-            framesPerSecond: nil,
-            dynamicRange: nil,
-            bitrateKbps: 128,
-            estimatedBytes: 1_000_000,
-            language: "en",
-            formatNote: "English (Original)",
-            audioChannels: 2,
-            languagePreference: 10
-        )
-        let metadata = MediaDownloadMetadata(
-            title: "Video",
-            platform: "Test",
-            extractorKey: "Test",
-            thumbnailURL: nil,
-            webpageURL: sourceURL,
-            expectedBytes: 10_000_000,
-            mediaType: .video,
-            entryCount: 1,
-            capabilities: MediaDownloadCapabilities(
-                formatOptions: [videoFormat, audioFormat]
-            )
-        )
-        let selection = MediaDownloadFormatSelection(
-            format: videoFormat,
-            audioFormat: audioFormat
-        )
+        let fixture = makeMediaFormatTestFixture()
         let item = DownloadItem(
-            sourceURL: sourceURL,
+            sourceURL: fixture.sourceURL,
             sourceKind: .mediaURL,
             backend: .ytDlp,
             preferredFilename: nil,
             destinationFolderPath: "/tmp/downloads",
             status: .paused,
-            mediaMetadata: metadata,
-            mediaFormatPreference: .specific(selection)
+            mediaMetadata: fixture.metadata,
+            mediaFormatPreference: .specific(fixture.selection)
         )
 
         let record = item.makeRecord()
 
         XCTAssertEqual(record.mediaMetadata?.capabilities, .unavailable)
-        XCTAssertEqual(record.mediaFormatPreference, .specific(selection))
+        XCTAssertEqual(record.mediaFormatPreference, .specific(fixture.selection))
         XCTAssertEqual(
             item.mediaMetadata?.capabilities.formatOptions,
-            [videoFormat, audioFormat]
+            [fixture.videoFormat, fixture.audioFormat]
         )
 
         let encodedRecord = try JSONEncoder().encode(record)
@@ -585,7 +627,93 @@ final class HarborModelAndSafetyTests: XCTestCase {
         )
     }
 
-    private func legacyTorrentRecord(status: DownloadStatus) throws -> DownloadRecord {
+    struct ChildMediaAttemptReceipt: Encodable {
+        let version: Int
+        let downloadID: UUID
+        let attemptIdentifier: UUID
+        let sourceURL: URL
+        let destinationFolderPath: String
+        let isCollection: Bool
+        let preexistingDestinationFiles: [
+            String: MediaDownloadService.RegularFileIdentity
+        ]
+        let createdAt: Date
+    }
+
+    func writeChildOwnedMediaCompletionEvidence(
+        recoveryFolder: URL,
+        downloadID: UUID,
+        attemptIdentifier: UUID,
+        sourceURL: URL,
+        destinationFolder: URL,
+        completedURLs: [URL],
+        isCollection: Bool = false,
+        includeSuccessMarker: Bool = true,
+        preexistingDestinationFiles: [
+            String: MediaDownloadService.RegularFileIdentity
+        ] = [:]
+    ) throws {
+        let receipt = ChildMediaAttemptReceipt(
+            version: 1,
+            downloadID: downloadID,
+            attemptIdentifier: attemptIdentifier,
+            sourceURL: sourceURL,
+            destinationFolderPath: destinationFolder.standardizedFileURL.path,
+            isCollection: isCollection,
+            preexistingDestinationFiles: preexistingDestinationFiles,
+            createdAt: .now
+        )
+        try JSONEncoder().encode(receipt).write(
+            to: recoveryFolder.appendingPathComponent(".harbor-attempt.json"),
+            options: .atomic
+        )
+        let pathLines = try completedURLs.map { url in
+            let encodedPath = try XCTUnwrap(
+                String(data: JSONEncoder().encode(url.path), encoding: .utf8)
+            )
+            return "harbor-file:\(encodedPath)"
+        }.joined(separator: "\n") + "\n"
+        try Data(pathLines.utf8).write(
+            to: recoveryFolder.appendingPathComponent(".harbor-final-paths.jsonl"),
+            options: .atomic
+        )
+        if includeSuccessMarker {
+            try Data("\(attemptIdentifier.uuidString)\n".utf8).write(
+                to: recoveryFolder.appendingPathComponent(".harbor-process-succeeded"),
+                options: .atomic
+            )
+        }
+    }
+
+    func makeCompletedHandoff(
+        payloadURL: URL,
+        handoffDirectoryURL: URL,
+        downloadID: UUID,
+        attemptIdentifier: UUID,
+        sourceURL: URL,
+        owner: CompletedDownloadHandoffOwner = .direct,
+        suggestedFilename: String? = nil,
+        statusCode: Int? = 200,
+        mimeType: String? = "application/octet-stream"
+    ) throws -> CompletedDownloadHandoff {
+        let byteCount = Int64(try Data(contentsOf: payloadURL).count)
+        return try CompletedDownloadHandoffStore(directoryURL: handoffDirectoryURL).publish(
+            payloadAt: payloadURL,
+            manifest: CompletedDownloadHandoffManifest(
+                downloadID: downloadID,
+                attemptIdentifier: attemptIdentifier,
+                owner: owner,
+                sourceURL: sourceURL,
+                statusCode: statusCode,
+                mimeType: mimeType,
+                suggestedFilename: suggestedFilename,
+                actualBytes: byteCount,
+                expectedBytes: byteCount
+            )
+        )
+    }
+
+    func legacyTorrentRecord(status: DownloadStatus) throws -> DownloadRecord {
         let record = DownloadRecord(
             id: UUID(),
             sourceURL: URL(fileURLWithPath: "/tmp/legacy.torrent"),
@@ -613,6 +741,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
         [
             "downloadLimitOverride",
             "uploadLimitOverride",
+            "requiresMediaRecoveryReset",
             "torrentFingerprint",
             "torrentSourceFingerprint",
             "managedTorrentSourcePath",
@@ -627,7 +756,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
         return try JSONDecoder().decode(DownloadRecord.self, from: legacyData)
     }
 
-    private func makeTorrentItem(
+    func makeTorrentItem(
         sourceURL: URL,
         sourceKind: DownloadSourceKind,
         status: DownloadStatus = .completed,
@@ -646,7 +775,6 @@ final class HarborModelAndSafetyTests: XCTestCase {
         )
     }
 }
-
 @MainActor
 private final class FakeQuickLookPreviewService: QuickLookPreviewing {
     private(set) var previewedURLs: [URL] = []

@@ -36,7 +36,7 @@ struct Aria2BinaryResolver {
         nonisolated init(
             fileManager: FileManager = .default,
             environment: [String: String] = ProcessInfo.processInfo.environment,
-            bundledResourceRoots: [URL] = Self.defaultBundledResourceRoots(),
+            bundledResourceRoots: [URL] = HarborApplicationSupport.bundledResourceRoots(),
             candidatePaths: [String] = Self.defaultCandidatePaths,
             pathLookup: @escaping @Sendable () -> URL? = Aria2BinaryResolver.resolveFromPATH
         ) {
@@ -53,23 +53,6 @@ struct Aria2BinaryResolver {
             "/opt/local/bin/aria2c"
         ]
 
-        nonisolated private static func defaultBundledResourceRoots() -> [URL] {
-            var roots: [URL] = []
-            var seenPaths = Set<String>()
-
-            for resourceURL in [
-                Bundle.main.resourceURL,
-                Bundle(for: BundleToken.self).resourceURL
-            ].compactMap({ $0 }) {
-                guard seenPaths.insert(resourceURL.path).inserted else {
-                    continue
-                }
-
-                roots.append(resourceURL)
-            }
-
-            return roots
-        }
     }
 
     nonisolated static let installHint = "Harbor couldn’t find a compatible bundled torrent engine. Reinstall the app, or set `ARIA2C_PATH` to a portable `aria2c` runtime."
@@ -113,7 +96,7 @@ struct Aria2BinaryResolver {
             let candidateURLs = [
                 root
                     .appendingPathComponent("TorrentRuntime", isDirectory: true)
-                    .appendingPathComponent(runtimeArchitectureName, isDirectory: true)
+                    .appendingPathComponent(HarborApplicationSupport.architectureName, isDirectory: true)
                     .appendingPathComponent("bin", isDirectory: true)
                     .appendingPathComponent("aria2c", isDirectory: false),
                 root
@@ -159,15 +142,4 @@ struct Aria2BinaryResolver {
         return URL(fileURLWithPath: path)
     }
 
-    private nonisolated static var runtimeArchitectureName: String {
-        #if arch(arm64)
-        "arm64"
-        #elseif arch(x86_64)
-        "x86_64"
-        #else
-        "unsupported"
-        #endif
-    }
 }
-
-private final class BundleToken: NSObject {}

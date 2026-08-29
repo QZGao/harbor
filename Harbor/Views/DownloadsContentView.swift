@@ -111,6 +111,7 @@ struct DownloadsContentView: View {
                 Label("Add Download", systemImage: "plus")
             }
             .buttonStyle(LiquidPillButtonStyle(prominent: true))
+            .disabled(center.canAddDownloads == false)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

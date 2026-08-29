@@ -119,6 +119,7 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
         let torrentURL = watchDirectoryURL.appendingPathComponent("watched.torrent")
         try Data("paused watched torrent".utf8).write(to: torrentURL)
 
+        await center.initializeIfNeeded()
         center.receiveWatchedTorrent(torrentURL)
 
         for _ in 0 ..< 40 {
@@ -143,6 +144,13 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
         XCTAssertTrue(fileManager.fileExists(atPath: torrentURL.path))
 
         center.removeDownload(id: item.id)
+
+        for _ in 0 ..< 100 {
+            if center.downloads.isEmpty {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
 
         XCTAssertTrue(center.downloads.isEmpty)
         XCTAssertFalse(fileManager.fileExists(atPath: torrentURL.path))
@@ -432,8 +440,15 @@ final class TorrentLifecycleAndStorageTests: XCTestCase {
         )
         let center = DownloadCenter(
             settings: settings,
+            persistence: DownloadPersistence(
+                directoryURL: rootURL.appendingPathComponent("Persistence", isDirectory: true)
+            ),
+            directRecoveryDirectoryURL: rootURL.appendingPathComponent("DirectRecovery", isDirectory: true),
+            completedHandoffDirectoryURL: rootURL.appendingPathComponent("Handoffs", isDirectory: true),
+            browserRecoveryDirectoryURL: rootURL.appendingPathComponent("BrowserRecovery", isDirectory: true),
             managedTorrentSourceStore: store
         )
+        await center.initializeIfNeeded()
         center.downloads = [restoredItem]
 
         center.receiveWatchedTorrent(reimportedSourceURL)

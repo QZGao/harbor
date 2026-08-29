@@ -209,8 +209,8 @@ struct AddDownloadSheet: View {
 
                             ForEach(mediaPreview.capabilities.formatOptions) { format in
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(mediaFormatTitle(format))
-                                    Text(mediaFormatDetails(format))
+                                    Text(format.formatTitle)
+                                    Text(format.formatDetails)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -242,7 +242,7 @@ struct AddDownloadSheet: View {
                                         .tag(String?.none)
 
                                     ForEach(mediaPreview.capabilities.audioFormatOptions) { audioFormat in
-                                        Text(mediaAudioFormatTitle(audioFormat))
+                                        Text(audioFormat.audioFormatTitle)
                                             .tag(Optional(audioFormat.id))
                                     }
                                 }
@@ -258,7 +258,7 @@ struct AddDownloadSheet: View {
                         }
                     }
 
-                    if let mergeOutputFormat = selectedFormatSelection?.mergeOutputFormat {
+                    if let mergeOutputFormat = mediaFormatPreference.selection?.mergeOutputFormat {
                         LabeledContent("Output") {
                             Text(mergeOutputFormat.uppercased())
                                 .foregroundStyle(.secondary)
@@ -296,42 +296,23 @@ struct AddDownloadSheet: View {
         }
     }
 
-    private var selectedFormatSelection: MediaDownloadFormatSelection? {
-        guard case let .specific(selection) = mediaFormatPreference else {
-            return nil
-        }
-
-        return selection
-    }
-
     private var selectedFormat: MediaDownloadFormatOption? {
-        guard let mediaPreview,
-              let formatID = selectedFormatSelection?.formatID else {
-            return nil
-        }
-
-        return mediaPreview.capabilities.formatOption(id: formatID)
+        mediaPreview?.capabilities.selectedFormat(in: mediaFormatPreference)
     }
 
     private var primaryFormatSelection: Binding<String?> {
         Binding(
             get: {
-                selectedFormatSelection?.formatID
+                mediaFormatPreference.selection?.formatID
             },
             set: { formatID in
-                guard let formatID else {
-                    mediaFormatPreference = .bestAvailable
-                    return
-                }
-
                 guard let mediaPreview,
-                      let format = mediaPreview.capabilities.formatOption(id: formatID) else {
+                      let preference = mediaPreview.capabilities.preference(
+                          selectingPrimaryFormatID: formatID
+                      ) else {
                     return
                 }
-
-                mediaFormatPreference = .specific(
-                    mediaPreview.capabilities.defaultSelection(for: format)
-                )
+                mediaFormatPreference = preference
             }
         )
     }
@@ -339,19 +320,17 @@ struct AddDownloadSheet: View {
     private var audioFormatSelection: Binding<String?> {
         Binding(
             get: {
-                selectedFormatSelection?.audioFormatID
+                mediaFormatPreference.selection?.audioFormatID
             },
             set: { audioFormatID in
                 guard let mediaPreview,
-                      let selectedFormat,
-                      let selection = mediaPreview.capabilities.selection(
-                          for: selectedFormat,
-                          audioFormatID: audioFormatID
+                      let preference = mediaPreview.capabilities.preference(
+                          mediaFormatPreference,
+                          selectingAudioFormatID: audioFormatID
                       ) else {
                     return
                 }
-
-                mediaFormatPreference = .specific(selection)
+                mediaFormatPreference = preference
             }
         )
     }
@@ -782,186 +761,6 @@ struct AddDownloadSheet: View {
         ]
             .compactMap { $0 }
             .joined(separator: " • ")
-    }
-
-    private func mediaFormatTitle(_ format: MediaDownloadFormatOption) -> String {
-        let mediaKind: String
-        if let height = format.height {
-            mediaKind = "\(height)p"
-        } else if let width = format.width {
-            mediaKind = "\(width) px"
-        } else if format.videoCodec != nil {
-            mediaKind = String(
-                localized: "media.format.video",
-                defaultValue: "Video",
-                comment: "Fallback label for a video format whose dimensions are unknown."
-            )
-        } else if format.audioCodec != nil {
-            mediaKind = String(
-                localized: "media.format.audio",
-                defaultValue: "Audio",
-                comment: "Label for an audio-only media format."
-            )
-        } else {
-            mediaKind = String(
-                localized: "media.format.media",
-                defaultValue: "Media",
-                comment: "Fallback label for a media format whose type is unknown."
-            )
-        }
-
-        return "\(mediaKind) \(format.container.uppercased())"
-    }
-
-    private func mediaFormatDetails(_ format: MediaDownloadFormatOption) -> String {
-        var details: [String] = []
-
-        if format.hasAudio,
-           let language = format.language?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           language.isEmpty == false {
-            details.append(language.uppercased())
-        }
-
-        if format.hasAudio,
-           let formatNote = format.formatNote?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           formatNote.isEmpty == false {
-            details.append(formatNote)
-        }
-
-        if let videoCodec = format.videoCodec {
-            details.append(mediaCodecTitle(videoCodec))
-        }
-
-        if let audioCodec = format.audioCodec {
-            details.append(mediaCodecTitle(audioCodec))
-        } else if format.videoCodec != nil {
-            details.append(
-                String(
-                    localized: "media.format.separateAudio",
-                    defaultValue: "Separate audio",
-                    comment: "Media format detail shown when a video stream requires a separate audio selection."
-                )
-            )
-        }
-
-        if let audioChannels = format.audioChannels, audioChannels > 0 {
-            switch audioChannels {
-            case 1:
-                details.append("Mono")
-            case 2:
-                details.append("Stereo")
-            default:
-                details.append("\(audioChannels) channels")
-            }
-        }
-
-        if let framesPerSecond = format.framesPerSecond, framesPerSecond > 0 {
-            details.append("\(framesPerSecond.formatted(.number.precision(.fractionLength(0...2)))) fps")
-        }
-
-        if let dynamicRange = format.dynamicRange,
-           dynamicRange.caseInsensitiveCompare("SDR") != .orderedSame {
-            details.append(dynamicRange)
-        }
-
-        if let bitrateKbps = format.bitrateKbps,
-           bitrateKbps.isFinite,
-           bitrateKbps > 0 {
-            details.append(
-                "\(bitrateKbps.formatted(.number.precision(.fractionLength(0)))) kbps"
-            )
-        }
-
-        if format.estimatedBytes > 0 {
-            details.append(DownloadFormatting.byteString(format.estimatedBytes))
-        }
-
-        return details.joined(separator: " • ")
-    }
-
-    private func mediaAudioFormatTitle(_ format: MediaDownloadFormatOption) -> String {
-        var components: [String] = []
-
-        if let language = format.language?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           language.isEmpty == false {
-            components.append(language.uppercased())
-        }
-
-        if let formatNote = format.formatNote?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           formatNote.isEmpty == false {
-            components.append(formatNote)
-        }
-
-        components.append(format.container.uppercased())
-
-        if let audioCodec = format.audioCodec {
-            components.append(mediaCodecTitle(audioCodec))
-        }
-
-        if let bitrateKbps = format.bitrateKbps,
-           bitrateKbps.isFinite,
-           bitrateKbps > 0 {
-            components.append(
-                "\(bitrateKbps.formatted(.number.precision(.fractionLength(0)))) kbps"
-            )
-        }
-
-        if let audioChannels = format.audioChannels, audioChannels > 0 {
-            switch audioChannels {
-            case 1:
-                components.append("Mono")
-            case 2:
-                components.append("Stereo")
-            default:
-                components.append("\(audioChannels) channels")
-            }
-        }
-
-        return components.joined(separator: " • ")
-    }
-
-    private func mediaCodecTitle(_ codec: String) -> String {
-        let normalizedCodec = codec.lowercased()
-
-        if normalizedCodec.hasPrefix("avc1") || normalizedCodec.hasPrefix("h264") {
-            return "H.264"
-        }
-
-        if normalizedCodec.hasPrefix("hev1")
-            || normalizedCodec.hasPrefix("hvc1")
-            || normalizedCodec.hasPrefix("hevc") {
-            return "HEVC"
-        }
-
-        if normalizedCodec.hasPrefix("av01") || normalizedCodec == "av1" {
-            return "AV1"
-        }
-
-        if normalizedCodec.hasPrefix("vp9") {
-            return "VP9"
-        }
-
-        if normalizedCodec.hasPrefix("vp8") {
-            return "VP8"
-        }
-
-        if normalizedCodec.hasPrefix("mp4a") || normalizedCodec == "aac" {
-            return "AAC"
-        }
-
-        if normalizedCodec.hasPrefix("opus") {
-            return "Opus"
-        }
-
-        if normalizedCodec.hasPrefix("vorbis") {
-            return "Vorbis"
-        }
-
-        return codec.uppercased()
     }
 
     private func mediaTypeTitle(for metadata: MediaDownloadMetadata) -> String {

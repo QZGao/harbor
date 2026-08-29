@@ -18,11 +18,13 @@ struct DownloadCommands: Commands {
                 center.presentAddSheet()
             }
             .keyboardShortcut("n")
+            .disabled(center.canAddDownloads == false)
 
             Button("Add from Clipboard") {
                 center.addDownloadSourcesFromPasteboard()
             }
             .keyboardShortcut("v", modifiers: [.command, .shift])
+            .disabled(center.canAddDownloads == false)
 
             Button("Find Downloads") {
                 focusDownloadSearch?()
@@ -94,7 +96,9 @@ struct DownloadCommands: Commands {
             .disabled(center.hasCompletedDownloads == false)
 
             Button("Clear Failed") {
-                center.clearFailed()
+                Task {
+                    await center.clearFailed()
+                }
             }
             .disabled(center.hasFailedDownloads == false)
         }
