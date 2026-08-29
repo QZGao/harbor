@@ -970,7 +970,7 @@ actor Aria2TorrentService {
         self.rpcSecret = secret
         self.stderrPipe = stderrPipe
         do {
-            try persistDaemonOwnership(
+            try await persistDaemonOwnership(
                 process: process,
                 binaryURL: binaryURL,
                 sessionFileURL: sessionFileURL,
@@ -1597,12 +1597,29 @@ actor Aria2TorrentService {
         binaryURL: URL,
         sessionFileURL: URL,
         rpcPort: Int
-    ) throws {
-        guard let daemon = try runningDaemons(matching: binaryURL.path).first(where: {
-            $0.pid == process.processIdentifier
-                && daemonUsesHarborSession($0, sessionFileURL: sessionFileURL)
-                && $0.command.contains("--rpc-listen-port=\(rpcPort)")
-        }) else {
+    ) async throws {
+        var verifiedDaemon: RunningDaemon?
+
+        // Process.run() can return before the new executable is visible in a
+        // separate ps snapshot. Keep every identity check exact while giving
+        // macOS a short, bounded window to publish the launched process.
+        for attempt in 0 ..< 20 {
+            verifiedDaemon = try runningDaemons(matching: binaryURL.path).first(where: {
+                $0.pid == process.processIdentifier
+                    && daemonUsesHarborSession($0, sessionFileURL: sessionFileURL)
+                    && $0.command.contains("--rpc-listen-port=\(rpcPort)")
+            })
+            if verifiedDaemon != nil || process.isRunning == false {
+                break
+            }
+            if attempt < 19 {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+        }
+
+        // TODO: Share a direct Darwin process-identity reader with the media
+        // backend if ps publication timing causes more ownership races.
+        guard let daemon = verifiedDaemon else {
             throw TorrentEngineError.startupFailed(
                 "Harbor could not verify the newly launched aria2 process."
             )

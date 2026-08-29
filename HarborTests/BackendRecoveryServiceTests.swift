@@ -4,6 +4,48 @@ import XCTest
 @testable import Harbor
 
 extension HarborModelAndSafetyTests {
+    func testBundledAriaDaemonPersistsOwnershipAfterLaunch() async throws {
+        guard Aria2BinaryResolver.resolveBinaryURL() != nil else {
+            throw XCTSkip("The bundled aria2 runtime is not available in this test build.")
+        }
+
+        let fileManager = FileManager.default
+        let applicationSupportURL = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborAriaStartupTests-\(UUID().uuidString)", isDirectory: true)
+        let environmentKey = "HARBOR_APPLICATION_SUPPORT_DIR"
+        let previousValue = getenv(environmentKey).map { String(cString: $0) }
+        defer {
+            if let previousValue {
+                setenv(environmentKey, previousValue, 1)
+            } else {
+                unsetenv(environmentKey)
+            }
+            try? fileManager.removeItem(at: applicationSupportURL)
+        }
+        setenv(environmentKey, applicationSupportURL.path, 1)
+
+        let service = Aria2TorrentService()
+        var startupError: Error?
+        do {
+            let knownGIDs = try await service.allKnownGIDs()
+            XCTAssertTrue(knownGIDs.isEmpty)
+        } catch {
+            startupError = error
+        }
+        try? await service.shutdown()
+
+        if let startupError {
+            throw startupError
+        }
+        XCTAssertFalse(
+            fileManager.fileExists(
+                atPath: applicationSupportURL
+                    .appendingPathComponent("aria2.daemon-owner.json")
+                    .path
+            )
+        )
+    }
+
     func testMediaRecoveryCleanupPreservesRecordedFoldersAndRemovesOrphans() async throws {
         let fileManager = FileManager.default
         let recoveryRoot = fileManager.temporaryDirectory
