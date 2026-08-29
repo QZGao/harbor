@@ -3930,12 +3930,6 @@ final class DownloadCenter {
             return
         }
 
-        if item.sourceKind == .magnetLink {
-            item.shouldSeedAfterDownload = true
-            startOrQueueDownload(id: id)
-            return
-        }
-
         let sourceURL: URL
         if item.sourceURL.isFileURL,
            FileManager.default.fileExists(atPath: item.sourceURL.path) == false {
