@@ -9,6 +9,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 yt_dlp_version="${YT_DLP_VERSION:-2026.06.09}"
 yt_dlp_url="${YT_DLP_URL:-https://github.com/yt-dlp/yt-dlp/releases/download/${yt_dlp_version}/yt-dlp_macos}"
+deno_version="${DENO_VERSION:-2.9.6}"
 arm64_ffmpeg_path="${ARM64_FFMPEG_PATH:-${FFMPEG_PATH:-$(command -v ffmpeg || true)}}"
 arm64_ffprobe_path="${ARM64_FFPROBE_PATH:-${FFPROBE_PATH:-$(command -v ffprobe || true)}}"
 x86_64_ffmpeg_version="${X86_64_FFMPEG_VERSION:-8.1.2}"
@@ -41,6 +42,29 @@ copy_yt_dlp() {
   ditto "${tmp_dir}/yt-dlp" "${destination}/yt-dlp"
   chmod 755 "${destination}/yt-dlp"
   codesign --force --sign - "${destination}/yt-dlp"
+}
+
+copy_deno() {
+  local architecture="$1"
+  local destination="$2"
+  local archive="${tmp_dir}/deno-${architecture}.zip"
+  local extract_dir="${tmp_dir}/deno-${architecture}"
+  local deno_target
+
+  case "$architecture" in
+    arm64) deno_target="aarch64-apple-darwin" ;;
+    x86_64) deno_target="x86_64-apple-darwin" ;;
+  esac
+
+  echo "Downloading Deno ${deno_version} for ${architecture}"
+  download_file \
+    "https://github.com/denoland/deno/releases/download/v${deno_version}/deno-${deno_target}.zip" \
+    "$archive"
+  mkdir -p "$extract_dir"
+  ditto -x -k "$archive" "$extract_dir"
+  ditto "${extract_dir}/deno" "${destination}/deno"
+  chmod 755 "${destination}/deno"
+  codesign --force --sign - "${destination}/deno"
 }
 
 is_system_dependency() {
@@ -138,6 +162,7 @@ stage_arm64_runtime() {
   rm -rf "${runtime_dir:?}/${arch}"
   mkdir -p "$bin_dir" "$lib_dir"
   copy_yt_dlp "$bin_dir"
+  copy_deno "$arch" "$bin_dir"
 
   ditto "$arm64_ffmpeg_path" "${bin_dir}/ffmpeg"
   ditto "$arm64_ffprobe_path" "${bin_dir}/ffprobe"
@@ -169,6 +194,7 @@ stage_x86_64_runtime() {
   rm -rf "${runtime_dir:?}/${arch}"
   mkdir -p "$bin_dir" "$ffmpeg_extract" "$ffprobe_extract"
   copy_yt_dlp "$bin_dir"
+  copy_deno "$arch" "$bin_dir"
 
   download_file "$x86_64_ffmpeg_url" "$ffmpeg_zip"
   download_file "$x86_64_ffprobe_url" "$ffprobe_zip"
@@ -204,6 +230,7 @@ cat > "${runtime_dir}/README.md" <<EOF
 This directory holds Harbor's self-contained media runtime for public media downloads.
 
 - yt-dlp: ${yt_dlp_version}, universal macOS build copied into both architecture folders.
+- Deno: ${deno_version}, official macOS builds for each architecture.
 - arm64 ffmpeg/ffprobe: copied from ${arm64_ffmpeg_path%/bin/ffmpeg}
 - x86_64 ffmpeg/ffprobe: Evermeet ${x86_64_ffmpeg_version} static macOS builds.
 

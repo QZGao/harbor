@@ -30,11 +30,19 @@ for architecture in arm64 x86_64; do
   torrent_bin="${torrent_runtime_root}/${architecture}/bin"
 
   check_executable "${media_bin}/yt-dlp"
+  check_executable "${media_bin}/deno"
   check_executable "${media_bin}/ffmpeg"
   check_executable "${media_bin}/ffprobe"
   check_executable "${torrent_bin}/aria2c"
 
   run_for_arch "$architecture" "${media_bin}/yt-dlp" --version >/dev/null
+  run_for_arch "$architecture" "${media_bin}/deno" --version >/dev/null
+  runtime_report="$(run_for_arch "$architecture" "${media_bin}/yt-dlp" --ignore-config --verbose --js-runtimes "deno:${media_bin}/deno" --simulate about:blank 2>&1 || true)"
+  if [[ "$runtime_report" != *"JS runtimes: deno-"* ]]; then
+    echo "yt-dlp did not detect bundled Deno for ${architecture}." >&2
+    echo "$runtime_report" >&2
+    exit 1
+  fi
   run_for_arch "$architecture" "${media_bin}/ffmpeg" -version >/dev/null
   run_for_arch "$architecture" "${media_bin}/ffprobe" -version >/dev/null
   run_for_arch "$architecture" "${torrent_bin}/aria2c" --version >/dev/null

@@ -71,6 +71,7 @@ assert_harbor_alive
 
 MEDIA_ARCH="$(uname -m)"
 YTDLP_PATH="$APP_PATH/Contents/Resources/MediaRuntime/$MEDIA_ARCH/bin/yt-dlp"
+DENO_PATH="$APP_PATH/Contents/Resources/MediaRuntime/$MEDIA_ARCH/bin/deno"
 ARIA2_PATH="$APP_PATH/Contents/Resources/TorrentRuntime/$MEDIA_ARCH/bin/aria2c"
 
 if [ -x "$YTDLP_PATH" ]; then
@@ -78,6 +79,14 @@ if [ -x "$YTDLP_PATH" ]; then
   "$YTDLP_PATH" --version >/dev/null
 else
   echo "Expected bundled yt-dlp helper at: $YTDLP_PATH" >&2
+  exit 1
+fi
+
+if [ -x "$DENO_PATH" ]; then
+  echo "Testing bundled Deno helper..."
+  "$DENO_PATH" --version >/dev/null
+else
+  echo "Expected bundled Deno helper at: $DENO_PATH" >&2
   exit 1
 fi
 

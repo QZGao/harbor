@@ -1128,6 +1128,8 @@ actor MediaDownloadService {
             "--ignore-config",
             "--no-cache-dir",
             "--no-warnings",
+            "--js-runtimes",
+            "deno:\(runtime.denoURL.path)",
             "--socket-timeout",
             "15",
             "--retries",
@@ -1223,6 +1225,8 @@ actor MediaDownloadService {
         var arguments = [
             "--ignore-config",
             "--no-cache-dir",
+            "--js-runtimes",
+            "deno:\(runtime.denoURL.path)",
             "--newline",
             "--progress",
             "--continue",

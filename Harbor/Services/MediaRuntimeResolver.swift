@@ -2,6 +2,7 @@ import Foundation
 
 struct MediaRuntimeResolution: Equatable, Sendable {
     let ytDlpURL: URL
+    let denoURL: URL
     let ffmpegURL: URL
     let ffprobeURL: URL
 }
@@ -33,7 +34,7 @@ struct MediaRuntimeResolver {
 
     }
 
-    nonisolated static let installHint = "Harbor couldn’t find its bundled media engine. Reinstall the app, or set `YTDLP_PATH`, `FFMPEG_PATH`, and `FFPROBE_PATH` to compatible binaries."
+    nonisolated static let installHint = "Harbor couldn’t find its bundled media engine. Reinstall the app, or set `YTDLP_PATH`, `DENO_PATH`, `FFMPEG_PATH`, and `FFPROBE_PATH` to compatible binaries."
 
     nonisolated static func resolveRuntime(using context: Context = Context()) -> MediaRuntimeResolution? {
         if let bundledRuntime = resolveBundledRuntime(using: context) {
@@ -64,16 +65,19 @@ struct MediaRuntimeResolver {
 
     private nonisolated static func resolveEnvironmentOverride(using context: Context) -> MediaRuntimeResolution? {
         guard let ytDlpPath = context.environment["YTDLP_PATH"],
+              let denoPath = context.environment["DENO_PATH"],
               let ffmpegPath = context.environment["FFMPEG_PATH"],
               let ffprobePath = context.environment["FFPROBE_PATH"] else {
             return nil
         }
 
         let ytDlpURL = URL(fileURLWithPath: ytDlpPath)
+        let denoURL = URL(fileURLWithPath: denoPath)
         let ffmpegURL = URL(fileURLWithPath: ffmpegPath)
         let ffprobeURL = URL(fileURLWithPath: ffprobePath)
 
         guard context.fileManager.isExecutableFile(atPath: ytDlpURL.path),
+              context.fileManager.isExecutableFile(atPath: denoURL.path),
               context.fileManager.isExecutableFile(atPath: ffmpegURL.path),
               context.fileManager.isExecutableFile(atPath: ffprobeURL.path) else {
             return nil
@@ -81,6 +85,7 @@ struct MediaRuntimeResolver {
 
         return MediaRuntimeResolution(
             ytDlpURL: ytDlpURL,
+            denoURL: denoURL,
             ffmpegURL: ffmpegURL,
             ffprobeURL: ffprobeURL
         )
@@ -102,10 +107,12 @@ struct MediaRuntimeResolver {
         fileManager: FileManager
     ) -> MediaRuntimeResolution? {
         let ytDlpURL = binDirectory.appendingPathComponent("yt-dlp")
+        let denoURL = binDirectory.appendingPathComponent("deno")
         let ffmpegURL = binDirectory.appendingPathComponent("ffmpeg")
         let ffprobeURL = binDirectory.appendingPathComponent("ffprobe")
 
         guard fileManager.isExecutableFile(atPath: ytDlpURL.path),
+              fileManager.isExecutableFile(atPath: denoURL.path),
               fileManager.isExecutableFile(atPath: ffmpegURL.path),
               fileManager.isExecutableFile(atPath: ffprobeURL.path) else {
             return nil
@@ -113,6 +120,7 @@ struct MediaRuntimeResolver {
 
         return MediaRuntimeResolution(
             ytDlpURL: ytDlpURL,
+            denoURL: denoURL,
             ffmpegURL: ffmpegURL,
             ffprobeURL: ffprobeURL
         )

@@ -272,6 +272,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
     func testMediaDownloadArgumentsKeepAutomaticAndExactFormatPathsSeparate() throws {
         let runtime = MediaRuntimeResolution(
             ytDlpURL: URL(fileURLWithPath: "/tmp/yt-dlp"),
+            denoURL: URL(fileURLWithPath: "/tmp/deno"),
             ffmpegURL: URL(fileURLWithPath: "/tmp/ffmpeg"),
             ffprobeURL: URL(fileURLWithPath: "/tmp/ffprobe")
         )
@@ -381,6 +382,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
         XCTAssertEqual(value(after: "--fragment-retries"), "10")
         XCTAssertEqual(value(after: "--file-access-retries"), "3")
         XCTAssertEqual(value(after: "--extractor-retries"), "3")
+        XCTAssertEqual(value(after: "--js-runtimes"), "deno:/tmp/deno")
         let printToFileIndex = try XCTUnwrap(
             limitedArguments.firstIndex(of: "--print-to-file")
         )
