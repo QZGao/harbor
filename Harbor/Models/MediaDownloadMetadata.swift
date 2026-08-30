@@ -2,6 +2,7 @@ import Foundation
 
 enum MediaDownloadType: String, Codable, Sendable {
     case video
+    case audio
     case image
     case collection
     case unknown
@@ -823,6 +824,10 @@ enum MediaDownloadMetadataParser {
 
         if capabilities.formatOptions.contains(where: { $0.videoCodec != nil }) {
             return .video
+        }
+
+        if capabilities.formatOptions.contains(where: { $0.audioCodec != nil }) {
+            return .audio
         }
 
         if let ext = payload.ext?.lowercased(),

@@ -51,6 +51,7 @@ struct RootView: View {
                 }
         }
         .navigationSplitViewStyle(.balanced)
+        .accessibilityIdentifier(HarborAccessibility.root)
         .searchable(text: $center.searchText, placement: .toolbar, prompt: "Search downloads")
         .searchFocused($isSearchFocused)
         .focusedSceneValue(\.focusDownloadSearch, focusSearch)
@@ -213,6 +214,7 @@ private struct DownloadToolbarContent: ToolbarContent {
             Button("New Download", systemImage: "plus") {
                 center.presentAddSheet()
             }
+            .accessibilityIdentifier(HarborAccessibility.newDownload)
             .disabled(center.canAddDownloads == false)
         }
 
@@ -227,6 +229,7 @@ private struct DownloadToolbarContent: ToolbarContent {
                     center.resumeAll()
                 }
             }
+            .accessibilityIdentifier(HarborAccessibility.pauseResumeAll)
             .disabled(
                 center.hasActiveDownloads
                     ? center.hasPausableDownloads == false

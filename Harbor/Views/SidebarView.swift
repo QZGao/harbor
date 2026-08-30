@@ -16,10 +16,12 @@ struct SidebarView: View {
                             .foregroundStyle(.secondary)
                     }
                     .tag(filter)
+                    .accessibilityIdentifier(HarborAccessibility.sidebarFilter(filter))
                 }
             }
         }
         .listStyle(.sidebar)
+        .accessibilityIdentifier(HarborAccessibility.sidebar)
         .navigationTitle("Downloads")
         .safeAreaInset(edge: .bottom) {
             HStack(spacing: 12) {

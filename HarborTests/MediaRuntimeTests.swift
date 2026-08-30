@@ -128,6 +128,7 @@ final class MediaRuntimeTests: XCTestCase {
             """#
         )
         XCTAssertEqual(checkedAudio.capabilities.formatOptions.map(\.formatID), ["audio-only"])
+        XCTAssertEqual(checkedAudio.mediaType, .audio)
         XCTAssertTrue(checkedAudio.capabilities.supportsMediaFormatSelection)
         XCTAssertTrue(checkedAudio.supportsMediaDownload)
 

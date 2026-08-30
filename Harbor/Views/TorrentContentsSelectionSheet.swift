@@ -42,6 +42,7 @@ struct TorrentContentsSelectionSheet: View {
         }
         .padding(20)
         .frame(minWidth: 640, idealWidth: 720, minHeight: 460, idealHeight: 560)
+        .accessibilityIdentifier(HarborAccessibility.torrentSheet)
         .task(id: loadGeneration) {
             await load()
         }
@@ -86,6 +87,7 @@ struct TorrentContentsSelectionSheet: View {
             }
             .width(min: 90, ideal: 110, max: 140)
         }
+        .accessibilityIdentifier(HarborAccessibility.torrentTable)
     }
 
     private var footer: some View {
@@ -94,11 +96,13 @@ struct TorrentContentsSelectionSheet: View {
                 Button("Select All") {
                     selectedIndexes = Set(preview.files.map(\.index))
                 }
+                .accessibilityIdentifier(HarborAccessibility.torrentSelectAll)
                 .disabled(selectedIndexes.count == preview.files.count)
 
                 Button("Select None") {
                     selectedIndexes.removeAll()
                 }
+                .accessibilityIdentifier(HarborAccessibility.torrentSelectNone)
                 .disabled(selectedIndexes.isEmpty)
 
                 Text(selectionSummary(in: preview))
@@ -112,6 +116,7 @@ struct TorrentContentsSelectionSheet: View {
             Button("Cancel") {
                 dismiss()
             }
+            .accessibilityIdentifier(HarborAccessibility.torrentCancel)
             .keyboardShortcut(.cancelAction)
 
             Button("Add Download") {
@@ -127,6 +132,7 @@ struct TorrentContentsSelectionSheet: View {
                 )
                 dismiss()
             }
+            .accessibilityIdentifier(HarborAccessibility.torrentAdd)
             .keyboardShortcut(.defaultAction)
             .disabled(preview == nil || selectedIndexes.isEmpty)
         }

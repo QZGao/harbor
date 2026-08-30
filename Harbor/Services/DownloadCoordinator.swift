@@ -85,13 +85,18 @@ struct DirectDownloadPauseResult: Sendable {
 }
 
 enum DirectDownloadRetryPolicy {
-    static let delays: [Duration] = [
-        .seconds(2),
-        .seconds(5),
-        .seconds(15),
-        .seconds(30),
-        .seconds(60)
-    ]
+    static var delays: [Duration] {
+        if HarborTestRuntime.isUITesting {
+            return []
+        }
+        return [
+            .seconds(2),
+            .seconds(5),
+            .seconds(15),
+            .seconds(30),
+            .seconds(60)
+        ]
+    }
 
     static func delay(forAttempt attempt: Int) -> Duration? {
         guard attempt > 0, delays.indices.contains(attempt - 1) else {

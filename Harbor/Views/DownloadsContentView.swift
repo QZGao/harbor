@@ -22,13 +22,14 @@ struct DownloadsContentView: View {
                 ) {
                     TableColumn("Name", value: \.displayName) { item in
                         DownloadNameCell(item: item)
+                            .accessibilityIdentifier(HarborAccessibility.downloadRow(item.id))
                     }
                     .customizationID("name")
                     .defaultVisibility(.visible)
                     .disabledCustomizationBehavior(.visibility)
 
                     TableColumn("Status", value: \.status.rawValue) { item in
-                        DownloadStatusBadge(status: item.status)
+                        DownloadStatusBadge(status: item.status, downloadID: item.id)
                     }
                     .customizationID("status")
                     .defaultVisibility(.visible)
@@ -70,6 +71,7 @@ struct DownloadsContentView: View {
                             }
                     }
                 }
+                .accessibilityIdentifier(HarborAccessibility.downloadsTable)
             }
         }
         .navigationTitle(center.selectedFilter.title)
@@ -111,6 +113,7 @@ struct DownloadsContentView: View {
                 Label("Add Download", systemImage: "plus")
             }
             .buttonStyle(LiquidPillButtonStyle(prominent: true))
+            .accessibilityIdentifier(HarborAccessibility.newDownload)
             .disabled(center.canAddDownloads == false)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

@@ -6,6 +6,7 @@ struct DownloadDetailView: View {
     var body: some View {
         if let item = center.selectedDownload {
             DownloadInspectorContent(item: item, center: center)
+                .accessibilityIdentifier(HarborAccessibility.inspector)
         }
     }
 }
@@ -472,11 +473,13 @@ private struct DownloadActionRow: View {
                 Label("Continue", systemImage: "globe")
             }
             .buttonStyle(LiquidPillButtonStyle(prominent: true))
+            .accessibilityIdentifier(HarborAccessibility.inspectorPrimaryAction)
         } else if item.status == .failed || item.status == .cancelled {
             Button(action: retry) {
                 Label("Retry", systemImage: "arrow.clockwise")
             }
             .buttonStyle(LiquidPillButtonStyle(prominent: true))
+            .accessibilityIdentifier(HarborAccessibility.inspectorPrimaryAction)
         } else if item.canPause || item.canResume {
             let isPause = item.canPause
             let isSeedingTransfer = item.status == .seeding
@@ -494,11 +497,13 @@ private struct DownloadActionRow: View {
                 )
             }
             .buttonStyle(LiquidPillButtonStyle(prominent: true))
+            .accessibilityIdentifier(HarborAccessibility.inspectorPrimaryAction)
         } else if item.fileLocationURL != nil {
             Button(action: openFile) {
                 Label("Open", systemImage: "doc.fill")
             }
             .buttonStyle(LiquidPillButtonStyle(prominent: true))
+            .accessibilityIdentifier(HarborAccessibility.inspectorPrimaryAction)
         }
     }
 
@@ -509,6 +514,7 @@ private struct DownloadActionRow: View {
                 Label("Quick Look", systemImage: "eye")
             }
             .buttonStyle(LiquidPillButtonStyle(prominent: false))
+            .accessibilityIdentifier(HarborAccessibility.inspectorSecondaryAction)
             .disabled(canQuickLook == false)
         } else if item.fileLocationURL != nil,
            item.status != .completed {
@@ -516,6 +522,7 @@ private struct DownloadActionRow: View {
                 Label("Open", systemImage: "doc.fill")
             }
             .buttonStyle(LiquidPillButtonStyle(prominent: false))
+            .accessibilityIdentifier(HarborAccessibility.inspectorSecondaryAction)
         }
     }
 
@@ -543,6 +550,7 @@ private struct DownloadActionRow: View {
                 .accessibilityLabel("More actions")
         }
         .buttonStyle(LiquidPillButtonStyle(prominent: false))
+        .accessibilityIdentifier(HarborAccessibility.inspectorMoreActions)
         .help("More actions")
     }
 }

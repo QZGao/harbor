@@ -67,6 +67,7 @@ struct AddDownloadSheet: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Add Download")
                     .font(.title2.weight(.semibold))
+                    .accessibilityIdentifier(HarborAccessibility.addSheet)
                 Text("Paste one or more links, a media post URL, a magnet link, or choose a `.torrent` file. Add several at once by putting one link per line.")
                     .foregroundStyle(.secondary)
             }
@@ -78,6 +79,7 @@ struct AddDownloadSheet: View {
                     }
                 }
                 .pickerStyle(.segmented)
+                .accessibilityIdentifier(HarborAccessibility.addSourceMode)
 
                 if entryMode == .linkOrMagnet {
                     TextField(
@@ -88,6 +90,7 @@ struct AddDownloadSheet: View {
                     )
                     .labelsHidden()
                     .lineLimit(1...8)
+                    .accessibilityIdentifier(HarborAccessibility.addSource)
                     .focused($focusedField, equals: Field.sourceURL)
                     .onChange(of: sourceURLText) {
                         scheduleMediaPreviewRefresh()
@@ -112,6 +115,7 @@ struct AddDownloadSheet: View {
                                     startingAt: URL(fileURLWithPath: destinationPath, isDirectory: true)
                                 )
                             }
+                            .accessibilityIdentifier(HarborAccessibility.addChooseTorrent)
                         }
                     }
                 }
@@ -119,6 +123,7 @@ struct AddDownloadSheet: View {
                 destinationPicker
 
                 Toggle("Start immediately", isOn: $shouldStartImmediately)
+                    .accessibilityIdentifier(HarborAccessibility.addStartImmediately)
             }
             .formStyle(.grouped)
             .padding(.horizontal, -Layout.groupedFormHorizontalExpansion)
@@ -134,6 +139,7 @@ struct AddDownloadSheet: View {
                         sourceURLText = NSPasteboard.general.string(forType: .string) ?? sourceURLText
                         scheduleMediaPreviewRefresh()
                     }
+                    .accessibilityIdentifier(HarborAccessibility.addPaste)
                 }
 
                 Spacer()
@@ -141,12 +147,14 @@ struct AddDownloadSheet: View {
                 Button("Cancel") {
                     dismiss()
                 }
+                .accessibilityIdentifier(HarborAccessibility.addCancel)
                 .keyboardShortcut(.cancelAction)
 
                 if let torrentPreviewCandidate {
                     Button("Preview") {
                         torrentPreviewSource = torrentPreviewCandidate
                     }
+                    .accessibilityIdentifier(HarborAccessibility.addPreview)
                 }
 
                 Button(addButtonTitle) {
@@ -154,6 +162,7 @@ struct AddDownloadSheet: View {
                         await submit()
                     }
                 }
+                .accessibilityIdentifier(HarborAccessibility.addSubmit)
                 .keyboardShortcut(.defaultAction)
                 .disabled(canSubmit == false || isSubmitting)
             }
@@ -264,6 +273,11 @@ struct AddDownloadSheet: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier(HarborAccessibility.addMediaMetadata)
+                    .accessibilityValue(
+                        "extractor=\(mediaPreview.extractorKey ?? "");type=\(mediaPreview.mediaType.rawValue)"
+                    )
                 }
             }
 
@@ -340,6 +354,7 @@ struct AddDownloadSheet: View {
             }
 
             Toggle("I own this content or have permission to save it", isOn: $hasMediaSavePermission)
+                .accessibilityIdentifier(HarborAccessibility.addMediaPermission)
         } else if let mediaPreviewError {
             LabeledContent("Media") {
                 VStack(alignment: .trailing, spacing: 8) {
@@ -351,6 +366,7 @@ struct AddDownloadSheet: View {
                         Button("Try as Media") {
                             tryAsMedia()
                         }
+                        .accessibilityIdentifier(HarborAccessibility.addTryAsMedia)
                     }
                 }
             }
@@ -364,6 +380,7 @@ struct AddDownloadSheet: View {
                 Button("Try as Media") {
                     tryAsMedia()
                 }
+                .accessibilityIdentifier(HarborAccessibility.addTryAsMedia)
             }
         }
     }
@@ -794,7 +811,7 @@ struct AddDownloadSheet: View {
                     ProgressView()
                         .controlSize(.small)
                 case .failure:
-                    Image(systemName: metadata.mediaType == .image ? "photo" : "play.rectangle")
+                    Image(systemName: mediaIconName(for: metadata))
                         .font(.title3)
                         .foregroundStyle(.secondary)
                 @unknown default:
@@ -811,7 +828,7 @@ struct AddDownloadSheet: View {
             ZStack {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(.quaternary)
-                Image(systemName: metadata.mediaType == .image ? "photo" : "play.rectangle")
+                Image(systemName: mediaIconName(for: metadata))
                     .font(.title3)
                     .foregroundStyle(.secondary)
             }
@@ -852,6 +869,12 @@ struct AddDownloadSheet: View {
                 defaultValue: "Video",
                 comment: "Media preview type for video content."
             )
+        case .audio:
+            return String(
+                localized: "media.preview.audio",
+                defaultValue: "Audio",
+                comment: "Media preview type for audio content."
+            )
         case .image:
             return String(
                 localized: "media.preview.image",
@@ -870,6 +893,17 @@ struct AddDownloadSheet: View {
                 defaultValue: "Media",
                 comment: "Media preview type fallback."
             )
+        }
+    }
+
+    private func mediaIconName(for metadata: MediaDownloadMetadata) -> String {
+        switch metadata.mediaType {
+        case .image:
+            return "photo"
+        case .audio:
+            return "waveform"
+        case .video, .collection, .unknown:
+            return "play.rectangle"
         }
     }
 

@@ -40,6 +40,9 @@ actor DownloadNotificationService {
         case .authorized, .provisional, .ephemeral:
             return true
         case .notDetermined:
+            guard HarborTestRuntime.preventsNotificationAuthorizationRequest == false else {
+                return false
+            }
             return (try? await center.requestAuthorization(options: [.alert, .sound, .badge])) ?? false
         case .denied:
             return false

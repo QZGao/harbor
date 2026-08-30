@@ -1,0 +1,64 @@
+{
+  "configurations" : [
+    {
+      "id" : "2EAD8D32-CF99-476B-AE38-53A5B7FE3A29",
+      "name" : "Offline",
+      "options" : {
+        "environmentVariableEntries" : [
+          {
+            "key" : "HARBOR_FIXTURE_BASE_URL",
+            "value" : "$(HARBOR_FIXTURE_BASE_URL)"
+          },
+          {
+            "key" : "HARBOR_FIXTURE_LOG",
+            "value" : "$(HARBOR_FIXTURE_LOG)"
+          },
+          {
+            "key" : "HARBOR_FIXTURE_MEDIA_SHA256",
+            "value" : "$(HARBOR_FIXTURE_MEDIA_SHA256)"
+          },
+          {
+            "key" : "HARBOR_UI_ALLOW_LIVE_NETWORK",
+            "value" : "NO"
+          },
+          {
+            "key" : "HARBOR_UI_ALLOW_SYSTEM_INTEGRATIONS",
+            "value" : "NO"
+          }
+        ]
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "codeCoverage" : false,
+    "targetForVariableExpansion" : {
+      "containerPath" : "container:Harbor.xcodeproj",
+      "identifier" : "0DA35C532F6338930095E98E",
+      "name" : "Harbor"
+    },
+    "testTimeoutsEnabled" : true
+  },
+  "testTargets" : [
+    {
+      "parallelizable" : true,
+      "target" : {
+        "containerPath" : "container:Harbor.xcodeproj",
+        "identifier" : "0D4700062F90000000A1B2C3",
+        "name" : "HarborTests"
+      }
+    },
+    {
+      "parallelizable" : false,
+      "skippedTests" : [
+        "HarborLiveCanaryUITests",
+        "HarborSystemUITests"
+      ],
+      "target" : {
+        "containerPath" : "container:Harbor.xcodeproj",
+        "identifier" : "0D8000062FA0000000A1B2C3",
+        "name" : "HarborUITests"
+      }
+    }
+  ],
+  "version" : 1
+}

@@ -67,7 +67,7 @@ enum HarborApplicationSupport {
             return nil
         }
 
-        // TODO: Keep this CLI hook for release smoke tests until Harbor has a formal UI test target.
+        // Release smoke tests and XCUITest use this hook to keep live Harbor data isolated.
         return URL(fileURLWithPath: path, isDirectory: true)
     }
 

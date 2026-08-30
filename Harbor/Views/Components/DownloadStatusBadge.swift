@@ -2,6 +2,12 @@ import SwiftUI
 
 struct DownloadStatusBadge: View {
     let status: DownloadStatus
+    var downloadID: UUID?
+
+    init(status: DownloadStatus, downloadID: UUID? = nil) {
+        self.status = status
+        self.downloadID = downloadID
+    }
 
     private var tint: Color {
         switch status {
@@ -28,6 +34,10 @@ struct DownloadStatusBadge: View {
 
     var body: some View {
         Label(status.title, systemImage: status.systemImage)
+            .accessibilityIdentifier(
+                downloadID.map { HarborAccessibility.downloadStatus(status, downloadID: $0) }
+                    ?? HarborAccessibility.downloadStatus(status)
+            )
             .font(.caption.weight(.semibold))
             .foregroundStyle(tint)
             .padding(.horizontal, 10)

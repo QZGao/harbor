@@ -1,0 +1,51 @@
+{
+  "configurations" : [
+    {
+      "id" : "C8BC2487-63F3-44B9-A712-D88184A1E058",
+      "name" : "Live Public Links",
+      "options" : {
+        "environmentVariableEntries" : [
+          {
+            "key" : "HARBOR_FIXTURE_BASE_URL",
+            "value" : "$(HARBOR_FIXTURE_BASE_URL)"
+          },
+          {
+            "key" : "HARBOR_FIXTURE_LOG",
+            "value" : "$(HARBOR_FIXTURE_LOG)"
+          },
+          {
+            "key" : "HARBOR_FIXTURE_MEDIA_SHA256",
+            "value" : "$(HARBOR_FIXTURE_MEDIA_SHA256)"
+          },
+          {
+            "key" : "HARBOR_UI_ALLOW_LIVE_NETWORK",
+            "value" : "YES"
+          }
+        ]
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "codeCoverage" : false,
+    "targetForVariableExpansion" : {
+      "containerPath" : "container:Harbor.xcodeproj",
+      "identifier" : "0DA35C532F6338930095E98E",
+      "name" : "Harbor"
+    },
+    "testTimeoutsEnabled" : true
+  },
+  "testTargets" : [
+    {
+      "parallelizable" : false,
+      "selectedTests" : [
+        "HarborLiveCanaryUITests"
+      ],
+      "target" : {
+        "containerPath" : "container:Harbor.xcodeproj",
+        "identifier" : "0D8000062FA0000000A1B2C3",
+        "name" : "HarborUITests"
+      }
+    }
+  ],
+  "version" : 1
+}
