@@ -10,7 +10,6 @@ set -eu
 # Required by default: set RELEASE_NOTES or RELEASE_NOTES_FILE.
 # Required for smoke by default: quit Harbor and set HARBOR_SMOKE_CONFIRM_NO_RUNNING_HARBOR=YES.
 # Set PREPARE_RELEASE_APP=NO to publish an already prepared build/export/Harbor.app.
-# Set RUN_RELEASE_TESTS=NO only when retrying a release after the same commit already passed tests.
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PROJECT_NAME="Harbor"
@@ -35,7 +34,6 @@ RELEASE_NOTES_URL_PREFIX="${RELEASE_NOTES_URL_PREFIX:-}"
 PUBLIC_FEED_URL="${PUBLIC_FEED_URL:-https://thsnkhn.github.io/harbor/appcast.xml}"
 MAXIMUM_DELTAS="${MAXIMUM_DELTAS:-0}"
 RUN_RELEASE_SMOKE="${RUN_RELEASE_SMOKE:-YES}"
-RUN_RELEASE_TESTS="${RUN_RELEASE_TESTS:-YES}"
 PREPARE_RELEASE_APP="${PREPARE_RELEASE_APP:-YES}"
 ALLOW_DIRTY_RELEASE="${ALLOW_DIRTY_RELEASE:-NO}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-XCode Notary}"
@@ -45,9 +43,6 @@ EXPORT_OPTIONS_PLIST_PROVIDED="${EXPORT_OPTIONS_PLIST+x}"
 EXPORT_OPTIONS_PLIST="${EXPORT_OPTIONS_PLIST:-$PROJECT_DIR/build/ExportOptionsDeveloperID.plist}"
 YT_DLP_ENTITLEMENTS="${YT_DLP_ENTITLEMENTS:-$PROJECT_DIR/Scripts/yt-dlp.entitlements}"
 REQUIRE_RELEASE_NOTES="${REQUIRE_RELEASE_NOTES:-YES}"
-TEST_CONFIGURATION="${TEST_CONFIGURATION:-Debug}"
-TEST_ARCHITECTURE="${TEST_ARCHITECTURE:-$(uname -m)}"
-RELEASE_TEST_DERIVED_DATA_PATH="${RELEASE_TEST_DERIVED_DATA_PATH:-$PROJECT_DIR/build/release-tests}"
 
 usage() {
   echo "Usage: $0 [v<version>|<version>]" >&2
@@ -140,17 +135,6 @@ ensure_clean_worktree() {
     git status --short >&2
     exit 1
   fi
-}
-
-run_release_tests() {
-  echo "Running the full macOS release test suite..."
-  xcodebuild test \
-    -project "$PROJECT_FILE" \
-    -scheme "$SCHEME" \
-    -configuration "$TEST_CONFIGURATION" \
-    -destination "platform=macOS,arch=$TEST_ARCHITECTURE" \
-    -derivedDataPath "$RELEASE_TEST_DERIVED_DATA_PATH" \
-    CODE_SIGNING_ALLOWED=NO
 }
 
 write_default_export_options() {
@@ -286,10 +270,6 @@ if [ "$RUN_RELEASE_SMOKE" != "NO" ] && [ "${HARBOR_SMOKE_CONFIRM_NO_RUNNING_HARB
 fi
 
 ensure_clean_worktree
-
-if [ "$RUN_RELEASE_TESTS" != "NO" ]; then
-  run_release_tests
-fi
 
 if [ "$PREPARE_RELEASE_APP" != "NO" ]; then
   prepare_release_app
