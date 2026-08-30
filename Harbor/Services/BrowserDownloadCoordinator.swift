@@ -161,7 +161,6 @@ final class BrowserDownloadCoordinator: NSObject {
     private var pendingNavigationStops: [UUID: PendingNavigationStop] = [:]
     private var downloadContexts: [ObjectIdentifier: DownloadContext] = [:]
     private var activeDownloadsByID: [UUID: ActiveDownloadHandle] = [:]
-    private var resumableWebViews: [UUID: WKWebView] = [:]
     private var stopWaiters: [UUID: [(ActiveDownloadStopResult) -> Void]] = [:]
     private var activeDownloadStopFailures: [UUID: ActiveDownloadStopFailure] = [:]
     private var completedActiveStopResults: [UUID: (UUID, ActiveDownloadStopResult)] = [:]
@@ -235,14 +234,9 @@ final class BrowserDownloadCoordinator: NSObject {
 
         cancelSession()
 
-        let webView: WKWebView
-        if resumeData != nil, let resumableWebView = resumableWebViews[downloadID] {
-            webView = resumableWebView
-        } else {
-            let configuration = WKWebViewConfiguration()
-            configuration.websiteDataStore = .nonPersistent()
-            webView = WKWebView(frame: .zero, configuration: configuration)
-        }
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .nonPersistent()
+        let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
         webView.uiDelegate = self
 
@@ -257,7 +251,6 @@ final class BrowserDownloadCoordinator: NSObject {
         activeSession = session
 
         if let resumeData {
-            resumableWebViews[downloadID] = webView
             session.statusMessage = "Resuming secure browser-backed download…"
             session.isLoading = false
             pendingResumes[downloadID] = PendingResume(
@@ -342,10 +335,6 @@ final class BrowserDownloadCoordinator: NSObject {
             || activeDownloadsByID[id] != nil
             || completionPublications[id] != nil
             || activeSession?.downloadID == id
-    }
-
-    func hasResumableWebView(id: UUID) -> Bool {
-        resumableWebViews[id] != nil
     }
 
     func quiesceDownload(id: UUID, cancelling: Bool = false) async -> BrowserDownloadQuiescence? {
@@ -520,7 +509,6 @@ final class BrowserDownloadCoordinator: NSObject {
         pendingResumeStopWaiters.removeValue(forKey: id)
         pendingNavigationConversions.removeValue(forKey: id)
         pendingNavigationStops.removeValue(forKey: id)
-        resumableWebViews.removeValue(forKey: id)
         completedActiveStopResults.removeValue(forKey: id)
         completionPublicationFailures.removeValue(forKey: id)
         try discardPartialFiles(downloadID: id)
@@ -533,7 +521,6 @@ final class BrowserDownloadCoordinator: NSObject {
         pendingResumeStopWaiters.removeValue(forKey: id)
         pendingNavigationConversions.removeValue(forKey: id)
         pendingNavigationStops.removeValue(forKey: id)
-        resumableWebViews.removeValue(forKey: id)
         completedActiveStopResults.removeValue(forKey: id)
         try? discardPartialFiles(downloadID: id)
     }
@@ -654,8 +641,7 @@ final class BrowserDownloadCoordinator: NSObject {
             self.finishPendingResumeStop(
                 id: id,
                 sessionIdentifier: sessionIdentifier,
-                webViewIdentifier: webViewIdentifier,
-                cancellationWasConfirmed: false
+                webViewIdentifier: webViewIdentifier
             )
         }
         return true
@@ -665,8 +651,7 @@ final class BrowserDownloadCoordinator: NSObject {
         id: UUID,
         sessionIdentifier: UUID,
         webViewIdentifier: ObjectIdentifier,
-        resumeData deliveredResumeData: Data? = nil,
-        cancellationWasConfirmed: Bool
+        resumeData deliveredResumeData: Data? = nil
     ) {
         guard let pending = pendingResumes[id],
               pending.session.id == sessionIdentifier,
@@ -676,21 +661,13 @@ final class BrowserDownloadCoordinator: NSObject {
         }
         pendingResumes.removeValue(forKey: id)
         pendingResumeTerminationReasons.removeValue(forKey: id)
+        pending.session.webView.stopLoading()
         if activeSession?.id == sessionIdentifier {
             activeSession = nil
         }
         let resumeData = reason == .pause
             ? (deliveredResumeData ?? pending.resumeData)
             : nil
-        if resumeData != nil, cancellationWasConfirmed {
-            resumableWebViews[id] = pending.session.webView
-        } else {
-            // A timeout proves only that Harbor stopped waiting; it does not
-            // prove that WebKit released this view's old resume operation.
-            // Quarantine it so a retry cannot attach a second WKDownload to
-            // the same view while the retained callback is still pending.
-            resumableWebViews.removeValue(forKey: id)
-        }
         let waiters = pendingResumeStopWaiters.removeValue(forKey: id) ?? []
         waiters.forEach { $0(resumeData) }
     }
@@ -708,7 +685,6 @@ final class BrowserDownloadCoordinator: NSObject {
             pending.session.webView.stopLoading()
             activeSession = nil
         }
-        resumableWebViews.removeValue(forKey: downloadID)
     }
 
     private func requestPendingNavigationStop(
@@ -768,13 +744,9 @@ final class BrowserDownloadCoordinator: NSObject {
         }
         pendingNavigationConversions.removeValue(forKey: id)
         pendingNavigationStops.removeValue(forKey: id)
+        stop.session.webView.stopLoading()
         if activeSession?.id == sessionIdentifier {
             activeSession = nil
-        }
-        if stop.reason == .pause, resumeData != nil {
-            resumableWebViews[id] = stop.session.webView
-        } else {
-            resumableWebViews.removeValue(forKey: id)
         }
         stop.waiters.forEach { $0(resumeData) }
     }
@@ -863,8 +835,7 @@ final class BrowserDownloadCoordinator: NSObject {
                     id: downloadID,
                     sessionIdentifier: sessionIdentifier,
                     webViewIdentifier: webViewIdentifier,
-                    resumeData: resumeData,
-                    cancellationWasConfirmed: true
+                    resumeData: resumeData
                 )
             }
         }
@@ -1040,21 +1011,9 @@ final class BrowserDownloadCoordinator: NSObject {
             return
         }
 
-        switch reason {
-        case .pause:
-            if let temporaryURL = stoppedContext.temporaryURL {
-                try? fileManager.removeItem(at: temporaryURL)
-            }
-            if resumeData != nil {
-                resumableWebViews[id] = stoppedContext.webView
-            } else {
-                resumableWebViews.removeValue(forKey: id)
-            }
-        case .cancel:
-            resumableWebViews.removeValue(forKey: id)
-            if let temporaryURL = stoppedContext.temporaryURL {
-                try? fileManager.removeItem(at: temporaryURL)
-            }
+        stoppedContext.webView.stopLoading()
+        if let temporaryURL = stoppedContext.temporaryURL {
+            try? fileManager.removeItem(at: temporaryURL)
         }
 
         let result = ActiveDownloadStopResult(
@@ -1420,7 +1379,6 @@ extension BrowserDownloadCoordinator: WKDownloadDelegate {
         let pendingStopWaiters = context.terminationReason == nil
             ? []
             : (stopWaiters.removeValue(forKey: context.downloadID) ?? [])
-        resumableWebViews.removeValue(forKey: context.downloadID)
 
         var claimedCompletion = false
         do {
@@ -1568,12 +1526,6 @@ extension BrowserDownloadCoordinator: WKDownloadDelegate {
         let preservedResumeData = shouldRetireResumeData
             ? nil
             : (resumeData ?? context.originalResumeData)
-        if preservedResumeData != nil {
-            resumableWebViews[context.downloadID] = context.webView
-        } else {
-            resumableWebViews.removeValue(forKey: context.downloadID)
-        }
-
         clearActiveSession(matching: context)
 
         onEvent(

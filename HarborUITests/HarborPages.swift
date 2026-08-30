@@ -66,10 +66,10 @@ struct HarborTorrentPreviewPage {
 
     var sheet: XCUIElement { app.descendants(matching: .any)["torrent-contents.sheet"].firstMatch }
     var table: XCUIElement { app.descendants(matching: .any)["torrent-contents.table"].firstMatch }
-    var selectAll: XCUIElement { app.buttons["torrent-contents.select-all"].firstMatch }
-    var selectNone: XCUIElement { app.buttons["torrent-contents.select-none"].firstMatch }
-    var add: XCUIElement { app.buttons["torrent-contents.add"].firstMatch }
-    var cancel: XCUIElement { app.buttons["torrent-contents.cancel"].firstMatch }
+    var selectAll: XCUIElement { app.buttons["Select All"].firstMatch }
+    var selectNone: XCUIElement { app.buttons["Select None"].firstMatch }
+    var add: XCUIElement { app.sheets.element(boundBy: 1).buttons["Add Download"].firstMatch }
+    var cancel: XCUIElement { app.sheets.element(boundBy: 1).buttons["Cancel"].firstMatch }
 }
 
 @MainActor

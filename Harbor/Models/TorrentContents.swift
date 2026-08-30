@@ -50,6 +50,7 @@ struct TorrentFileSelection: Codable, Equatable, Sendable {
 
 enum TorrentMetainfoError: LocalizedError, Equatable {
     case malformed
+    case tooLarge
     case missingName
     case missingFiles
     case invalidFile
@@ -58,6 +59,8 @@ enum TorrentMetainfoError: LocalizedError, Equatable {
         switch self {
         case .malformed:
             "The torrent metadata is malformed."
+        case .tooLarge:
+            "The torrent metadata is too large."
         case .missingName:
             "The torrent metadata does not include a name."
         case .missingFiles:
@@ -69,12 +72,16 @@ enum TorrentMetainfoError: LocalizedError, Equatable {
 }
 
 enum TorrentMetainfoParser {
+    nonisolated static let maximumMetainfoBytes = 32 * 1_024 * 1_024
     nonisolated private static let maximumDepth = 128
     nonisolated private static let maximumCollectionEntries = 200_000
 
     nonisolated static func preview(from data: Data) throws -> TorrentContentsPreview {
         guard data.isEmpty == false else {
             throw TorrentMetainfoError.malformed
+        }
+        guard data.count <= maximumMetainfoBytes else {
+            throw TorrentMetainfoError.tooLarge
         }
 
         var parser = Parser(data: data)

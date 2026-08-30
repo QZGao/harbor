@@ -129,22 +129,41 @@ private enum TorrentPreviewError: LocalizedError {
     }
 }
 
-private final class TorrentEngineLogBuffer: @unchecked Sendable {
+final class TorrentEngineLogBuffer: @unchecked Sendable {
     nonisolated private let lock = NSLock()
+    nonisolated private let maximumCharacterCount: Int
     nonisolated(unsafe) private var output = ""
+    nonisolated(unsafe) private var isCapturing = true
 
-    nonisolated init() {}
+    nonisolated init(maximumCharacterCount: Int = 262_144) {
+        self.maximumCharacterCount = max(maximumCharacterCount, 0)
+    }
 
     nonisolated func reset() {
         lock.lock()
         output = ""
+        isCapturing = true
         lock.unlock()
     }
 
     nonisolated func append(_ value: String) {
         lock.lock()
+        guard isCapturing, maximumCharacterCount > 0 else {
+            lock.unlock()
+            return
+        }
         output.append(value)
         output.append("\n")
+        if output.count > maximumCharacterCount {
+            output.removeFirst(output.count - maximumCharacterCount)
+        }
+        lock.unlock()
+    }
+
+    nonisolated func stopCapturing() {
+        lock.lock()
+        output = ""
+        isCapturing = false
         lock.unlock()
     }
 
@@ -429,7 +448,7 @@ actor Aria2TorrentService {
         case .magnetLink:
             torrentData = nil
         case .torrentFile:
-            torrentData = try Data(contentsOf: sourceURL)
+            torrentData = try ManagedTorrentSourceStore.loadTorrentData(at: sourceURL)
         case .directURL, .mediaURL:
             throw TorrentEngineError.invalidSource
         }
@@ -553,7 +572,7 @@ actor Aria2TorrentService {
                 }
 
                 if let metadataURL {
-                    let data = try Data(contentsOf: metadataURL, options: .mappedIfSafe)
+                    let data = try ManagedTorrentSourceStore.loadTorrentData(at: metadataURL)
                     let preview = try TorrentMetainfoParser.preview(from: data)
                     guard preview.infoHash == expectedInfoHash else {
                         throw TorrentPreviewError.fingerprintMismatch
@@ -925,6 +944,7 @@ actor Aria2TorrentService {
             "--save-session=\(sessionFileURL.path)",
             "--save-session-interval=5",
             "--force-save=true",
+            "--stop-with-process=\(ProcessInfo.processInfo.processIdentifier)",
             "--bt-detach-seed-only=true",
             // Per-download options override this unlimited daemon default.
             // TODO: Add per-torrent ratio overrides if one global preference becomes too limiting.
@@ -1006,6 +1026,7 @@ actor Aria2TorrentService {
                 try await applyGlobalOptions(transferSettings)
                 isRetryingAfterSessionRecovery = false
                 isDaemonReady = true
+                startupLogBuffer.stopCapturing()
                 logger.info("aria2 RPC is ready")
                 return
             } catch {

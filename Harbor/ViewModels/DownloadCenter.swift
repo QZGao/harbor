@@ -2440,9 +2440,12 @@ final class DownloadCenter {
     ) -> DownloadItem {
         let backend = backend(for: request.sourceKind)
         let preferredFilename: String?
-        if request.sourceKind.supportsCustomFilename {
+        if request.sourceKind.supportsCustomFilename,
+           let customFilename = request.customFilename?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           customFilename.isEmpty == false {
             preferredFilename = destinationResolver.resolvedFilename(
-                custom: request.customFilename,
+                custom: customFilename,
                 responseSuggestedFilename: nil,
                 sourceURL: request.sourceURL
             )
@@ -7399,14 +7402,10 @@ final class DownloadCenter {
 
     private func shouldAllowHTMLDownload(
         for item: DownloadItem,
-        suggestedFilename: String?
+        suggestedFilename _: String?
     ) -> Bool {
         let extensions = [
             item.preferredFilename.flatMap {
-                let pathExtension = URL(fileURLWithPath: $0).pathExtension
-                return pathExtension.isEmpty ? nil : pathExtension
-            },
-            suggestedFilename.flatMap {
                 let pathExtension = URL(fileURLWithPath: $0).pathExtension
                 return pathExtension.isEmpty ? nil : pathExtension
             },

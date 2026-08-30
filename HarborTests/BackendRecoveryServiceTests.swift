@@ -427,6 +427,68 @@ extension HarborModelAndSafetyTests {
         withExtendedLifetime(process) {}
     }
 
+    func testManagedChildProcessStopsWhenOneOutputLineExceedsLimit() async throws {
+        let state = ManagedProcessTestState()
+        let exceededLimit = expectation(description: "output limit exceeded")
+        let terminated = expectation(description: "limited child process terminated")
+        let process = try ManagedChildProcess(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "printf '%4096s' x"],
+            environment: ProcessInfo.processInfo.environment,
+            maximumBufferedLineBytes: 1_024,
+            onOutputLimitExceeded: {
+                exceededLimit.fulfill()
+            },
+            onStdout: { state.appendStdout($0) },
+            onStderr: { state.appendStderr($0) },
+            onTermination: { termination in
+                state.recordTermination(termination)
+                terminated.fulfill()
+            }
+        )
+
+        await fulfillment(of: [exceededLimit, terminated], timeout: 4)
+        XCTAssertTrue(state.snapshot.stdout.isEmpty)
+        XCTAssertNotNil(state.snapshot.termination)
+        withExtendedLifetime(process) {}
+    }
+
+    func testMetadataCommandStateReleasesFinishedProcessAndBoundsOutput() async throws {
+        let state = MetadataCommandState(maximumCapturedBytes: 16)
+        XCTAssertTrue(state.appendStdout("12345678"))
+        XCTAssertFalse(state.appendStderr("123456789"))
+        let limitedResult = state.finish(
+            termination: ManagedChildProcessTermination(waitStatus: 0)
+        )
+        guard case let .failure(error)? = limitedResult else {
+            return XCTFail("Expected oversized metadata output to fail")
+        }
+        XCTAssertTrue(error.localizedDescription.contains("too much metadata"))
+
+        let processState = MetadataCommandState()
+        let terminated = expectation(description: "metadata child process terminated")
+        var process: ManagedChildProcess? = try ManagedChildProcess(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "printf '{}\\n'"],
+            environment: ProcessInfo.processInfo.environment,
+            onStdout: { _ = processState.appendStdout($0) },
+            onStderr: { _ = processState.appendStderr($0) },
+            onTermination: { termination in
+                _ = processState.finish(termination: termination)
+                terminated.fulfill()
+            }
+        )
+        processState.process = process
+        weak var weakProcess = process
+
+        await fulfillment(of: [terminated], timeout: 3)
+        process = nil
+        for _ in 0 ..< 40 where weakProcess != nil {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertNil(weakProcess)
+    }
+
     func testManagedChildProcessTerminatesProcessGroup() async throws {
         let temporaryDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("HarborProcessGroupTests-\(UUID().uuidString)", isDirectory: true)

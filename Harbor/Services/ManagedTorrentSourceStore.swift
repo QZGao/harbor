@@ -10,6 +10,7 @@ struct ManagedTorrentSource: Equatable, Sendable {
 
 enum ManagedTorrentSourceStoreError: LocalizedError {
     case emptyTorrent
+    case torrentTooLarge
     case invalidServerResponse
     case unsuccessfulStatusCode(Int)
 
@@ -20,6 +21,12 @@ enum ManagedTorrentSourceStoreError: LocalizedError {
                 localized: "torrent.import.empty",
                 defaultValue: "The torrent file is empty.",
                 comment: "Error shown when a selected torrent file has no data."
+            )
+        case .torrentTooLarge:
+            String(
+                localized: "torrent.import.tooLarge",
+                defaultValue: "The torrent file is too large.",
+                comment: "Error shown when a torrent file exceeds Harbor's safe metadata size limit."
             )
         case .invalidServerResponse:
             String(
@@ -63,7 +70,7 @@ actor ManagedTorrentSourceStore {
             }
         }
 
-        let data = try Data(contentsOf: sourceURL, options: .mappedIfSafe)
+        let data = try Self.loadTorrentData(at: sourceURL, fileManager: fileManager)
         return try persist(data: data, originalURL: originalURL ?? sourceURL)
     }
 
@@ -71,14 +78,14 @@ actor ManagedTorrentSourceStore {
         from remoteURL: URL,
         using session: URLSession = .shared
     ) async throws -> ManagedTorrentSource {
-        let (data, response) = try await session.data(from: remoteURL)
+        let (temporaryURL, response) = try await session.download(from: remoteURL)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ManagedTorrentSourceStoreError.invalidServerResponse
         }
         guard 200 ..< 300 ~= httpResponse.statusCode else {
             throw ManagedTorrentSourceStoreError.unsuccessfulStatusCode(httpResponse.statusCode)
         }
-
+        let data = try Self.loadTorrentData(at: temporaryURL, fileManager: fileManager)
         return try persist(data: data, originalURL: remoteURL)
     }
 
@@ -90,7 +97,7 @@ actor ManagedTorrentSourceStore {
     }
 
     func fingerprint(forTorrentAt sourceURL: URL) throws -> String {
-        let data = try Data(contentsOf: sourceURL, options: .mappedIfSafe)
+        let data = try Self.loadTorrentData(at: sourceURL, fileManager: fileManager)
         guard data.isEmpty == false else {
             throw ManagedTorrentSourceStoreError.emptyTorrent
         }
@@ -131,6 +138,23 @@ actor ManagedTorrentSourceStore {
 
     nonisolated static func sourceFingerprint(for data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    nonisolated static func loadTorrentData(
+        at url: URL,
+        fileManager: FileManager = .default
+    ) throws -> Data {
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        if let size = attributes[.size] as? NSNumber,
+           size.int64Value > Int64(TorrentMetainfoParser.maximumMetainfoBytes) {
+            throw ManagedTorrentSourceStoreError.torrentTooLarge
+        }
+
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        guard data.count <= TorrentMetainfoParser.maximumMetainfoBytes else {
+            throw ManagedTorrentSourceStoreError.torrentTooLarge
+        }
+        return data
     }
 
     nonisolated static func normalizedInfoHash(_ value: String?) -> String? {
@@ -182,6 +206,9 @@ actor ManagedTorrentSourceStore {
     private func persist(data: Data, originalURL: URL) throws -> ManagedTorrentSource {
         guard data.isEmpty == false else {
             throw ManagedTorrentSourceStoreError.emptyTorrent
+        }
+        guard data.count <= TorrentMetainfoParser.maximumMetainfoBytes else {
+            throw ManagedTorrentSourceStoreError.torrentTooLarge
         }
 
         let fingerprint = Self.fingerprint(for: data)

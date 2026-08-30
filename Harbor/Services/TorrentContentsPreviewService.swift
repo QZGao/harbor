@@ -30,17 +30,17 @@ struct TorrentContentsPreviewService: Sendable {
                 sourceURL.stopAccessingSecurityScopedResource()
             }
         }
-        return try Data(contentsOf: sourceURL, options: .mappedIfSafe)
+        return try ManagedTorrentSourceStore.loadTorrentData(at: sourceURL)
     }
 
     private func fetchRemoteTorrent(from sourceURL: URL) async throws -> Data {
-        let (data, response) = try await URLSession.shared.data(from: sourceURL)
+        let (temporaryURL, response) = try await URLSession.shared.download(from: sourceURL)
         guard let response = response as? HTTPURLResponse else {
             throw ManagedTorrentSourceStoreError.invalidServerResponse
         }
         guard 200 ..< 300 ~= response.statusCode else {
             throw ManagedTorrentSourceStoreError.unsuccessfulStatusCode(response.statusCode)
         }
-        return data
+        return try ManagedTorrentSourceStore.loadTorrentData(at: temporaryURL)
     }
 }

@@ -30,13 +30,20 @@ enum HarborTestRuntime {
         userDefaults.set(defaultDestinationPath, forKey: "defaultDestinationPath")
         userDefaults.set(torrentDestinationPath, forKey: "torrentDestinationPath")
         userDefaults.set(torrentWatchFolderPath, forKey: "torrentWatchFolderPath")
-        userDefaults.set(true, forKey: "startDownloadsAutomatically")
-        userDefaults.set(
-            CommandLine.arguments.contains("--harbor-notifications-enabled"),
-            forKey: "notificationsEnabled"
-        )
-        userDefaults.set(false, forKey: "seedNewTorrents")
-        userDefaults.set(false, forKey: "preventSleepWhileDownloading")
+        if userDefaults.object(forKey: "startDownloadsAutomatically") == nil {
+            userDefaults.set(true, forKey: "startDownloadsAutomatically")
+        }
+        if CommandLine.arguments.contains("--harbor-notifications-enabled") {
+            userDefaults.set(true, forKey: "notificationsEnabled")
+        } else if userDefaults.object(forKey: "notificationsEnabled") == nil {
+            userDefaults.set(false, forKey: "notificationsEnabled")
+        }
+        if userDefaults.object(forKey: "seedNewTorrents") == nil {
+            userDefaults.set(false, forKey: "seedNewTorrents")
+        }
+        if userDefaults.object(forKey: "preventSleepWhileDownloading") == nil {
+            userDefaults.set(false, forKey: "preventSleepWhileDownloading")
+        }
         return userDefaults
     }()
 

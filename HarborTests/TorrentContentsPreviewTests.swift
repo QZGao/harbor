@@ -37,6 +37,33 @@ final class TorrentContentsPreviewTests: XCTestCase {
         XCTAssertThrowsError(try TorrentMetainfoParser.preview(from: Data("not-bencode".utf8)))
     }
 
+    func testRejectsOversizedTorrentBeforeParsing() {
+        let oversized = Data(
+            repeating: 0,
+            count: TorrentMetainfoParser.maximumMetainfoBytes + 1
+        )
+
+        XCTAssertThrowsError(try TorrentMetainfoParser.preview(from: oversized)) { error in
+            XCTAssertEqual(error as? TorrentMetainfoError, .tooLarge)
+        }
+    }
+
+    func testTorrentEngineLogBufferIsBoundedAndStopsAfterStartup() {
+        let buffer = TorrentEngineLogBuffer(maximumCharacterCount: 16)
+        buffer.append(String(repeating: "a", count: 32))
+
+        XCTAssertEqual(buffer.snapshot().count, 16)
+        XCTAssertTrue(buffer.snapshot().hasSuffix("\n"))
+
+        buffer.stopCapturing()
+        buffer.append("ignored")
+        XCTAssertEqual(buffer.snapshot(), "")
+
+        buffer.reset()
+        buffer.append("ready")
+        XCTAssertEqual(buffer.snapshot(), "ready\n")
+    }
+
     func testBuildsPartialSelectionSummaryInTorrentOrder() throws {
         let preview = try TorrentMetainfoParser.preview(from: makeMultiFileTorrent())
 

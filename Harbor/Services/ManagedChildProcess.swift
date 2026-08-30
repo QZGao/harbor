@@ -33,6 +33,8 @@ final class ManagedChildProcess: @unchecked Sendable {
         executableURL: URL,
         arguments: [String],
         environment: [String: String],
+        maximumBufferedLineBytes: Int? = nil,
+        onOutputLimitExceeded: @escaping @Sendable () -> Void = {},
         onStdout: @escaping OutputHandler,
         onStderr: @escaping OutputHandler,
         onTermination: @escaping TerminationHandler
@@ -130,8 +132,18 @@ final class ManagedChildProcess: @unchecked Sendable {
         self.stderrHandle = FileHandle(fileDescriptor: stderrPipe[0], closeOnDealloc: true)
         self.onTermination = onTermination
 
-        startOutputReader(stdoutHandle, onOutput: onStdout)
-        startOutputReader(stderrHandle, onOutput: onStderr)
+        startOutputReader(
+            stdoutHandle,
+            maximumBufferedLineBytes: maximumBufferedLineBytes,
+            onOutputLimitExceeded: onOutputLimitExceeded,
+            onOutput: onStdout
+        )
+        startOutputReader(
+            stderrHandle,
+            maximumBufferedLineBytes: maximumBufferedLineBytes,
+            onOutputLimitExceeded: onOutputLimitExceeded,
+            onOutput: onStderr
+        )
         waitForExit()
     }
 
@@ -175,6 +187,8 @@ final class ManagedChildProcess: @unchecked Sendable {
 
     private nonisolated func startOutputReader(
         _ handle: FileHandle,
+        maximumBufferedLineBytes: Int?,
+        onOutputLimitExceeded: @escaping @Sendable () -> Void,
         onOutput: @escaping OutputHandler
     ) {
         outputReaders.enter()
@@ -218,6 +232,13 @@ final class ManagedChildProcess: @unchecked Sendable {
                         if self.lock.withLock({ self.shouldStopOutputReaders == false }) {
                             onOutput(String(decoding: line, as: UTF8.self))
                         }
+                    }
+                    if let maximumBufferedLineBytes,
+                       pending.count > maximumBufferedLineBytes {
+                        pending.removeAll(keepingCapacity: false)
+                        onOutputLimitExceeded()
+                        self.terminate(grace: 0.2)
+                        break
                     }
                     continue
                 }

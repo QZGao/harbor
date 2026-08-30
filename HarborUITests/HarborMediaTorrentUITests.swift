@@ -13,7 +13,13 @@ final class HarborMediaTorrentUITests: HarborUITestCase {
         let tryMedia = app.buttons["add-download.try-as-media"].firstMatch
         XCTAssertTrue(tryMedia.waitForExistence(timeout: 5))
         tryMedia.click()
-        XCTAssertTrue(app.staticTexts["Harbor Synthetic Media"].waitForExistence(timeout: 120))
+        let mediaMetadata = app.descendants(matching: .any)["add-download.media-metadata"].firstMatch
+        XCTAssertTrue(mediaMetadata.waitForExistence(timeout: 120))
+        XCTAssertTrue(
+            mediaMetadata.staticTexts.matching(
+                NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", "Harbor Synthetic Media", "Harbor Synthetic Media")
+            ).firstMatch.exists
+        )
 
         let submit = app.buttons["add-download.submit"].firstMatch
         XCTAssertTrue(submit.isEnabled)
@@ -42,13 +48,22 @@ final class HarborMediaTorrentUITests: HarborUITestCase {
         XCTAssertTrue(preview.waitForExistence(timeout: 10))
         preview.click()
 
-        XCTAssertTrue(app.otherElements["torrent-contents.sheet"].waitForExistence(timeout: 15))
-        XCTAssertTrue(app.staticTexts["Harbor UI Fixture"].exists)
-        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS '2 files'")).firstMatch.exists)
-        app.buttons["torrent-contents.select-none"].click()
-        XCTAssertFalse(app.buttons["torrent-contents.add"].isEnabled)
-        app.buttons["torrent-contents.select-all"].click()
-        XCTAssertTrue(app.buttons["torrent-contents.add"].isEnabled)
+        let torrent = HarborTorrentPreviewPage(app: app)
+        XCTAssertTrue(torrent.add.waitForExistence(timeout: 15))
+        XCTAssertTrue(
+            app.staticTexts.matching(
+                NSPredicate(format: "label == %@ OR value == %@", "Harbor UI Fixture", "Harbor UI Fixture")
+            ).firstMatch.exists
+        )
+        XCTAssertTrue(
+            app.staticTexts.matching(
+                NSPredicate(format: "label CONTAINS '2 files' OR value CONTAINS '2 files'")
+            ).firstMatch.exists
+        )
+        torrent.selectNone.click()
+        XCTAssertFalse(torrent.add.isEnabled)
+        torrent.selectAll.click()
+        XCTAssertTrue(torrent.add.isEnabled)
     }
 
     func testMagnetPersistsAsPausedDownload() {
@@ -89,7 +104,7 @@ final class HarborMediaTorrentUITests: HarborUITestCase {
         addDownloadPage.source.typeText(fixtureURL("/torrents/webseed.torrent").absoluteString)
         addDownloadPage.preview.click()
         let torrent = HarborTorrentPreviewPage(app: app)
-        XCTAssertTrue(torrent.sheet.waitForExistence(timeout: 15))
+        XCTAssertTrue(torrent.add.waitForExistence(timeout: 15))
         let existingDownloads = downloadReferences()
         torrent.add.click()
         let download = waitForNewDownload(excluding: existingDownloads)

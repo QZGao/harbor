@@ -1158,11 +1158,19 @@ actor MediaDownloadService {
                         executableURL: runtime.ytDlpURL,
                         arguments: arguments,
                         environment: processEnvironment(runtime: runtime),
+                        maximumBufferedLineBytes: MetadataCommandState.maximumCapturedBytes,
+                        onOutputLimitExceeded: {
+                            state.markOutputLimitExceeded()
+                        },
                         onStdout: { output in
-                            state.appendStdout(output)
+                            if state.appendStdout(output) == false {
+                                state.process?.terminate(grace: 0.2)
+                            }
                         },
                         onStderr: { output in
-                            state.appendStderr(output)
+                            if state.appendStderr(output) == false {
+                                state.process?.terminate(grace: 0.2)
+                            }
                         },
                         onTermination: { termination in
                             guard let result = state.finish(termination: termination) else {
@@ -1179,7 +1187,7 @@ actor MediaDownloadService {
                     )
 
                     state.process = process
-                    if Task.isCancelled {
+                    if Task.isCancelled || state.shouldTerminateProcess {
                         process.terminate(grace: 0.2)
                     }
 
@@ -2498,14 +2506,21 @@ actor MediaDownloadService {
     }
 }
 
-private final class MetadataCommandState: @unchecked Sendable {
+final class MetadataCommandState: @unchecked Sendable {
+    nonisolated static let maximumCapturedBytes = 16 * 1_024 * 1_024
+
     nonisolated private let lock = NSLock()
+    nonisolated private let maximumCapturedBytes: Int
     nonisolated(unsafe) private var stdoutBuffer = ""
     nonisolated(unsafe) private var stderrBuffer = ""
+    nonisolated(unsafe) private var capturedByteCount = 0
     nonisolated(unsafe) private var isCompleted = false
+    nonisolated(unsafe) private var outputLimitError: Error?
     nonisolated(unsafe) private var storedProcess: ManagedChildProcess?
 
-    nonisolated init() {}
+    nonisolated init(maximumCapturedBytes: Int = MetadataCommandState.maximumCapturedBytes) {
+        self.maximumCapturedBytes = max(maximumCapturedBytes, 0)
+    }
 
     nonisolated var process: ManagedChildProcess? {
         get {
@@ -2518,15 +2533,35 @@ private final class MetadataCommandState: @unchecked Sendable {
         }
     }
 
-    nonisolated func appendStdout(_ output: String) {
+    nonisolated var shouldTerminateProcess: Bool {
+        lock.withLock { outputLimitError != nil }
+    }
+
+    @discardableResult
+    nonisolated func appendStdout(_ output: String) -> Bool {
         lock.withLock {
+            guard reserveCapacity(for: output) else {
+                return false
+            }
             stdoutBuffer += output
+            return true
         }
     }
 
-    nonisolated func appendStderr(_ output: String) {
+    @discardableResult
+    nonisolated func appendStderr(_ output: String) -> Bool {
         lock.withLock {
+            guard reserveCapacity(for: output) else {
+                return false
+            }
             stderrBuffer += output
+            return true
+        }
+    }
+
+    nonisolated func markOutputLimitExceeded() {
+        lock.withLock {
+            recordOutputLimitExceeded()
         }
     }
 
@@ -2537,6 +2572,10 @@ private final class MetadataCommandState: @unchecked Sendable {
             }
 
             isCompleted = true
+            storedProcess = nil
+            stdoutBuffer = ""
+            stderrBuffer = ""
+            capturedByteCount = 0
             return true
         }
     }
@@ -2549,16 +2588,51 @@ private final class MetadataCommandState: @unchecked Sendable {
 
             isCompleted = true
 
-            if termination.isSuccess {
-                return .success(Data(stdoutBuffer.utf8))
+            let result: Result<Data, Error>
+            if let outputLimitError {
+                result = .failure(outputLimitError)
+            } else if termination.isSuccess {
+                result = .success(Data(stdoutBuffer.utf8))
+            } else {
+                result = .failure(
+                    MediaDownloadError.unsupported(
+                        MediaDownloadErrorClassifier.message(from: stderrBuffer)
+                    )
+                )
             }
 
-            return .failure(
-                MediaDownloadError.unsupported(
-                    MediaDownloadErrorClassifier.message(from: stderrBuffer)
-                )
-            )
+            storedProcess = nil
+            stdoutBuffer = ""
+            stderrBuffer = ""
+            capturedByteCount = 0
+            return result
         }
+    }
+
+    nonisolated private func reserveCapacity(for output: String) -> Bool {
+        guard isCompleted == false, outputLimitError == nil else {
+            return false
+        }
+
+        let byteCount = output.utf8.count
+        guard byteCount <= maximumCapturedBytes - capturedByteCount else {
+            recordOutputLimitExceeded()
+            return false
+        }
+        capturedByteCount += byteCount
+        return true
+    }
+
+    nonisolated private func recordOutputLimitExceeded() {
+        guard outputLimitError == nil else {
+            return
+        }
+        outputLimitError = MediaDownloadError.unavailable(
+            "This media link returned too much metadata."
+        )
+        stdoutBuffer = ""
+        stderrBuffer = ""
+        capturedByteCount = 0
     }
 }
 

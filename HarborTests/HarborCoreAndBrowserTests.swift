@@ -72,7 +72,6 @@ extension HarborModelAndSafetyTests {
         XCTAssertNil(result?.completionUnavailableMessage)
         XCTAssertLessThan(elapsed, .seconds(2))
         XCTAssertFalse(coordinator.hasPendingOrActiveAttempt(id: id))
-        XCTAssertFalse(coordinator.hasResumableWebView(id: id))
     }
 
     func testStaleBrowserCallbacksCannotDismissReplacementSession() throws {

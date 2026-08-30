@@ -23,14 +23,24 @@ final class HarborLaunchUITests: HarborUITestCase {
 
         let source = app.textFields["add-download.source"].firstMatch
         source.click()
-        source.typeText(
-            "\(fixtureURL("/direct/small.bin").absoluteString)\n" +
-            "not-a-link\n" +
-            "\(fixtureURL("/direct/small.bin").absoluteString)"
-        )
+        source.typeText(fixtureURL("/direct/small.bin").absoluteString)
+        source.typeKey(.return, modifierFlags: [.option])
+        source.typeText("not-a-link")
+        source.typeKey(.return, modifierFlags: [.option])
+        source.typeText(fixtureURL("/direct/small.bin").absoluteString)
 
-        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'ready'")).firstMatch.waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'duplicate'")).firstMatch.exists)
-        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'unsupported'")).firstMatch.exists)
+        let ready = app.staticTexts.matching(
+            NSPredicate(format: "label ==[c] 'Ready' OR value ==[c] 'Ready'")
+        ).firstMatch
+        let duplicate = app.staticTexts.matching(
+            NSPredicate(format: "label ==[c] 'Duplicate' OR value ==[c] 'Duplicate'")
+        ).firstMatch
+        let skipped = app.staticTexts.matching(
+            NSPredicate(format: "label ==[c] 'Skipped' OR value ==[c] 'Skipped'")
+        ).firstMatch
+
+        XCTAssertTrue(ready.waitForExistence(timeout: 5))
+        XCTAssertTrue(duplicate.waitForExistence(timeout: 5))
+        XCTAssertTrue(skipped.waitForExistence(timeout: 5))
     }
 }
