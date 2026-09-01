@@ -20,6 +20,26 @@ enum HarborApplicationSupport {
         return rootURL.appendingPathComponent("Harbor", isDirectory: true)
     }
 
+    nonisolated static func bundledResourceRoots() -> [URL] {
+        var seenPaths = Set<String>()
+        return [
+            Bundle.main.resourceURL,
+            Bundle(for: BundleToken.self).resourceURL
+        ]
+        .compactMap { $0 }
+        .filter { seenPaths.insert($0.path).inserted }
+    }
+
+    nonisolated static var architectureName: String {
+        #if arch(arm64)
+        "arm64"
+        #elseif arch(x86_64)
+        "x86_64"
+        #else
+        "unsupported"
+        #endif
+    }
+
     private nonisolated static func unitTestRootURL(fileManager: FileManager) -> URL? {
         guard isRunningUnitTests else {
             return nil
@@ -47,7 +67,7 @@ enum HarborApplicationSupport {
             return nil
         }
 
-        // TODO: Keep this CLI hook for release smoke tests until Harbor has a formal UI test target.
+        // Release smoke tests and XCUITest use this hook to keep live Harbor data isolated.
         return URL(fileURLWithPath: path, isDirectory: true)
     }
 
@@ -56,3 +76,5 @@ enum HarborApplicationSupport {
         return trimmed.isEmpty ? nil : trimmed
     }
 }
+
+private final class BundleToken: NSObject {}

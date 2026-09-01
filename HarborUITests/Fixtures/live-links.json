@@ -1,0 +1,110 @@
+[
+  {
+    "id": "youtube-test-video",
+    "platform": "YouTube",
+    "url": "https://www.youtube.com/watch?v=BaW_jenozKc",
+    "expectedExtractor": "Youtube",
+    "expectedMediaType": "video",
+    "operation": "download",
+    "lastVerifiedAt": null
+  },
+  {
+    "id": "instagram-public-reel",
+    "platform": "Instagram",
+    "url": "https://www.instagram.com/reel/Chunk8-jurw/",
+    "expectedExtractor": "Instagram",
+    "expectedMediaType": "video",
+    "operation": "metadata",
+    "lastVerifiedAt": null
+  },
+  {
+    "id": "tiktok-public-video",
+    "platform": "TikTok",
+    "url": "https://www.tiktok.com/@memezar/video/7063366612800220462",
+    "expectedExtractor": "TikTok",
+    "expectedMediaType": "video",
+    "operation": "metadata",
+    "lastVerifiedAt": null
+  },
+  {
+    "id": "x-public-video",
+    "platform": "X",
+    "url": "https://twitter.com/freethenipple/status/643211948184596480",
+    "expectedExtractor": "Twitter",
+    "expectedMediaType": "video",
+    "operation": "metadata",
+    "lastVerifiedAt": null
+  },
+  {
+    "id": "facebook-public-video",
+    "platform": "Facebook",
+    "url": "https://www.facebook.com/officialjaden/videos/608902674763495/",
+    "expectedExtractor": "Facebook",
+    "expectedMediaType": "video",
+    "operation": "metadata",
+    "lastVerifiedAt": null
+  },
+  {
+    "id": "pinterest-public-video",
+    "platform": "Pinterest",
+    "url": "https://www.pinterest.com/pin/664281013778109217/",
+    "expectedExtractor": "Pinterest",
+    "expectedMediaType": "video",
+    "operation": "metadata",
+    "lastVerifiedAt": null
+  },
+  {
+    "id": "vimeo-public-video",
+    "platform": "Vimeo",
+    "url": "https://vimeo.com/56015672",
+    "expectedExtractor": "Vimeo",
+    "expectedMediaType": "video",
+    "operation": "metadata",
+    "lastVerifiedAt": null
+  },
+  {
+    "id": "dailymotion-public-video",
+    "platform": "Dailymotion",
+    "url": "https://www.dailymotion.com/video/x7t2i1m",
+    "expectedExtractor": "Dailymotion",
+    "expectedMediaType": "video",
+    "operation": "metadata",
+    "lastVerifiedAt": null
+  },
+  {
+    "id": "reddit-public-video",
+    "platform": "Reddit",
+    "url": "https://www.reddit.com/r/videos/comments/6rrwyj/that_small_heart_attack/",
+    "expectedExtractor": "Reddit",
+    "expectedMediaType": "video",
+    "operation": "metadata",
+    "lastVerifiedAt": null
+  },
+  {
+    "id": "threads-public-video",
+    "platform": "Threads",
+    "url": "https://www.threads.net/@zuck/post/CuV_QJvJ7QI",
+    "expectedExtractor": "Threads",
+    "expectedMediaType": "video",
+    "operation": "metadata",
+    "lastVerifiedAt": null
+  },
+  {
+    "id": "soundcloud-public-track",
+    "platform": "SoundCloud",
+    "url": "https://soundcloud.com/ethmusic/lostin-powers-she-so-heavy",
+    "expectedExtractor": "Soundcloud",
+    "expectedMediaType": "audio",
+    "operation": "metadata",
+    "lastVerifiedAt": null
+  },
+  {
+    "id": "twitch-public-clip",
+    "platform": "Twitch",
+    "url": "https://www.twitch.tv/riotgames/clip/EncouragingVastTheRinger",
+    "expectedExtractor": "TwitchClips",
+    "expectedMediaType": "video",
+    "operation": "metadata",
+    "lastVerifiedAt": null
+  }
+]

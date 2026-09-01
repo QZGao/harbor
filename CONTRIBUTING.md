@@ -41,7 +41,10 @@ When opening a pull request, include:
 - what changed
 - which issue it closes or relates to
 - how you tested it
-- screenshots or screen recordings for UI changes, when helpful
+- screenshots or screen recordings for every fix or feature that changes the UI
+- the AI tool and model you used, if AI assisted with the contribution, and a short description of how you used it
+
+You remain responsible for the code, tests, documentation, and review of an AI-assisted contribution.
 
 Keep PRs focused. A small PR that solves one clear issue is easier to review and more likely to ship than a large PR that mixes several unrelated changes.
 
@@ -53,6 +56,8 @@ Please follow the existing project style:
 
 - keep UI state, app state, persistence, and download engines separated
 - prefer clear names over clever abstractions
+- add defensive code only for a verified failure mode, platform constraint, or data-safety requirement
+- avoid speculative fallback layers that make the code harder to read and maintain
 - keep user-facing behavior predictable and conservative
 - use system macOS controls and platform conventions where possible
 - preserve Harbor's local-first, privacy-friendly product direction

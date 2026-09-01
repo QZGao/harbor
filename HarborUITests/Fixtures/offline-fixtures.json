@@ -1,0 +1,21 @@
+{
+  "directSmall": {
+    "path": "/direct/small.bin",
+    "byteCount": 94208,
+    "sha256": "c057102af0d868b2e267e418e9ccbdb821f265a8860d949d9ae2179963bd2cea"
+  },
+  "directSlow": {
+    "path": "/direct/slow.bin",
+    "byteCount": 4194304,
+    "sha256": "2b07811057df887086f06a67edc6ebf911de8b6741156e7a2eb1416a4b8b1b2e"
+  },
+  "mediaPage": {
+    "path": "/media/page",
+    "title": "Harbor Synthetic Media"
+  },
+  "torrentMulti": {
+    "path": "/torrents/multi.torrent",
+    "name": "Harbor UI Fixture",
+    "fileCount": 2
+  }
+}

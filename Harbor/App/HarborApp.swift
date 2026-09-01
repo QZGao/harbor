@@ -8,13 +8,15 @@ struct HarborApp: App {
     @StateObject private var updater: AppUpdater
 
     init() {
-        let settings = AppSettingsStore()
+        let settings = AppSettingsStore(userDefaults: HarborTestRuntime.userDefaults)
         _settings = State(initialValue: settings)
         _center = State(initialValue: DownloadCenter(settings: settings))
         _updater = StateObject(
             wrappedValue: PreviewRuntime.isActive || HarborApplicationSupport.isRunningUnitTests
                 ? AppUpdater.preview(canCheckForUpdates: false)
-                : AppUpdater()
+                : AppUpdater(
+                    checksForUpdatesOnLaunch: HarborTestRuntime.disablesAutomaticUpdateCheck == false
+                )
         )
     }
 
@@ -22,6 +24,7 @@ struct HarborApp: App {
         WindowGroup("Harbor", id: "main") {
             RootView(center: center, settings: settings)
                 .frame(minWidth: 1_040, minHeight: 680)
+                .defaultAppStorage(HarborTestRuntime.userDefaults)
                 .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
                 .task {
                     appDelegate.center = center
@@ -46,6 +49,7 @@ struct HarborApp: App {
 
         Settings {
             SettingsView(settings: settings, updater: updater)
+                .defaultAppStorage(HarborTestRuntime.userDefaults)
         }
         .windowResizability(.contentSize)
     }

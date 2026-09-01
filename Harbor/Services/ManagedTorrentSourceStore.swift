@@ -10,6 +10,7 @@ struct ManagedTorrentSource: Equatable, Sendable {
 
 enum ManagedTorrentSourceStoreError: LocalizedError {
     case emptyTorrent
+    case torrentTooLarge
     case invalidServerResponse
     case unsuccessfulStatusCode(Int)
 
@@ -20,6 +21,12 @@ enum ManagedTorrentSourceStoreError: LocalizedError {
                 localized: "torrent.import.empty",
                 defaultValue: "The torrent file is empty.",
                 comment: "Error shown when a selected torrent file has no data."
+            )
+        case .torrentTooLarge:
+            String(
+                localized: "torrent.import.tooLarge",
+                defaultValue: "The torrent file is too large.",
+                comment: "Error shown when a torrent file exceeds Harbor's safe metadata size limit."
             )
         case .invalidServerResponse:
             String(
@@ -63,7 +70,7 @@ actor ManagedTorrentSourceStore {
             }
         }
 
-        let data = try Data(contentsOf: sourceURL, options: .mappedIfSafe)
+        let data = try Self.loadTorrentData(at: sourceURL, fileManager: fileManager)
         return try persist(data: data, originalURL: originalURL ?? sourceURL)
     }
 
@@ -71,14 +78,14 @@ actor ManagedTorrentSourceStore {
         from remoteURL: URL,
         using session: URLSession = .shared
     ) async throws -> ManagedTorrentSource {
-        let (data, response) = try await session.data(from: remoteURL)
+        let (temporaryURL, response) = try await session.download(from: remoteURL)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ManagedTorrentSourceStoreError.invalidServerResponse
         }
         guard 200 ..< 300 ~= httpResponse.statusCode else {
             throw ManagedTorrentSourceStoreError.unsuccessfulStatusCode(httpResponse.statusCode)
         }
-
+        let data = try Self.loadTorrentData(at: temporaryURL, fileManager: fileManager)
         return try persist(data: data, originalURL: remoteURL)
     }
 
@@ -93,8 +100,15 @@ actor ManagedTorrentSourceStore {
         return try persist(data: data, originalURL: remoteURL)
     }
 
+    func prepareTorrentData(
+        _ data: Data,
+        originalURL: URL
+    ) throws -> ManagedTorrentSource {
+        try persist(data: data, originalURL: originalURL)
+    }
+
     func fingerprint(forTorrentAt sourceURL: URL) throws -> String {
-        let data = try Data(contentsOf: sourceURL, options: .mappedIfSafe)
+        let data = try Self.loadTorrentData(at: sourceURL, fileManager: fileManager)
         guard data.isEmpty == false else {
             throw ManagedTorrentSourceStoreError.emptyTorrent
         }
@@ -135,6 +149,23 @@ actor ManagedTorrentSourceStore {
 
     nonisolated static func sourceFingerprint(for data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    nonisolated static func loadTorrentData(
+        at url: URL,
+        fileManager: FileManager = .default
+    ) throws -> Data {
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        if let size = attributes[.size] as? NSNumber,
+           size.int64Value > Int64(TorrentMetainfoParser.maximumMetainfoBytes) {
+            throw ManagedTorrentSourceStoreError.torrentTooLarge
+        }
+
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        guard data.count <= TorrentMetainfoParser.maximumMetainfoBytes else {
+            throw ManagedTorrentSourceStoreError.torrentTooLarge
+        }
+        return data
     }
 
     nonisolated static func normalizedInfoHash(_ value: String?) -> String? {
@@ -187,6 +218,9 @@ actor ManagedTorrentSourceStore {
         guard data.isEmpty == false else {
             throw ManagedTorrentSourceStoreError.emptyTorrent
         }
+        guard data.count <= TorrentMetainfoParser.maximumMetainfoBytes else {
+            throw ManagedTorrentSourceStoreError.torrentTooLarge
+        }
 
         let fingerprint = Self.fingerprint(for: data)
         let managedURL = directoryURL.appendingPathComponent("\(fingerprint).torrent", isDirectory: false)
@@ -206,200 +240,5 @@ actor ManagedTorrentSourceStore {
     nonisolated private static func defaultDirectoryURL(fileManager: FileManager) -> URL {
         HarborApplicationSupport.directoryURL(fileManager: fileManager)
             .appendingPathComponent("TorrentSources", isDirectory: true)
-    }
-}
-
-nonisolated private struct TorrentMetainfoParser {
-    private let data: Data
-    private var index = 0
-    private static let maximumDepth = 128
-
-    private init(data: Data) {
-        self.data = data
-    }
-
-    static func infoDictionaryRange(in data: Data) -> Range<Data.Index>? {
-        var parser = TorrentMetainfoParser(data: data)
-        return parser.parseTopLevelInfoDictionary()
-    }
-
-    private mutating func parseTopLevelInfoDictionary() -> Range<Data.Index>? {
-        guard consume(UInt8(ascii: "d")) else {
-            return nil
-        }
-
-        var infoRange: Range<Data.Index>?
-        var previousKey: Data?
-
-        while currentByte != UInt8(ascii: "e") {
-            guard let keyRange = parseByteString(),
-                  validateDictionaryKey(data[keyRange], after: &previousKey) else {
-                return nil
-            }
-
-            let valueStart = index
-            guard skipValue(depth: 1) else {
-                return nil
-            }
-
-            if data[keyRange].elementsEqual("info".utf8) {
-                guard infoRange == nil,
-                      data[valueStart] == UInt8(ascii: "d") else {
-                    return nil
-                }
-                infoRange = valueStart ..< index
-            }
-        }
-
-        guard consume(UInt8(ascii: "e")),
-              index == data.endIndex else {
-            return nil
-        }
-
-        return infoRange
-    }
-
-    private mutating func skipValue(depth: Int) -> Bool {
-        guard depth <= Self.maximumDepth,
-              let byte = currentByte else {
-            return false
-        }
-
-        switch byte {
-        case UInt8(ascii: "i"):
-            return skipInteger()
-        case UInt8(ascii: "l"):
-            return skipList(depth: depth)
-        case UInt8(ascii: "d"):
-            return skipDictionary(depth: depth)
-        case UInt8(ascii: "0") ... UInt8(ascii: "9"):
-            return parseByteString() != nil
-        default:
-            return false
-        }
-    }
-
-    private mutating func skipInteger() -> Bool {
-        guard consume(UInt8(ascii: "i")) else {
-            return false
-        }
-
-        let isNegative = consume(UInt8(ascii: "-"))
-        let digitsStart = index
-
-        while let byte = currentByte, byte.isASCIIDigit {
-            index += 1
-        }
-
-        guard index > digitsStart,
-              currentByte == UInt8(ascii: "e") else {
-            return false
-        }
-
-        let digits = data[digitsStart ..< index]
-        guard (digits.count == 1 || digits.first != UInt8(ascii: "0")),
-              (isNegative == false || digits.first != UInt8(ascii: "0")) else {
-            return false
-        }
-
-        index += 1
-        return true
-    }
-
-    private mutating func skipList(depth: Int) -> Bool {
-        guard consume(UInt8(ascii: "l")) else {
-            return false
-        }
-
-        while currentByte != UInt8(ascii: "e") {
-            guard skipValue(depth: depth + 1) else {
-                return false
-            }
-        }
-
-        return consume(UInt8(ascii: "e"))
-    }
-
-    private mutating func skipDictionary(depth: Int) -> Bool {
-        guard consume(UInt8(ascii: "d")) else {
-            return false
-        }
-
-        var previousKey: Data?
-        while currentByte != UInt8(ascii: "e") {
-            guard let keyRange = parseByteString(),
-                  validateDictionaryKey(data[keyRange], after: &previousKey),
-                  skipValue(depth: depth + 1) else {
-                return false
-            }
-        }
-
-        return consume(UInt8(ascii: "e"))
-    }
-
-    private mutating func parseByteString() -> Range<Data.Index>? {
-        let lengthStart = index
-        while let byte = currentByte, byte.isASCIIDigit {
-            index += 1
-        }
-
-        guard index > lengthStart,
-              currentByte == UInt8(ascii: ":") else {
-            return nil
-        }
-
-        let digits = data[lengthStart ..< index]
-        guard digits.count == 1 || digits.first != UInt8(ascii: "0") else {
-            return nil
-        }
-
-        var length = 0
-        for digit in digits {
-            let value = Int(digit - UInt8(ascii: "0"))
-            guard length <= (Int.max - value) / 10 else {
-                return nil
-            }
-            length = length * 10 + value
-        }
-
-        index += 1
-        guard length <= data.endIndex - index else {
-            return nil
-        }
-
-        let range = index ..< index + length
-        index += length
-        return range
-    }
-
-    private mutating func validateDictionaryKey(
-        _ key: Data.SubSequence,
-        after previousKey: inout Data?
-    ) -> Bool {
-        let keyData = Data(key)
-        if let previousKey,
-           keyData.lexicographicallyPrecedes(previousKey) || keyData == previousKey {
-            return false
-        }
-        previousKey = keyData
-        return true
-    }
-
-    private var currentByte: UInt8? {
-        index < data.endIndex ? data[index] : nil
-    }
-
-    private mutating func consume(_ byte: UInt8) -> Bool {
-        guard currentByte == byte else {
-            return false
-        }
-        index += 1
-        return true
-    }
-}
-
-nonisolated private extension UInt8 {
-    var isASCIIDigit: Bool {
-        self >= UInt8(ascii: "0") && self <= UInt8(ascii: "9")
     }
 }

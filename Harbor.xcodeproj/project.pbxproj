@@ -18,10 +18,21 @@
 			remoteGlobalIDString = 0DA35C532F6338930095E98E;
 			remoteInfo = Harbor;
 		};
+		0D8000072FA0000000A1B2C3 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 0DA35C4C2F6338930095E98E /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 0DA35C532F6338930095E98E;
+			remoteInfo = Harbor;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		0D4700012F90000000A1B2C3 /* HarborTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = HarborTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		0D8000012FA0000000A1B2C3 /* HarborUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = HarborUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		0D80000C2FA0000000A1B2C3 /* HarborUIOffline.xctestplan */ = {isa = PBXFileReference; lastKnownFileType = text; path = HarborUIOffline.xctestplan; sourceTree = "<group>"; };
+		0D80000D2FA0000000A1B2C3 /* HarborUISystem.xctestplan */ = {isa = PBXFileReference; lastKnownFileType = text; path = HarborUISystem.xctestplan; sourceTree = "<group>"; };
+		0D80000E2FA0000000A1B2C3 /* HarborUILiveCanary.xctestplan */ = {isa = PBXFileReference; lastKnownFileType = text; path = HarborUILiveCanary.xctestplan; sourceTree = "<group>"; };
 		0DA35C542F6338930095E98E /* Harbor.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Harbor.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -41,6 +52,11 @@
 			path = HarborTests;
 			sourceTree = "<group>";
 		};
+		0D8000022FA0000000A1B2C3 /* HarborUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = HarborUITests;
+			sourceTree = "<group>";
+		};
 		0DA35C562F6338930095E98E /* Harbor */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
@@ -53,6 +69,13 @@
 
 /* Begin PBXFrameworksBuildPhase section */
 		0D4700032F90000000A1B2C3 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		0D8000032FA0000000A1B2C3 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -75,6 +98,10 @@
 			children = (
 				0DA35C562F6338930095E98E /* Harbor */,
 				0D4700022F90000000A1B2C3 /* HarborTests */,
+				0D8000022FA0000000A1B2C3 /* HarborUITests */,
+				0D80000C2FA0000000A1B2C3 /* HarborUIOffline.xctestplan */,
+				0D80000D2FA0000000A1B2C3 /* HarborUISystem.xctestplan */,
+				0D80000E2FA0000000A1B2C3 /* HarborUILiveCanary.xctestplan */,
 				0DA35C552F6338930095E98E /* Products */,
 			);
 			sourceTree = "<group>";
@@ -84,6 +111,7 @@
 			children = (
 				0DA35C542F6338930095E98E /* Harbor.app */,
 				0D4700012F90000000A1B2C3 /* HarborTests.xctest */,
+				0D8000012FA0000000A1B2C3 /* HarborUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -113,6 +141,29 @@
 			productName = HarborTests;
 			productReference = 0D4700012F90000000A1B2C3 /* HarborTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		0D8000062FA0000000A1B2C3 /* HarborUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0D80000B2FA0000000A1B2C3 /* Build configuration list for PBXNativeTarget "HarborUITests" */;
+			buildPhases = (
+				0D8000052FA0000000A1B2C3 /* Sources */,
+				0D8000032FA0000000A1B2C3 /* Frameworks */,
+				0D8000042FA0000000A1B2C3 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				0D8000082FA0000000A1B2C3 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				0D8000022FA0000000A1B2C3 /* HarborUITests */,
+			);
+			name = HarborUITests;
+			packageProductDependencies = (
+			);
+			productName = HarborUITests;
+			productReference = 0D8000012FA0000000A1B2C3 /* HarborUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
 		};
 		0DA35C532F6338930095E98E /* Harbor */ = {
 			isa = PBXNativeTarget;
@@ -153,6 +204,10 @@
 						CreatedOnToolsVersion = 26.3;
 						TestTargetID = 0DA35C532F6338930095E98E;
 					};
+					0D8000062FA0000000A1B2C3 = {
+						CreatedOnToolsVersion = 26.6;
+						TestTargetID = 0DA35C532F6338930095E98E;
+					};
 					0DA35C532F6338930095E98E = {
 						CreatedOnToolsVersion = 26.3;
 					};
@@ -177,15 +232,23 @@
 			productRefGroup = 0DA35C552F6338930095E98E /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
-			targets = (
-				0DA35C532F6338930095E98E /* Harbor */,
-				0D4700062F90000000A1B2C3 /* HarborTests */,
+				targets = (
+					0DA35C532F6338930095E98E /* Harbor */,
+					0D4700062F90000000A1B2C3 /* HarborTests */,
+					0D8000062FA0000000A1B2C3 /* HarborUITests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		0D4700042F90000000A1B2C3 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		0D8000042FA0000000A1B2C3 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -219,15 +282,17 @@
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/TorrentRuntime/arm64/bin/aria2c",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/TorrentRuntime/x86_64/bin/aria2c",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MediaRuntime/arm64/bin/yt-dlp",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MediaRuntime/arm64/bin/deno",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MediaRuntime/arm64/bin/ffmpeg",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MediaRuntime/arm64/bin/ffprobe",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MediaRuntime/x86_64/bin/yt-dlp",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MediaRuntime/x86_64/bin/deno",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MediaRuntime/x86_64/bin/ffmpeg",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MediaRuntime/x86_64/bin/ffprobe",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\n\nAPP_PATH=\"${TARGET_BUILD_DIR}/${WRAPPER_NAME}\"\nRESOURCES_DIR=\"${APP_PATH}/Contents/Resources\"\nSIGN_IDENTITY=\"${EXPANDED_CODE_SIGN_IDENTITY_NAME:-}\"\n\nif [ -z \"$SIGN_IDENTITY\" ]; then\n  echo \"Skipping embedded runtime signing because no expanded code signing identity is available.\"\n  exit 0\nfi\n\nsign_runtime() {\n  local runtime_name=\"$1\"\n  shift\n\n  for architecture in arm64 x86_64; do\n    local runtime_dir=\"${RESOURCES_DIR}/${runtime_name}/${architecture}\"\n\n    if [ ! -d \"$runtime_dir\" ]; then\n      echo \"${runtime_name} ${architecture} not found at $runtime_dir\"\n      continue\n    fi\n\n    if [ \"$runtime_name\" = \"TorrentRuntime\" ] && [ \"$architecture\" = \"x86_64\" ]; then\n      echo \"Keeping TorrentRuntime x86_64 staged signature intact for Rosetta compatibility.\"\n      continue\n    fi\n\n    echo \"Signing ${runtime_name} ${architecture} with identity: $SIGN_IDENTITY\"\n\n    if [ -d \"$runtime_dir/lib\" ]; then\n      find \"$runtime_dir/lib\" -type f \\( -name \"*.dylib\" \\) | while read -r file; do\n        echo \"Signing dylib: $file\"\n        codesign --force --sign \"$SIGN_IDENTITY\" --options runtime --timestamp \"$file\"\n      done\n    fi\n\n    for executable_name in \"$@\"; do\n      local executable=\"$runtime_dir/bin/$executable_name\"\n      if [ -f \"$executable\" ]; then\n        echo \"Signing executable: $executable\"\n        codesign --force --sign \"$SIGN_IDENTITY\" --options runtime --timestamp \"$executable\"\n      fi\n    done\n  done\n}\n\nsign_runtime \"TorrentRuntime\" \"aria2c\"\necho \"Keeping MediaRuntime yt-dlp signature intact for PyInstaller.\"\nsign_runtime \"MediaRuntime\" \"ffmpeg\" \"ffprobe\"\n";
+			shellScript = "set -euo pipefail\n\nAPP_PATH=\"${TARGET_BUILD_DIR}/${WRAPPER_NAME}\"\nRESOURCES_DIR=\"${APP_PATH}/Contents/Resources\"\nSIGN_IDENTITY=\"${EXPANDED_CODE_SIGN_IDENTITY_NAME:-}\"\n\nif [ -z \"$SIGN_IDENTITY\" ]; then\n  echo \"Skipping embedded runtime signing because no expanded code signing identity is available.\"\n  exit 0\nfi\n\nsign_runtime() {\n  local runtime_name=\"$1\"\n  shift\n\n  for architecture in arm64 x86_64; do\n    local runtime_dir=\"${RESOURCES_DIR}/${runtime_name}/${architecture}\"\n\n    if [ ! -d \"$runtime_dir\" ]; then\n      echo \"${runtime_name} ${architecture} not found at $runtime_dir\"\n      continue\n    fi\n\n    if [ \"$runtime_name\" = \"TorrentRuntime\" ] && [ \"$architecture\" = \"x86_64\" ]; then\n      echo \"Keeping TorrentRuntime x86_64 staged signature intact for Rosetta compatibility.\"\n      continue\n    fi\n\n    echo \"Signing ${runtime_name} ${architecture} with identity: $SIGN_IDENTITY\"\n\n    if [ -d \"$runtime_dir/lib\" ]; then\n      find \"$runtime_dir/lib\" -type f \\( -name \"*.dylib\" \\) | while read -r file; do\n        echo \"Signing dylib: $file\"\n        codesign --force --sign \"$SIGN_IDENTITY\" --options runtime --timestamp \"$file\"\n      done\n    fi\n\n    for executable_name in \"$@\"; do\n      local executable=\"$runtime_dir/bin/$executable_name\"\n      if [ -f \"$executable\" ]; then\n        echo \"Signing executable: $executable\"\n        codesign --force --sign \"$SIGN_IDENTITY\" --options runtime --timestamp \"$executable\"\n      fi\n    done\n  done\n}\n\nsign_runtime \"TorrentRuntime\" \"aria2c\"\necho \"Keeping MediaRuntime yt-dlp signature intact for PyInstaller.\"\nsign_runtime \"MediaRuntime\" \"deno\" \"ffmpeg\" \"ffprobe\"\n";
 		};
 		0DFA3D392F6F7A79006B52A1 /* Copy Vendored Runtimes */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -262,6 +327,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		0D8000052FA0000000A1B2C3 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		0DA35C502F6338930095E98E /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -276,6 +348,11 @@
 			isa = PBXTargetDependency;
 			target = 0DA35C532F6338930095E98E /* Harbor */;
 			targetProxy = 0D4700072F90000000A1B2C3 /* PBXContainerItemProxy */;
+		};
+		0D8000082FA0000000A1B2C3 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 0DA35C532F6338930095E98E /* Harbor */;
+			targetProxy = 0D8000072FA0000000A1B2C3 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -325,6 +402,52 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Harbor.app/Contents/MacOS/Harbor";
+			};
+			name = Release;
+		};
+		0D8000092FA0000000A1B2C3 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
+				PRODUCT_BUNDLE_IDENTIFIER = co.hapy.HarborUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = Harbor;
+			};
+			name = Debug;
+		};
+		0D80000A2FA0000000A1B2C3 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
+				PRODUCT_BUNDLE_IDENTIFIER = co.hapy.HarborUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = Harbor;
 			};
 			name = Release;
 		};
@@ -457,12 +580,12 @@
 		0DA35C602F6338940095E98E /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = Harbor;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 28;
+				CURRENT_PROJECT_VERSION = 30;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -477,7 +600,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.6;
-				MARKETING_VERSION = 1.6.2;
+				MARKETING_VERSION = 1.7.1;
 				PRODUCT_BUNDLE_IDENTIFIER = co.hapy.harbor;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -494,12 +617,12 @@
 		0DA35C612F6338940095E98E /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = Harbor;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 28;
+				CURRENT_PROJECT_VERSION = 30;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -514,7 +637,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.6;
-				MARKETING_VERSION = 1.6.2;
+				MARKETING_VERSION = 1.7.1;
 				PRODUCT_BUNDLE_IDENTIFIER = co.hapy.harbor;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -536,6 +659,15 @@
 			buildConfigurations = (
 				0D4700092F90000000A1B2C3 /* Debug */,
 				0D47000A2F90000000A1B2C3 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		0D80000B2FA0000000A1B2C3 /* Build configuration list for PBXNativeTarget "HarborUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0D8000092FA0000000A1B2C3 /* Debug */,
+				0D80000A2FA0000000A1B2C3 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

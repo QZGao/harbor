@@ -1,8 +1,14 @@
 import Foundation
 
+struct DownloadPersistenceRevision: Equatable, Sendable {
+    let writerIdentifier: UUID
+    let value: UInt64
+}
+
 actor DownloadPersistence {
     private let fileManager: FileManager
     private let fileURL: URL
+    private var latestRevisionByWriter: [UUID: UInt64] = [:]
 
     init(
         fileManager: FileManager = .default,
@@ -15,19 +21,44 @@ actor DownloadPersistence {
     }
 
     func load() throws -> [DownloadRecord] {
-        guard fileManager.fileExists(atPath: fileURL.path) else {
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return []
+        } catch let error as POSIXError where error.code == .ENOENT {
             return []
         }
-
-        let data = try Data(contentsOf: fileURL)
         return try JSONDecoder().decode([DownloadRecord].self, from: data)
     }
 
     func save(_ records: [DownloadRecord]) throws {
+        try write(records)
+    }
+
+    func save(
+        _ records: [DownloadRecord],
+        revision: DownloadPersistenceRevision
+    ) throws {
+        guard revision.value > (latestRevisionByWriter[revision.writerIdentifier] ?? 0) else {
+            return
+        }
+
+        try write(records)
+        latestRevisionByWriter[revision.writerIdentifier] = revision.value
+    }
+
+    private func write(_ records: [DownloadRecord]) throws {
         let directoryURL = fileURL.deletingLastPathComponent()
+        let directoryAlreadyExists = fileManager.fileExists(atPath: directoryURL.path)
         try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        if directoryAlreadyExists == false {
+            try DurableFileSystem.synchronizeParentDirectory(of: directoryURL)
+        }
         let data = try JSONEncoder().encode(records)
         try data.write(to: fileURL, options: [.atomic])
+        try DurableFileSystem.synchronizeFile(at: fileURL)
+        try DurableFileSystem.synchronizeDirectory(at: directoryURL)
     }
 
 }

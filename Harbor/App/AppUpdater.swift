@@ -13,7 +13,10 @@ final class AppUpdater: ObservableObject {
     private var didCheckForUpdatesOnLaunch = false
     private var observations: [NSKeyValueObservation] = []
 
-    init(bundle: Bundle = .main) {
+    init(
+        bundle: Bundle = .main,
+        checksForUpdatesOnLaunch: Bool = true
+    ) {
         self.currentBundle = bundle
         self.previewVersionLabel = nil
 
@@ -35,7 +38,9 @@ final class AppUpdater: ObservableObject {
         self.canCheckForUpdates = controller.updater.canCheckForUpdates
 
         installObservers(for: controller.updater)
-        checkForUpdatesOnLaunchIfAllowed()
+        if checksForUpdatesOnLaunch {
+            checkForUpdatesOnLaunchIfAllowed()
+        }
     }
 
     private init(

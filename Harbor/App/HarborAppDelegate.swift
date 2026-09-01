@@ -9,6 +9,15 @@ final class HarborAppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        guard HarborTestRuntime.isUITesting else { return }
+
+        DispatchQueue.main.async {
+            let windows = NSApp.windows.filter(\.isVisible)
+            windows.dropFirst().forEach { $0.close() }
+        }
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if isTerminating {
             return .terminateLater
@@ -20,8 +29,11 @@ final class HarborAppDelegate: NSObject, NSApplicationDelegate {
 
         isTerminating = true
         Task { @MainActor in
-            await center.shutdownForTermination()
-            sender.reply(toApplicationShouldTerminate: true)
+            let didSave = await center.shutdownForTermination()
+            if didSave == false {
+                isTerminating = false
+            }
+            sender.reply(toApplicationShouldTerminate: didSave)
         }
         return .terminateLater
     }

@@ -25,6 +25,34 @@ enum TorrentEngineError: LocalizedError {
     }
 }
 
+struct TorrentSubmissionUncertainError: LocalizedError, Sendable {
+    let gid: String
+    let detail: String
+
+    init(gid: String, underlyingError: Error) {
+        self.gid = gid
+        self.detail = underlyingError.localizedDescription
+    }
+
+    var errorDescription: String? {
+        "Harbor submitted torrent \(gid), but could not confirm its recovery state: \(detail)"
+    }
+}
+
+struct TorrentUnpauseUncertainError: LocalizedError, Sendable {
+    let gid: String
+    let detail: String
+
+    init(gid: String, underlyingError: Error) {
+        self.gid = gid
+        self.detail = underlyingError.localizedDescription
+    }
+
+    var errorDescription: String? {
+        "Harbor could not confirm whether torrent \(gid) resumed: \(detail)"
+    }
+}
+
 struct TorrentStatusSnapshot: Sendable {
     let gid: String
     let status: String
@@ -65,38 +93,77 @@ struct TorrentTransferOptions: Equatable, Sendable {
     let shouldSeed: Bool
     let seedRatioLimit: Double?
     let verifyExistingData: Bool
+    let selectedFileIndexes: [Int]?
 
     init(
         downloadLimitBytesPerSecond: Int64?,
         uploadLimitBytesPerSecond: Int64?,
         shouldSeed: Bool,
         seedRatioLimit: Double? = nil,
-        verifyExistingData: Bool = false
+        verifyExistingData: Bool = false,
+        selectedFileIndexes: [Int]? = nil
     ) {
         self.downloadLimitBytesPerSecond = downloadLimitBytesPerSecond
         self.uploadLimitBytesPerSecond = uploadLimitBytesPerSecond
         self.shouldSeed = shouldSeed
         self.seedRatioLimit = seedRatioLimit
         self.verifyExistingData = verifyExistingData
+        self.selectedFileIndexes = selectedFileIndexes
     }
 }
 
-private final class TorrentEngineLogBuffer: @unchecked Sendable {
-    nonisolated private let lock = NSLock()
-    nonisolated(unsafe) private var output = ""
+private enum TorrentPreviewError: LocalizedError {
+    case invalidMagnet
+    case metadataUnavailable(String?)
+    case fingerprintMismatch
 
-    nonisolated init() {}
+    var errorDescription: String? {
+        switch self {
+        case .invalidMagnet:
+            "The magnet link does not include a supported BitTorrent info hash."
+        case let .metadataUnavailable(detail):
+            detail ?? "Harbor could not resolve metadata for this magnet link."
+        case .fingerprintMismatch:
+            "The resolved torrent metadata does not match the magnet link."
+        }
+    }
+}
+
+final class TorrentEngineLogBuffer: @unchecked Sendable {
+    nonisolated private let lock = NSLock()
+    nonisolated private let maximumCharacterCount: Int
+    nonisolated(unsafe) private var output = ""
+    nonisolated(unsafe) private var isCapturing = true
+
+    nonisolated init(maximumCharacterCount: Int = 262_144) {
+        self.maximumCharacterCount = max(maximumCharacterCount, 0)
+    }
 
     nonisolated func reset() {
         lock.lock()
         output = ""
+        isCapturing = true
         lock.unlock()
     }
 
     nonisolated func append(_ value: String) {
         lock.lock()
+        guard isCapturing, maximumCharacterCount > 0 else {
+            lock.unlock()
+            return
+        }
         output.append(value)
         output.append("\n")
+        if output.count > maximumCharacterCount {
+            output.removeFirst(output.count - maximumCharacterCount)
+        }
+        lock.unlock()
+    }
+
+    nonisolated func stopCapturing() {
+        lock.lock()
+        output = ""
+        isCapturing = false
         lock.unlock()
     }
 
@@ -108,6 +175,13 @@ private final class TorrentEngineLogBuffer: @unchecked Sendable {
 }
 
 actor Aria2TorrentService {
+    typealias DaemonStartupOperation = @Sendable (Aria2TorrentService) async throws -> Void
+
+    private struct DaemonStartupState {
+        let identifier: UUID
+        let task: Task<Void, Error>
+    }
+
     private struct RPCEnvelope<Result: Decodable>: Decodable {
         let result: Result?
         let error: RPCFailure?
@@ -159,7 +233,34 @@ actor Aria2TorrentService {
     private struct RunningDaemon {
         let pid: pid_t
         let parentPID: pid_t
+        let startSignature: String
         let command: String
+    }
+
+    private struct DaemonOwnershipManifest: Codable {
+        static let currentVersion = 1
+
+        let version: Int
+        let pid: pid_t
+        let binaryPath: String
+        let sessionFilePath: String
+        let rpcPort: Int
+        let startSignature: String
+
+        init(
+            pid: pid_t,
+            binaryPath: String,
+            sessionFilePath: String,
+            rpcPort: Int,
+            startSignature: String
+        ) {
+            self.version = Self.currentVersion
+            self.pid = pid
+            self.binaryPath = binaryPath
+            self.sessionFilePath = sessionFilePath
+            self.rpcPort = rpcPort
+            self.startSignature = startSignature
+        }
     }
 
     nonisolated private let logger = Logger(
@@ -179,18 +280,32 @@ actor Aria2TorrentService {
     private var rpcPort: Int?
     private var rpcSecret: String?
     private var stderrPipe: Pipe?
+    private var isDaemonReady = false
+    private var daemonStartupState: DaemonStartupState?
+    private let daemonStartupOperation: DaemonStartupOperation
     private let startupLogBuffer = TorrentEngineLogBuffer()
     private var transferSettings: DownloadTransferSettings
     private var isRetryingAfterSessionRecovery = false
 
-    init(transferSettings: DownloadTransferSettings = .default) {
+    init(
+        transferSettings: DownloadTransferSettings = .default,
+        daemonStartupOperation: DaemonStartupOperation? = nil
+    ) {
         self.transferSettings = transferSettings
+        self.daemonStartupOperation = daemonStartupOperation ?? { service in
+            try await service.startDaemonUntilReady()
+        }
     }
 
     deinit {
         stderrPipe?.fileHandleForReading.readabilityHandler = nil
-        if let process, process.isRunning {
-            terminateDaemonProcess(process)
+        if let process {
+            let didStop = process.isRunning
+                ? terminateDaemonProcess(process)
+                : true
+            if didStop {
+                discardDaemonOwnershipManifest()
+            }
         }
     }
 
@@ -205,7 +320,8 @@ actor Aria2TorrentService {
     ) async {
         self.transferSettings = transferSettings
 
-        guard process?.isRunning == true,
+        guard isDaemonReady,
+              process?.isRunning == true,
               rpcPort != nil,
               rpcSecret != nil else {
             return
@@ -231,10 +347,16 @@ actor Aria2TorrentService {
     }
 
     func saveSession() async throws {
-        guard process?.isRunning == true,
+        if let daemonStartupState {
+            try await awaitDaemonStartup(daemonStartupState)
+        }
+        guard isDaemonReady,
+              process?.isRunning == true,
               rpcPort != nil,
               rpcSecret != nil else {
-            return
+            throw TorrentEngineError.rpc(
+                "The torrent engine stopped before its recovery session could be saved."
+            )
         }
 
         _ = try await rpcCall(method: "aria2.saveSession", params: [
@@ -264,28 +386,54 @@ actor Aria2TorrentService {
         return Set((active + waiting + stopped).map(\.gid))
     }
 
-    func shutdown() async {
-        guard process?.isRunning == true,
-              rpcPort != nil,
-              rpcSecret != nil else {
-            resetDaemon(terminateIfRunning: process?.isRunning == true)
+    func shutdown() async throws {
+        if let daemonStartupState {
+            try await awaitDaemonStartup(daemonStartupState)
+        }
+        guard let process, process.isRunning else {
+            if self.process == nil {
+                // A previous termination escalation may have dropped the
+                // in-memory Process while deliberately retaining its durable
+                // ownership marker. Do not approve app termination until that
+                // exact persisted owner is confirmed gone.
+                try terminatePersistedOwnedDaemonIfNeeded()
+            }
+            resetDaemon(terminateIfRunning: false)
             return
         }
+        guard rpcPort != nil, rpcSecret != nil else {
+            throw TorrentEngineError.rpc(
+                "The torrent engine is still running, but Harbor cannot save its recovery session."
+            )
+        }
+
+        // Do not terminate the only in-memory owner of current torrent state
+        // until aria2 confirms that its recovery session is durable. The app
+        // delegate can then refuse termination and let the user retry instead
+        // of silently accepting a stale session file.
+        try await saveSession()
 
         do {
-            try await saveSession()
             _ = try await rpcCall(method: "aria2.shutdown", params: [
                 authorizedToken()
             ], as: String.self)
 
-            for _ in 0 ..< 20 where process?.isRunning == true {
+            for _ in 0 ..< 20 where process.isRunning {
                 try? await Task.sleep(for: .milliseconds(50))
             }
         } catch {
             logger.warning("Failed to gracefully shut down aria2: \(error.localizedDescription, privacy: .public)")
         }
 
-        resetDaemon(terminateIfRunning: process?.isRunning == true)
+        if process.isRunning {
+            terminateDaemonProcess(process)
+        }
+        guard process.isRunning == false else {
+            throw TorrentEngineError.rpc(
+                "Harbor could not confirm that the torrent engine stopped before quitting."
+            )
+        }
+        resetDaemon(terminateIfRunning: false)
     }
 
     func addDownload(
@@ -296,57 +444,180 @@ actor Aria2TorrentService {
         transferOptions: TorrentTransferOptions? = nil
     ) async throws -> String {
         logger.info("Starting torrent add request for source kind \(String(describing: sourceKind), privacy: .public)")
+        let torrentData: Data?
+        switch sourceKind {
+        case .magnetLink:
+            torrentData = nil
+        case .torrentFile:
+            torrentData = try ManagedTorrentSourceStore.loadTorrentData(at: sourceURL)
+        case .directURL, .mediaURL:
+            throw TorrentEngineError.invalidSource
+        }
+        let gid = Self.makeSubmissionGID()
         try await ensureDaemonRunning()
 
-        let options = downloadOptions(
+        var options = downloadOptions(
             destinationFolderPath: destinationFolderPath,
             requestHeaders: requestHeaders,
             transferOptions: transferOptions
         )
+        options["gid"] = gid
 
+        let returnedGID: String
         switch sourceKind {
         case .magnetLink:
-            let gid = try await rpcCallWithDaemonRestart(
+            returnedGID = try await submitDownload(
                 method: "aria2.addUri",
-                params: {
-                    [
-                        try authorizedToken(),
-                        [sourceURL.absoluteString],
-                        options
-                    ]
-                },
-                as: String.self
+                params: [
+                    authorizedToken(),
+                    [sourceURL.absoluteString],
+                    options
+                ],
+                gid: gid
             )
-            logger.info("aria2 accepted magnet download with gid \(gid, privacy: .public)")
-            await persistSessionAfterMutation("magnet add")
-            return gid
         case .torrentFile:
-            let torrentData = try await TorrentSourceLoader.load(
-                from: sourceURL,
-                requestHeaders: requestHeaders
-            )
-            let gid = try await rpcCallWithDaemonRestart(
+            guard let torrentData else {
+                throw TorrentEngineError.invalidSource
+            }
+            returnedGID = try await submitDownload(
                 method: "aria2.addTorrent",
-                params: {
-                    [
-                        try authorizedToken(),
-                        torrentData.base64EncodedString(),
-                        [],
-                        options
-                    ]
-                },
-                as: String.self
+                params: [
+                    authorizedToken(),
+                    torrentData.base64EncodedString(),
+                    [],
+                    options
+                ],
+                gid: gid
             )
-            logger.info("aria2 accepted torrent file with gid \(gid, privacy: .public)")
-            await persistSessionAfterMutation("torrent add")
-            return gid
         case .directURL, .mediaURL:
             throw TorrentEngineError.invalidSource
         }
+        guard returnedGID == gid else {
+            // The add request may still have committed under the caller-owned
+            // reserved GID. Treat a contradictory response as uncertain
+            // ownership so the model keeps that GID slot-occupying instead of
+            // declaring failure while aria2 may be writing in the background.
+            throw TorrentSubmissionUncertainError(
+                gid: gid,
+                underlyingError: TorrentEngineError.invalidResponse
+            )
+        }
+        // A successful add is not handed to the model until aria confirms the
+        // session file contains it.
+        do {
+            try await saveSession()
+        } catch {
+            throw TorrentSubmissionUncertainError(
+                gid: returnedGID,
+                underlyingError: error
+            )
+        }
+        logger.info("aria2 accepted torrent with reserved gid \(returnedGID, privacy: .public)")
+        return returnedGID
+    }
+
+    func previewMagnetMetainfo(
+        at sourceURL: URL,
+        requestHeaders: [RequestHeader]
+    ) async throws -> Data {
+        guard let expectedInfoHash = ManagedTorrentSourceStore.normalizedInfoHash(
+            MagnetLinkMetadata(url: sourceURL).infoHash
+        ) else {
+            throw TorrentPreviewError.invalidMagnet
+        }
+
+        let previewDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HarborTorrentPreview", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: previewDirectory,
+            withIntermediateDirectories: true
+        )
+
+        let gid = Self.makeSubmissionGID()
+        do {
+            try await ensureDaemonRunning()
+            var options: [String: Any] = [
+                "gid": gid,
+                "dir": previewDirectory.path,
+                "pause": "false",
+                "pause-metadata": "true",
+                "bt-metadata-only": "true",
+                "bt-save-metadata": "true",
+                "seed-time": "0"
+            ]
+            if requestHeaders.isEmpty == false {
+                options["header"] = requestHeaders.map(\.aria2HeaderValue)
+            }
+            let returnedGID = try await submitDownload(
+                method: "aria2.addUri",
+                params: [
+                    authorizedToken(),
+                    [sourceURL.absoluteString],
+                    options
+                ],
+                gid: gid
+            )
+            guard returnedGID == gid else {
+                throw TorrentEngineError.invalidResponse
+            }
+
+            let expectedMetadataURL = previewDirectory
+                .appendingPathComponent("\(expectedInfoHash).torrent", isDirectory: false)
+
+            while true {
+                try Task.checkCancellation()
+
+                let metadataURL: URL? = if FileManager.default.fileExists(
+                    atPath: expectedMetadataURL.path
+                ) {
+                    expectedMetadataURL
+                } else {
+                    try FileManager.default.contentsOfDirectory(
+                        at: previewDirectory,
+                        includingPropertiesForKeys: nil
+                    ).first { $0.pathExtension.lowercased() == "torrent" }
+                }
+
+                if let metadataURL {
+                    let data = try ManagedTorrentSourceStore.loadTorrentData(at: metadataURL)
+                    let preview = try TorrentMetainfoParser.preview(from: data)
+                    guard preview.infoHash == expectedInfoHash else {
+                        throw TorrentPreviewError.fingerprintMismatch
+                    }
+                    await cleanupTorrentPreview(gid: gid, directoryURL: previewDirectory)
+                    return data
+                }
+
+                let snapshot = try await status(for: gid)
+                if snapshot.status == "error" || snapshot.status == "removed" {
+                    throw TorrentPreviewError.metadataUnavailable(snapshot.errorMessage)
+                }
+
+                try await Task.sleep(for: .milliseconds(250))
+            }
+        } catch {
+            await cleanupTorrentPreview(gid: gid, directoryURL: previewDirectory)
+            throw error
+        }
+    }
+
+    private func cleanupTorrentPreview(gid: String, directoryURL: URL) async {
+        // A fresh task does not inherit caller cancellation, so a dismissed
+        // selector still removes its temporary aria2 job and durable session entry.
+        let cleanupTask = Task {
+            try? await removeAndConfirmStopped(gid: gid)
+        }
+        await cleanupTask.value
+        try? FileManager.default.removeItem(at: directoryURL)
     }
 
     func pause(gid: String) async throws {
         let lineage = try await followedStatus(for: gid)
+        guard lineage.currentSnapshot.status == "active"
+                || lineage.currentSnapshot.status == "waiting" else {
+            return
+        }
         let currentGID = lineage.currentSnapshot.gid
         _ = try await rpcCallWithDaemonRestart(
             method: "aria2.forcePause",
@@ -358,34 +629,75 @@ actor Aria2TorrentService {
             },
             as: String.self
         )
-        await persistSessionAfterMutation("pause")
+        try await saveSession()
     }
 
     func unpause(gid: String) async throws {
         let lineage = try await followedStatus(for: gid)
         let currentGID = lineage.currentSnapshot.gid
-        _ = try await rpcCallWithDaemonRestart(
-            method: "aria2.unpause",
-            params: {
-                [
-                    try authorizedToken(),
-                    currentGID
-                ]
-            },
-            as: String.self
-        )
-        await persistSessionAfterMutation("unpause")
+        do {
+            _ = try await rpcCall(
+                method: "aria2.unpause",
+                params: [authorizedToken(), currentGID],
+                as: String.self
+            )
+            try await saveSession()
+            return
+        } catch {
+            let originalError = error
+            var lastProbeError: Error?
+            var lastObservedStatus: String?
+
+            for delay in [Duration.zero, .milliseconds(150), .milliseconds(500)] {
+                if delay != .zero {
+                    try? await Task.sleep(for: delay)
+                }
+                do {
+                    let snapshot = try await followedStatus(for: gid)
+                    let currentStatus = snapshot.currentSnapshot.status
+                    lastObservedStatus = currentStatus
+                    lastProbeError = nil
+                    if currentStatus == "active" || currentStatus == "waiting" {
+                        do {
+                            try await saveSession()
+                        } catch {
+                            throw TorrentUnpauseUncertainError(
+                                gid: gid,
+                                underlyingError: error
+                            )
+                        }
+                        return
+                    }
+                } catch let uncertain as TorrentUnpauseUncertainError {
+                    throw uncertain
+                } catch {
+                    lastProbeError = error
+                }
+            }
+
+            if lastProbeError == nil,
+               lastObservedStatus == "paused",
+               Self.mutationFailureWasExplicitlyRejected(originalError) {
+                throw originalError
+            }
+            throw TorrentUnpauseUncertainError(
+                gid: gid,
+                underlyingError: lastProbeError ?? originalError
+            )
+        }
     }
 
     func remove(gid: String) async {
         guard process?.isRunning == true,
               rpcPort != nil,
-              rpcSecret != nil,
-              let token = try? authorizedToken() else {
+              rpcSecret != nil else {
             return
         }
 
         let lineage = try? await followedStatus(for: gid)
+        guard let token = try? authorizedToken() else {
+            return
+        }
         let gids = lineage?.gids.reversed() ?? [gid].reversed()
         var didRemove = false
 
@@ -400,15 +712,29 @@ actor Aria2TorrentService {
 
     func removeAndConfirmStopped(gid: String) async throws {
         try await ensureDaemonRunning()
+        let gids: [String]
+        do {
+            gids = Array(try await followedStatus(for: gid).gids.reversed())
+        } catch {
+            guard isMissingGIDError(error) else {
+                // A transient lineage lookup must not be treated as proof that
+                // removing only the root GID stopped a followed magnet payload.
+                throw error
+            }
+            gids = [gid]
+        }
+        // followedStatus may restart the daemon and rotate its RPC secret.
+        // Resolve authorization only after lineage discovery has settled.
         let token = try authorizedToken()
-        let lineage = try? await followedStatus(for: gid)
-        let gids = lineage?.gids.reversed() ?? [gid].reversed()
 
         for targetGID in gids {
             try await removeSingleAndConfirmStopped(gid: targetGID, token: token)
         }
 
-        await persistSessionAfterMutation("confirmed remove")
+        // A confirmed runtime removal is not durable until aria2 rewrites its
+        // session. Propagate this failure so the owning record retains the GID
+        // and cleanup can be retried safely.
+        try await saveSession()
     }
 
     private func removeSingle(gid: String, token: String) async -> Bool {
@@ -499,6 +825,7 @@ actor Aria2TorrentService {
         )
 
         let filePaths = payload.files?
+            .filter { $0.selected != "false" }
             .compactMap(\.path)
             .filter { $0.isEmpty == false } ?? []
 
@@ -547,9 +874,57 @@ actor Aria2TorrentService {
     }
 
     private func ensureDaemonRunning() async throws {
-        if let process, process.isRunning, rpcPort != nil, rpcSecret != nil {
+        if isDaemonReady,
+           let process,
+           process.isRunning,
+           rpcPort != nil,
+           rpcSecret != nil {
             return
         }
+
+        if let daemonStartupState {
+            try await awaitDaemonStartup(daemonStartupState)
+            return
+        }
+
+        let daemonStartupOperation = daemonStartupOperation
+        let startupTask = Task { [weak self, daemonStartupOperation] in
+            guard let self else {
+                throw TorrentEngineError.startupFailed(
+                    "The torrent engine service was released during startup."
+                )
+            }
+            try await daemonStartupOperation(self)
+        }
+        let startupState = DaemonStartupState(
+            identifier: UUID(),
+            task: startupTask
+        )
+        daemonStartupState = startupState
+        try await awaitDaemonStartup(startupState)
+    }
+
+    private func awaitDaemonStartup(_ startupState: DaemonStartupState) async throws {
+        do {
+            try await startupState.task.value
+        } catch {
+            if daemonStartupState?.identifier == startupState.identifier {
+                isDaemonReady = false
+                daemonStartupState = nil
+            }
+            throw error
+        }
+
+        // Any waiter can resume first after the shared task completes. Make
+        // readiness publication part of the shared await instead of relying
+        // on the caller that happened to create the task to run first.
+        if daemonStartupState?.identifier == startupState.identifier {
+            isDaemonReady = true
+            daemonStartupState = nil
+        }
+    }
+
+    private func startDaemonUntilReady() async throws {
 
         if process != nil || rpcPort != nil || rpcSecret != nil || stderrPipe != nil {
             resetDaemon(terminateIfRunning: process?.isRunning == true)
@@ -559,16 +934,16 @@ actor Aria2TorrentService {
             throw TorrentEngineError.binaryNotFound
         }
 
-        terminateOrphanedDaemons(matching: binaryURL)
+        let sessionFileURL = try prepareSessionFile()
+        try terminateOrphanedDaemons(
+            matching: binaryURL,
+            sessionFileURL: sessionFileURL
+        )
         logger.info("Launching aria2 from \(binaryURL.path, privacy: .public)")
 
         let port = Int.random(in: 18_000 ... 28_000)
         let secret = UUID().uuidString.replacingOccurrences(of: "-", with: "")
-        let sessionFileURL = try prepareSessionFile()
-
-        let process = Process()
-        process.executableURL = binaryURL
-        process.arguments = [
+        var arguments = [
             "--enable-rpc=true",
             "--rpc-listen-all=false",
             "--rpc-listen-port=\(port)",
@@ -577,6 +952,7 @@ actor Aria2TorrentService {
             "--save-session=\(sessionFileURL.path)",
             "--save-session-interval=5",
             "--force-save=true",
+            "--stop-with-process=\(ProcessInfo.processInfo.processIdentifier)",
             "--bt-detach-seed-only=true",
             // Per-download options override this unlimited daemon default.
             // TODO: Add per-torrent ratio overrides if one global preference becomes too limiting.
@@ -584,8 +960,11 @@ actor Aria2TorrentService {
             "--bt-save-metadata=true",
             "--bt-load-saved-metadata=true",
             "--follow-torrent=true",
+            "--pause=true",
             "--allow-overwrite=false",
-            "--auto-file-renaming=true",
+            "--auto-file-renaming=true"
+        ]
+        arguments.append(contentsOf: [
             "--summary-interval=0",
             "--max-concurrent-downloads=\(transferSettings.maxConcurrentDownloads)",
             "--max-overall-download-limit=\(Self.aria2LimitString(transferSettings.globalSpeedLimitBytesPerSecond))",
@@ -596,7 +975,11 @@ actor Aria2TorrentService {
             "--split=\(transferSettings.perDownloadConnectionCount)",
             "--check-certificate=true",
             "--console-log-level=notice"
-        ]
+        ])
+
+        let process = Process()
+        process.executableURL = binaryURL
+        process.arguments = arguments
         startupLogBuffer.reset()
         let stderrPipe = Pipe()
         process.standardOutput = stderrPipe
@@ -614,6 +997,20 @@ actor Aria2TorrentService {
         self.rpcPort = port
         self.rpcSecret = secret
         self.stderrPipe = stderrPipe
+        do {
+            try await persistDaemonOwnership(
+                process: process,
+                binaryURL: binaryURL,
+                sessionFileURL: sessionFileURL,
+                rpcPort: port
+            )
+        } catch {
+            terminateDaemonProcess(process)
+            resetDaemon(terminateIfRunning: false)
+            throw TorrentEngineError.startupFailed(
+                "Harbor could not durably record ownership of the torrent engine: \(error.localizedDescription)"
+            )
+        }
         logger.info("aria2 process started on RPC port \(port, privacy: .public)")
 
         for _ in 0 ..< 20 {
@@ -624,7 +1021,7 @@ actor Aria2TorrentService {
                     at: sessionFileURL,
                     startupOutput: startupLogBuffer.snapshot()
                 ) {
-                    try await ensureDaemonRunning()
+                    try await startDaemonUntilReady()
                     return
                 }
                 throw TorrentEngineError.startupFailed("aria2c exited before opening RPC.")
@@ -636,6 +1033,8 @@ actor Aria2TorrentService {
                 ], as: VersionPayload.self)
                 try await applyGlobalOptions(transferSettings)
                 isRetryingAfterSessionRecovery = false
+                isDaemonReady = true
+                startupLogBuffer.stopCapturing()
                 logger.info("aria2 RPC is ready")
                 return
             } catch {
@@ -650,7 +1049,7 @@ actor Aria2TorrentService {
             at: sessionFileURL,
             startupOutput: startupLogBuffer.snapshot()
         ) {
-            try await ensureDaemonRunning()
+            try await startDaemonUntilReady()
             return
         }
         throw TorrentEngineError.startupFailed("Timed out waiting for aria2 RPC.")
@@ -790,7 +1189,6 @@ actor Aria2TorrentService {
     ) -> [String: String] {
         var options = [
             "dir": destinationFolderPath,
-            "continue": "true",
             "pause": "false"
         ]
 
@@ -808,7 +1206,35 @@ actor Aria2TorrentService {
             options["auto-file-renaming"] = "false"
         }
 
+        if let selectedFileIndexes = transferOptions?.selectedFileIndexes,
+           let selection = selectFileOption(from: selectedFileIndexes) {
+            options["select-file"] = selection
+        }
+
         return options
+    }
+
+    nonisolated static func selectFileOption(from indexes: [Int]) -> String? {
+        let indexes = Array(Set(indexes.filter { $0 > 0 })).sorted()
+        guard let first = indexes.first else {
+            return nil
+        }
+
+        var ranges: [String] = []
+        var rangeStart = first
+        var previous = first
+
+        for index in indexes.dropFirst() {
+            if index == previous + 1 {
+                previous = index
+                continue
+            }
+            ranges.append(rangeStart == previous ? "\(rangeStart)" : "\(rangeStart)-\(previous)")
+            rangeStart = index
+            previous = index
+        }
+        ranges.append(rangeStart == previous ? "\(rangeStart)" : "\(rangeStart)-\(previous)")
+        return ranges.joined(separator: ",")
     }
 
     private func globalOptions(_ transferSettings: DownloadTransferSettings) -> [String: String] {
@@ -928,6 +1354,85 @@ actor Aria2TorrentService {
         }
     }
 
+    private func submitDownload(
+        method: String,
+        params: [Any],
+        gid: String
+    ) async throws -> String {
+        do {
+            return try await rpcCall(
+                method: method,
+                params: params,
+                as: String.self
+            )
+        } catch {
+            // The request may have committed before its response was lost.
+            // Never replay a non-idempotent add here. Probe the caller-chosen
+            // GID; a later user retry uses the same durable reservation.
+            var lastProbeError: Error?
+            var lastProbeConfirmedMissing = false
+            for delay in [Duration.zero, .milliseconds(150), .milliseconds(500)] {
+                if delay != .zero {
+                    try? await Task.sleep(for: delay)
+                }
+                do {
+                    if try await reservedGIDExists(gid) {
+                        return gid
+                    }
+                    lastProbeConfirmedMissing = true
+                    lastProbeError = nil
+                } catch {
+                    lastProbeConfirmedMissing = false
+                    lastProbeError = error
+                }
+            }
+            if lastProbeConfirmedMissing,
+               Self.mutationFailureWasExplicitlyRejected(error) {
+                throw error
+            }
+            throw TorrentSubmissionUncertainError(
+                gid: gid,
+                underlyingError: lastProbeError ?? error
+            )
+        }
+    }
+
+    private static func makeSubmissionGID() -> String {
+        String(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(16))
+    }
+
+    /// A decoded JSON-RPC error is an authoritative response from aria2 that
+    /// the requested mutation was rejected. Transport failures and malformed
+    /// responses remain ambiguous even if short-lived probes still show the
+    /// old state: the original request can be delayed and commit afterward.
+    nonisolated static func mutationFailureWasExplicitlyRejected(
+        _ error: Error
+    ) -> Bool {
+        guard let torrentError = error as? TorrentEngineError else {
+            return false
+        }
+        if case .rpc = torrentError {
+            return true
+        }
+        return false
+    }
+
+    private func reservedGIDExists(_ gid: String) async throws -> Bool {
+        do {
+            _ = try await rpcCall(
+                method: "aria2.tellStatus",
+                params: [authorizedToken(), gid, ["gid"]],
+                as: StatusPayload.self
+            )
+            return true
+        } catch {
+            if isMissingGIDError(error) {
+                return false
+            }
+            throw error
+        }
+    }
+
     private func rpcCall<Result: Decodable>(
         method: String,
         params: [Any],
@@ -968,35 +1473,49 @@ actor Aria2TorrentService {
                  .cannotFindHost,
                  .networkConnectionLost,
                  .notConnectedToInternet:
-                return true
+                // A single ambiguous transport response is not evidence that
+                // a live daemon is dead. Killing it can discard committed
+                // mutations that have not yet reached the session file.
+                return process?.isRunning != true
             default:
                 return false
             }
         }
 
         if case TorrentEngineError.invalidResponse = error {
-            return true
+            return process?.isRunning != true
         }
 
         return false
     }
 
     private func resetDaemon(terminateIfRunning: Bool) {
+        isDaemonReady = false
         stderrPipe?.fileHandleForReading.readabilityHandler = nil
 
-        if terminateIfRunning,
-           let process,
-           process.isRunning {
-            terminateDaemonProcess(process)
+        let ownedProcess = process
+        let didConfirmOwnedProcessStopped: Bool
+        if let ownedProcess {
+            if terminateIfRunning, ownedProcess.isRunning {
+                didConfirmOwnedProcessStopped = terminateDaemonProcess(ownedProcess)
+            } else {
+                didConfirmOwnedProcessStopped = ownedProcess.isRunning == false
+            }
+        } else {
+            didConfirmOwnedProcessStopped = false
         }
 
         process = nil
         rpcPort = nil
         rpcSecret = nil
         stderrPipe = nil
+        if didConfirmOwnedProcessStopped {
+            discardDaemonOwnershipManifest()
+        }
     }
 
-    private nonisolated func terminateDaemonProcess(_ process: Process) {
+    @discardableResult
+    private nonisolated func terminateDaemonProcess(_ process: Process) -> Bool {
         process.terminate()
 
         let deadline = Date().addingTimeInterval(1)
@@ -1007,30 +1526,245 @@ actor Aria2TorrentService {
         if process.isRunning {
             logger.warning("Force killing aria2 daemon with pid \(process.processIdentifier, privacy: .public)")
             _ = kill(process.processIdentifier, SIGKILL)
+            let forcedDeadline = Date().addingTimeInterval(1)
+            while process.isRunning, Date() < forcedDeadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
         }
+        return process.isRunning == false
     }
 
-    private func terminateOrphanedDaemons(matching binaryURL: URL) {
+    private func terminateOrphanedDaemons(
+        matching binaryURL: URL,
+        sessionFileURL: URL
+    ) throws {
         let currentPID = ProcessInfo.processInfo.processIdentifier
         let binaryPath = binaryURL.path
+        let ownership = try daemonOwnershipManifest()
+        let inspectionBinaryPath = ownership?.binaryPath ?? binaryPath
+        var candidates = try runningDaemons(matching: inspectionBinaryPath).filter {
+            daemonUsesHarborSession($0, sessionFileURL: sessionFileURL)
+                && $0.pid != currentPID
+                && process?.processIdentifier != $0.pid
+        }
+        if inspectionBinaryPath != binaryPath {
+            candidates.append(contentsOf: try runningDaemons(matching: binaryPath).filter {
+                daemonUsesHarborSession($0, sessionFileURL: sessionFileURL)
+                    && $0.pid != currentPID
+                    && process?.processIdentifier != $0.pid
+            })
+        }
+        guard candidates.isEmpty == false else {
+            discardDaemonOwnershipManifest()
+            return
+        }
+        guard let ownership,
+              ownership.version == DaemonOwnershipManifest.currentVersion,
+              ownership.binaryPath == binaryPath,
+              ownership.sessionFilePath == sessionFileURL.path,
+              let daemon = candidates.first(where: {
+                  $0.pid == ownership.pid
+                      && $0.startSignature == ownership.startSignature
+                      && $0.command.contains("--rpc-listen-port=\(ownership.rpcPort)")
+              }),
+              Self.isVerifiedOwnershipParent(
+                  daemon.parentPID,
+                  currentProcessIdentifier: currentPID
+              ),
+              candidates.count == 1 else {
+            throw TorrentEngineError.startupFailed(
+                "Harbor found an aria2 process using its session file but could not verify that Harbor owns it. The process was left running."
+            )
+        }
 
-        for daemon in runningDaemons(matching: binaryPath) {
-            guard daemon.parentPID == 1,
-                  daemon.pid != currentPID,
-                  process?.processIdentifier != daemon.pid else {
-                continue
+        logger.warning("Terminating verified orphaned aria2 daemon with pid \(daemon.pid, privacy: .public)")
+        _ = kill(daemon.pid, SIGTERM)
+        let gracefulDeadline = Date().addingTimeInterval(1)
+        while try daemonStillMatches(daemon, binaryPath: binaryPath),
+              Date() < gracefulDeadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+
+        if try daemonStillMatches(daemon, binaryPath: binaryPath) {
+            logger.warning("Force killing verified orphaned aria2 daemon with pid \(daemon.pid, privacy: .public)")
+            _ = kill(daemon.pid, SIGKILL)
+            let forcedDeadline = Date().addingTimeInterval(1)
+            while try daemonStillMatches(daemon, binaryPath: binaryPath),
+                  Date() < forcedDeadline {
+                Thread.sleep(forTimeInterval: 0.05)
             }
+        }
 
-            logger.warning("Terminating orphaned aria2 daemon with pid \(daemon.pid, privacy: .public)")
-            _ = kill(daemon.pid, SIGTERM)
+        guard try daemonStillMatches(daemon, binaryPath: binaryPath) == false else {
+            throw TorrentEngineError.startupFailed(
+                "Harbor could not stop its earlier aria2 process before opening the saved session."
+            )
+        }
+        discardDaemonOwnershipManifest()
+    }
+
+    nonisolated static func isVerifiedOwnershipParent(
+        _ parentProcessIdentifier: pid_t,
+        currentProcessIdentifier: pid_t
+    ) -> Bool {
+        parentProcessIdentifier == currentProcessIdentifier
+            || parentProcessIdentifier == 1
+    }
+
+    private func terminatePersistedOwnedDaemonIfNeeded() throws {
+        guard let ownership = try daemonOwnershipManifest() else {
+            return
+        }
+        try terminateOrphanedDaemons(
+            matching: URL(fileURLWithPath: ownership.binaryPath),
+            sessionFileURL: URL(fileURLWithPath: ownership.sessionFilePath)
+        )
+    }
+
+    private func daemonStillMatches(
+        _ expected: RunningDaemon,
+        binaryPath: String
+    ) throws -> Bool {
+        try runningDaemons(matching: binaryPath).contains { current in
+            current.pid == expected.pid
+                && current.startSignature == expected.startSignature
+                && current.command == expected.command
         }
     }
 
-    private func runningDaemons(matching binaryPath: String) -> [RunningDaemon] {
+    private func persistDaemonOwnership(
+        process: Process,
+        binaryURL: URL,
+        sessionFileURL: URL,
+        rpcPort: Int
+    ) async throws {
+        var verifiedDaemon: RunningDaemon?
+
+        // Process.run() can return before the new executable is visible in a
+        // separate ps snapshot. Keep every identity check exact while giving
+        // macOS a short, bounded window to publish the launched process.
+        for attempt in 0 ..< 20 {
+            verifiedDaemon = try runningDaemon(
+                processIdentifier: process.processIdentifier,
+                matching: binaryURL.path
+            ).flatMap { daemon in
+                daemonUsesHarborSession(daemon, sessionFileURL: sessionFileURL)
+                    && daemon.command.contains("--rpc-listen-port=\(rpcPort)")
+                    ? daemon
+                    : nil
+            }
+            if verifiedDaemon != nil || process.isRunning == false {
+                break
+            }
+            if attempt < 19 {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+        }
+
+        // TODO: Share a direct Darwin process-identity reader with the media
+        // backend if ps publication timing causes more ownership races.
+        guard let daemon = verifiedDaemon else {
+            throw TorrentEngineError.startupFailed(
+                "Harbor could not verify the newly launched aria2 process."
+            )
+        }
+        let manifest = DaemonOwnershipManifest(
+            pid: daemon.pid,
+            binaryPath: binaryURL.path,
+            sessionFilePath: sessionFileURL.path,
+            rpcPort: rpcPort,
+            startSignature: daemon.startSignature
+        )
+        let url = daemonOwnershipManifestURL()
+        try JSONEncoder().encode(manifest).write(to: url, options: .atomic)
+        try DurableFileSystem.synchronizeFile(at: url)
+        try DurableFileSystem.synchronizeParentDirectory(of: url)
+    }
+
+    private func daemonOwnershipManifest() throws -> DaemonOwnershipManifest? {
+        let url = daemonOwnershipManifestURL()
+        do {
+            let values = try url.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            )
+            guard values.isRegularFile == true,
+                  values.isSymbolicLink != true else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return nil
+        } catch let error as POSIXError where error.code == .ENOENT {
+            return nil
+        }
+        let manifest = try JSONDecoder().decode(
+            DaemonOwnershipManifest.self,
+            from: Data(contentsOf: url)
+        )
+        guard manifest.version == DaemonOwnershipManifest.currentVersion else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return manifest
+    }
+
+    private nonisolated func discardDaemonOwnershipManifest() {
+        let url = daemonOwnershipManifestURL()
+        do {
+            try FileManager.default.removeItem(at: url)
+            try DurableFileSystem.synchronizeParentDirectory(of: url)
+        } catch let error as CocoaError where error.code == .fileNoSuchFile {
+            return
+        } catch let error as POSIXError where error.code == .ENOENT {
+            return
+        } catch {
+            logger.warning("Could not remove the aria2 ownership marker: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private nonisolated func daemonOwnershipManifestURL() -> URL {
+        HarborApplicationSupport.directoryURL()
+            .appendingPathComponent("aria2.daemon-owner.json", isDirectory: false)
+    }
+
+    private func daemonUsesHarborSession(
+        _ daemon: RunningDaemon,
+        sessionFileURL: URL
+    ) -> Bool {
+        daemon.command.contains("--input-file=\(sessionFileURL.path)")
+            && daemon.command.contains("--save-session=\(sessionFileURL.path)")
+            && daemon.command.contains("--enable-rpc=true")
+    }
+
+    private func runningDaemons(matching binaryPath: String) throws -> [RunningDaemon] {
+        try processListOutput(arguments: [
+            "-axo", "pid=,ppid=,lstart=,command=", "-ww"
+        ])
+        .split(separator: "\n")
+        .compactMap { line in
+            daemon(from: String(line), binaryPath: binaryPath)
+        }
+    }
+
+    private func runningDaemon(
+        processIdentifier: pid_t,
+        matching binaryPath: String
+    ) throws -> RunningDaemon? {
+        let output = try processListOutput(arguments: [
+            "-p", "\(processIdentifier)",
+            "-o", "pid=,ppid=,lstart=,command=",
+            "-ww"
+        ])
+        return output.split(separator: "\n")
+        .compactMap { line in
+            daemon(from: String(line), binaryPath: binaryPath)
+        }
+        .first
+    }
+
+    private func processListOutput(arguments: [String]) throws -> String {
         let process = Process()
         let outputPipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-axo", "pid=,ppid=,command="]
+        process.arguments = arguments
         process.standardOutput = outputPipe
         process.standardError = Pipe()
 
@@ -1038,54 +1772,59 @@ actor Aria2TorrentService {
             try process.run()
         } catch {
             logger.warning("Could not inspect aria2 processes: \(error.localizedDescription, privacy: .public)")
-            return []
+            throw TorrentEngineError.startupFailed(
+                "Harbor could not inspect earlier aria2 processes: \(error.localizedDescription)"
+            )
         }
 
         let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
 
         guard process.terminationStatus == 0 else {
-            return []
+            throw TorrentEngineError.startupFailed(
+                "Harbor could not inspect earlier aria2 processes."
+            )
         }
 
         guard let output = String(data: data, encoding: .utf8) else {
-            return []
+            throw TorrentEngineError.startupFailed(
+                "Harbor could not decode the process list while checking aria2."
+            )
         }
 
         return output
-            .split(separator: "\n")
-            .compactMap { line in
-                daemon(from: String(line), binaryPath: binaryPath)
-            }
     }
 
     private func daemon(from processLine: String, binaryPath: String) -> RunningDaemon? {
         let parts = processLine
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+            .split(separator: " ", maxSplits: 7, omittingEmptySubsequences: true)
 
-        guard parts.count == 3,
+        guard parts.count == 8,
               let pid = pid_t(parts[0]),
               let parentPID = pid_t(parts[1]) else {
             return nil
         }
 
-        let command = String(parts[2])
+        let startSignature = parts[2 ... 6].joined(separator: " ")
+        let command = String(parts[7])
+            .trimmingCharacters(in: .whitespaces)
         guard command.contains("--enable-rpc=true"),
               isHarborManagedDaemon(command: command, binaryPath: binaryPath) else {
             return nil
         }
 
         // TODO: Replace process-list cleanup with a persisted daemon lock if Harbor later supports multiple concurrent app instances.
-        return RunningDaemon(pid: pid, parentPID: parentPID, command: command)
+        return RunningDaemon(
+            pid: pid,
+            parentPID: parentPID,
+            startSignature: startSignature,
+            command: command
+        )
     }
 
     private func isHarborManagedDaemon(command: String, binaryPath: String) -> Bool {
-        command.hasPrefix(binaryPath)
-            || (
-                command.contains("/Harbor.app/Contents/Resources/TorrentRuntime/")
-                    && command.contains("/bin/aria2c")
-            )
+        command == binaryPath || command.hasPrefix(binaryPath + " ")
     }
 
     private nonisolated func installReadabilityHandler(for pipe: Pipe) {

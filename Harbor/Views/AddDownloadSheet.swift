@@ -2,6 +2,18 @@ import AppKit
 import SwiftUI
 
 struct AddDownloadSheet: View {
+    private struct TorrentPreviewSource: Identifiable {
+        let sourceKind: DownloadSourceKind
+        let sourceURL: URL
+
+        var id: String { "\(sourceKind.rawValue):\(sourceURL.absoluteString)" }
+    }
+
+    private enum PendingSensitiveTorrentAction {
+        case preview(TorrentPreviewSource)
+        case submit([AddDownloadRequest])
+    }
+
     private enum Layout {
         static let groupedFormHorizontalExpansion: CGFloat = 20
     }
@@ -12,6 +24,7 @@ struct AddDownloadSheet: View {
 
     let settings: AppSettingsStore
     let mediaPreviewProvider: @MainActor (URL) async throws -> MediaDownloadMetadata?
+    let torrentPreviewProvider: @MainActor (DownloadSourceKind, URL, [RequestHeader]) async throws -> TorrentContentsPreview
     let onSubmit: @MainActor ([AddDownloadRequest]) -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -35,17 +48,22 @@ struct AddDownloadSheet: View {
     @State private var isSubmitting = false
     @State private var mediaPreviewTask: Task<Void, Never>?
     @State private var mediaPreviewGeneration = 0
+    @State private var torrentPreviewSource: TorrentPreviewSource?
     @State private var approvedSensitiveTorrentHeaders: [RequestHeader]?
-    @State private var pendingSensitiveHeaderRequests: [AddDownloadRequest]?
+    @State private var pendingSensitiveTorrentAction: PendingSensitiveTorrentAction?
 
     init(
         settings: AppSettingsStore,
         draft: AddDownloadSheetDraft,
         mediaPreviewProvider: @escaping @MainActor (URL) async throws -> MediaDownloadMetadata? = { _ in nil },
+        torrentPreviewProvider: @escaping @MainActor (DownloadSourceKind, URL, [RequestHeader]) async throws -> TorrentContentsPreview = { _, _, _ in
+            throw TorrentEngineError.invalidSource
+        },
         onSubmit: @escaping @MainActor ([AddDownloadRequest]) -> Void
     ) {
         self.settings = settings
         self.mediaPreviewProvider = mediaPreviewProvider
+        self.torrentPreviewProvider = torrentPreviewProvider
         self.onSubmit = onSubmit
         _entryMode = State(initialValue: draft.entryMode)
         _sourceURLText = State(initialValue: draft.sourceURLText)
@@ -60,6 +78,7 @@ struct AddDownloadSheet: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Add Download")
                     .font(.title2.weight(.semibold))
+                    .accessibilityIdentifier(HarborAccessibility.addSheet)
                 Text("Paste one or more links, a media post URL, a magnet link, or choose a `.torrent` file. Add several at once by putting one link per line.")
                     .foregroundStyle(.secondary)
             }
@@ -71,6 +90,7 @@ struct AddDownloadSheet: View {
                     }
                 }
                 .pickerStyle(.segmented)
+                .accessibilityIdentifier(HarborAccessibility.addSourceMode)
 
                 if entryMode == .linkOrMagnet {
                     TextField(
@@ -81,6 +101,7 @@ struct AddDownloadSheet: View {
                     )
                     .labelsHidden()
                     .lineLimit(1...8)
+                    .accessibilityIdentifier(HarborAccessibility.addSource)
                     .focused($focusedField, equals: Field.sourceURL)
                     .onChange(of: sourceURLText) {
                         scheduleMediaPreviewRefresh()
@@ -105,6 +126,7 @@ struct AddDownloadSheet: View {
                                     startingAt: URL(fileURLWithPath: destinationPath, isDirectory: true)
                                 )
                             }
+                            .accessibilityIdentifier(HarborAccessibility.addChooseTorrent)
                         }
                     }
                 }
@@ -112,6 +134,7 @@ struct AddDownloadSheet: View {
                 destinationPicker
 
                 Toggle("Start immediately", isOn: $shouldStartImmediately)
+                    .accessibilityIdentifier(HarborAccessibility.addStartImmediately)
 
                 advancedSettingsSection
             }
@@ -129,6 +152,7 @@ struct AddDownloadSheet: View {
                         sourceURLText = NSPasteboard.general.string(forType: .string) ?? sourceURLText
                         scheduleMediaPreviewRefresh()
                     }
+                    .accessibilityIdentifier(HarborAccessibility.addPaste)
                 }
 
                 Spacer()
@@ -136,13 +160,22 @@ struct AddDownloadSheet: View {
                 Button("Cancel") {
                     dismiss()
                 }
+                .accessibilityIdentifier(HarborAccessibility.addCancel)
                 .keyboardShortcut(.cancelAction)
+
+                if let torrentPreviewCandidate {
+                    Button("Preview") {
+                        presentTorrentPreview(torrentPreviewCandidate)
+                    }
+                    .accessibilityIdentifier(HarborAccessibility.addPreview)
+                }
 
                 Button(addButtonTitle) {
                     Task {
                         await submit()
                     }
                 }
+                .accessibilityIdentifier(HarborAccessibility.addSubmit)
                 .keyboardShortcut(.defaultAction)
                 .disabled(canSubmit == false || isSubmitting)
             }
@@ -171,6 +204,24 @@ struct AddDownloadSheet: View {
             }
             updateDestinationForDetectedSourceIfNeeded()
         }
+        .sheet(item: $torrentPreviewSource) { source in
+            TorrentContentsSelectionSheet(
+                loadPreview: {
+                    try await torrentPreviewProvider(
+                        source.sourceKind,
+                        source.sourceURL,
+                        requestHeaders
+                    )
+                },
+                onAdd: { preview, selection in
+                    submitTorrentPreview(
+                        source: source,
+                        preview: preview,
+                        selection: selection
+                    )
+                }
+            )
+        }
         .sheet(isPresented: $isRequestHeadersEditorPresented) {
             RequestHeadersEditor(
                 requestHeaders: requestHeaders,
@@ -187,26 +238,75 @@ struct AddDownloadSheet: View {
         .alert(
             "Sensitive headers may be shared",
             isPresented: Binding(
-                get: { pendingSensitiveHeaderRequests != nil },
+                get: { pendingSensitiveTorrentAction != nil },
                 set: { isPresented in
                     if isPresented == false {
-                        pendingSensitiveHeaderRequests = nil
+                        pendingSensitiveTorrentAction = nil
                     }
                 }
             )
         ) {
             Button("Cancel", role: .cancel) {
-                pendingSensitiveHeaderRequests = nil
+                pendingSensitiveTorrentAction = nil
             }
 
-            Button("Continue Download") {
-                continuePendingSensitiveHeaderDownload()
+            Button("Continue") {
+                continuePendingSensitiveTorrentAction()
             }
         } message: {
             Text(
                 "The supplied headers contain Cookie or Authorization information. aria2 may send these headers to every HTTP/HTTPS tracker and web seed used by this torrent. Proceed?"
             )
         }
+    }
+
+    private var torrentPreviewCandidate: TorrentPreviewSource? {
+        switch entryMode {
+        case .torrentFile:
+            guard let torrentFileURL,
+                  DownloadSourceKind.detect(from: torrentFileURL) == .torrentFile else {
+                return nil
+            }
+            return TorrentPreviewSource(sourceKind: .torrentFile, sourceURL: torrentFileURL)
+        case .linkOrMagnet:
+            guard isBatchEntry == false,
+                  let parsedLinkURL,
+                  let sourceKind = DownloadSourceKind.detect(from: parsedLinkURL),
+                  sourceKind == .torrentFile || sourceKind == .magnetLink else {
+                return nil
+            }
+            return TorrentPreviewSource(sourceKind: sourceKind, sourceURL: parsedLinkURL)
+        }
+    }
+
+    private func presentTorrentPreview(_ source: TorrentPreviewSource) {
+        if requestHeaders.triggersSensitiveTorrentWarning,
+           approvedSensitiveTorrentHeaders != requestHeaders {
+            pendingSensitiveTorrentAction = .preview(source)
+            return
+        }
+
+        torrentPreviewSource = source
+    }
+
+    @MainActor
+    private func submitTorrentPreview(
+        source: TorrentPreviewSource,
+        preview: TorrentContentsPreview,
+        selection: TorrentFileSelection?
+    ) {
+        let request = AddDownloadRequest(
+            sourceKind: source.sourceKind,
+            sourceURL: source.sourceURL,
+            customFilename: nil,
+            destinationFolder: URL(fileURLWithPath: destinationPath, isDirectory: true),
+            shouldStartImmediately: shouldStartImmediately,
+            requestHeaders: requestHeaders,
+            torrentFileSelection: selection,
+            preparedTorrentMetainfo: preview.metainfoData,
+            torrentMetadataName: preview.name
+        )
+        submitRequests([request])
     }
 
     @ViewBuilder
@@ -236,6 +336,11 @@ struct AddDownloadSheet: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier(HarborAccessibility.addMediaMetadata)
+                    .accessibilityValue(
+                        "extractor=\(mediaPreview.extractorKey ?? "");type=\(mediaPreview.mediaType.rawValue)"
+                    )
                 }
             }
 
@@ -253,8 +358,8 @@ struct AddDownloadSheet: View {
 
                             ForEach(mediaPreview.capabilities.formatOptions) { format in
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(mediaFormatTitle(format))
-                                    Text(mediaFormatDetails(format))
+                                    Text(format.formatTitle)
+                                    Text(format.formatDetails)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -286,7 +391,7 @@ struct AddDownloadSheet: View {
                                         .tag(String?.none)
 
                                     ForEach(mediaPreview.capabilities.audioFormatOptions) { audioFormat in
-                                        Text(mediaAudioFormatTitle(audioFormat))
+                                        Text(audioFormat.audioFormatTitle)
                                             .tag(Optional(audioFormat.id))
                                     }
                                 }
@@ -302,7 +407,7 @@ struct AddDownloadSheet: View {
                         }
                     }
 
-                    if let mergeOutputFormat = selectedFormatSelection?.mergeOutputFormat {
+                    if let mergeOutputFormat = mediaFormatPreference.selection?.mergeOutputFormat {
                         LabeledContent("Output") {
                             Text(mergeOutputFormat.uppercased())
                                 .foregroundStyle(.secondary)
@@ -312,6 +417,7 @@ struct AddDownloadSheet: View {
             }
 
             Toggle("I own this content or have permission to save it", isOn: $hasMediaSavePermission)
+                .accessibilityIdentifier(HarborAccessibility.addMediaPermission)
         } else if let mediaPreviewError {
             LabeledContent("Media") {
                 VStack(alignment: .trailing, spacing: 8) {
@@ -323,6 +429,7 @@ struct AddDownloadSheet: View {
                         Button("Try as Media") {
                             tryAsMedia()
                         }
+                        .accessibilityIdentifier(HarborAccessibility.addTryAsMedia)
                     }
                 }
             }
@@ -336,46 +443,28 @@ struct AddDownloadSheet: View {
                 Button("Try as Media") {
                     tryAsMedia()
                 }
+                .accessibilityIdentifier(HarborAccessibility.addTryAsMedia)
             }
         }
     }
 
-    private var selectedFormatSelection: MediaDownloadFormatSelection? {
-        guard case let .specific(selection) = mediaFormatPreference else {
-            return nil
-        }
-
-        return selection
-    }
-
     private var selectedFormat: MediaDownloadFormatOption? {
-        guard let mediaPreview,
-              let formatID = selectedFormatSelection?.formatID else {
-            return nil
-        }
-
-        return mediaPreview.capabilities.formatOption(id: formatID)
+        mediaPreview?.capabilities.selectedFormat(in: mediaFormatPreference)
     }
 
     private var primaryFormatSelection: Binding<String?> {
         Binding(
             get: {
-                selectedFormatSelection?.formatID
+                mediaFormatPreference.selection?.formatID
             },
             set: { formatID in
-                guard let formatID else {
-                    mediaFormatPreference = .bestAvailable
-                    return
-                }
-
                 guard let mediaPreview,
-                      let format = mediaPreview.capabilities.formatOption(id: formatID) else {
+                      let preference = mediaPreview.capabilities.preference(
+                          selectingPrimaryFormatID: formatID
+                      ) else {
                     return
                 }
-
-                mediaFormatPreference = .specific(
-                    mediaPreview.capabilities.defaultSelection(for: format)
-                )
+                mediaFormatPreference = preference
             }
         )
     }
@@ -383,19 +472,17 @@ struct AddDownloadSheet: View {
     private var audioFormatSelection: Binding<String?> {
         Binding(
             get: {
-                selectedFormatSelection?.audioFormatID
+                mediaFormatPreference.selection?.audioFormatID
             },
             set: { audioFormatID in
                 guard let mediaPreview,
-                      let selectedFormat,
-                      let selection = mediaPreview.capabilities.selection(
-                          for: selectedFormat,
-                          audioFormatID: audioFormatID
+                      let preference = mediaPreview.capabilities.preference(
+                          mediaFormatPreference,
+                          selectingAudioFormatID: audioFormatID
                       ) else {
                     return
                 }
-
-                mediaFormatPreference = .specific(selection)
+                mediaFormatPreference = preference
             }
         )
     }
@@ -824,7 +911,7 @@ struct AddDownloadSheet: View {
             $0.sourceKind.usesAria2 && $0.requestHeaders.triggersSensitiveTorrentWarning
         }),
            approvedSensitiveTorrentHeaders != requestHeaders {
-            pendingSensitiveHeaderRequests = requests
+            pendingSensitiveTorrentAction = .submit(requests)
             return
         }
 
@@ -837,16 +924,25 @@ struct AddDownloadSheet: View {
         dismiss()
     }
 
-    private func continuePendingSensitiveHeaderDownload() {
-        guard let requests = pendingSensitiveHeaderRequests,
-              isSubmitting == false else {
+    private func continuePendingSensitiveTorrentAction() {
+        guard let action = pendingSensitiveTorrentAction else {
             return
         }
 
-        pendingSensitiveHeaderRequests = nil
-        isSubmitting = true
-        defer { isSubmitting = false }
-        performSubmission(requests)
+        pendingSensitiveTorrentAction = nil
+        approvedSensitiveTorrentHeaders = requestHeaders
+
+        switch action {
+        case let .preview(source):
+            torrentPreviewSource = source
+        case let .submit(requests):
+            guard isSubmitting == false else {
+                return
+            }
+            isSubmitting = true
+            defer { isSubmitting = false }
+            performSubmission(requests)
+        }
     }
 
     @ViewBuilder
@@ -862,7 +958,7 @@ struct AddDownloadSheet: View {
                     ProgressView()
                         .controlSize(.small)
                 case .failure:
-                    Image(systemName: metadata.mediaType == .image ? "photo" : "play.rectangle")
+                    Image(systemName: mediaIconName(for: metadata))
                         .font(.title3)
                         .foregroundStyle(.secondary)
                 @unknown default:
@@ -879,7 +975,7 @@ struct AddDownloadSheet: View {
             ZStack {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(.quaternary)
-                Image(systemName: metadata.mediaType == .image ? "photo" : "play.rectangle")
+                Image(systemName: mediaIconName(for: metadata))
                     .font(.title3)
                     .foregroundStyle(.secondary)
             }
@@ -903,186 +999,6 @@ struct AddDownloadSheet: View {
             .joined(separator: " • ")
     }
 
-    private func mediaFormatTitle(_ format: MediaDownloadFormatOption) -> String {
-        let mediaKind: String
-        if let height = format.height {
-            mediaKind = "\(height)p"
-        } else if let width = format.width {
-            mediaKind = "\(width) px"
-        } else if format.videoCodec != nil {
-            mediaKind = String(
-                localized: "media.format.video",
-                defaultValue: "Video",
-                comment: "Fallback label for a video format whose dimensions are unknown."
-            )
-        } else if format.audioCodec != nil {
-            mediaKind = String(
-                localized: "media.format.audio",
-                defaultValue: "Audio",
-                comment: "Label for an audio-only media format."
-            )
-        } else {
-            mediaKind = String(
-                localized: "media.format.media",
-                defaultValue: "Media",
-                comment: "Fallback label for a media format whose type is unknown."
-            )
-        }
-
-        return "\(mediaKind) \(format.container.uppercased())"
-    }
-
-    private func mediaFormatDetails(_ format: MediaDownloadFormatOption) -> String {
-        var details: [String] = []
-
-        if format.hasAudio,
-           let language = format.language?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           language.isEmpty == false {
-            details.append(language.uppercased())
-        }
-
-        if format.hasAudio,
-           let formatNote = format.formatNote?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           formatNote.isEmpty == false {
-            details.append(formatNote)
-        }
-
-        if let videoCodec = format.videoCodec {
-            details.append(mediaCodecTitle(videoCodec))
-        }
-
-        if let audioCodec = format.audioCodec {
-            details.append(mediaCodecTitle(audioCodec))
-        } else if format.videoCodec != nil {
-            details.append(
-                String(
-                    localized: "media.format.separateAudio",
-                    defaultValue: "Separate audio",
-                    comment: "Media format detail shown when a video stream requires a separate audio selection."
-                )
-            )
-        }
-
-        if let audioChannels = format.audioChannels, audioChannels > 0 {
-            switch audioChannels {
-            case 1:
-                details.append("Mono")
-            case 2:
-                details.append("Stereo")
-            default:
-                details.append("\(audioChannels) channels")
-            }
-        }
-
-        if let framesPerSecond = format.framesPerSecond, framesPerSecond > 0 {
-            details.append("\(framesPerSecond.formatted(.number.precision(.fractionLength(0...2)))) fps")
-        }
-
-        if let dynamicRange = format.dynamicRange,
-           dynamicRange.caseInsensitiveCompare("SDR") != .orderedSame {
-            details.append(dynamicRange)
-        }
-
-        if let bitrateKbps = format.bitrateKbps,
-           bitrateKbps.isFinite,
-           bitrateKbps > 0 {
-            details.append(
-                "\(bitrateKbps.formatted(.number.precision(.fractionLength(0)))) kbps"
-            )
-        }
-
-        if format.estimatedBytes > 0 {
-            details.append(DownloadFormatting.byteString(format.estimatedBytes))
-        }
-
-        return details.joined(separator: " • ")
-    }
-
-    private func mediaAudioFormatTitle(_ format: MediaDownloadFormatOption) -> String {
-        var components: [String] = []
-
-        if let language = format.language?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           language.isEmpty == false {
-            components.append(language.uppercased())
-        }
-
-        if let formatNote = format.formatNote?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           formatNote.isEmpty == false {
-            components.append(formatNote)
-        }
-
-        components.append(format.container.uppercased())
-
-        if let audioCodec = format.audioCodec {
-            components.append(mediaCodecTitle(audioCodec))
-        }
-
-        if let bitrateKbps = format.bitrateKbps,
-           bitrateKbps.isFinite,
-           bitrateKbps > 0 {
-            components.append(
-                "\(bitrateKbps.formatted(.number.precision(.fractionLength(0)))) kbps"
-            )
-        }
-
-        if let audioChannels = format.audioChannels, audioChannels > 0 {
-            switch audioChannels {
-            case 1:
-                components.append("Mono")
-            case 2:
-                components.append("Stereo")
-            default:
-                components.append("\(audioChannels) channels")
-            }
-        }
-
-        return components.joined(separator: " • ")
-    }
-
-    private func mediaCodecTitle(_ codec: String) -> String {
-        let normalizedCodec = codec.lowercased()
-
-        if normalizedCodec.hasPrefix("avc1") || normalizedCodec.hasPrefix("h264") {
-            return "H.264"
-        }
-
-        if normalizedCodec.hasPrefix("hev1")
-            || normalizedCodec.hasPrefix("hvc1")
-            || normalizedCodec.hasPrefix("hevc") {
-            return "HEVC"
-        }
-
-        if normalizedCodec.hasPrefix("av01") || normalizedCodec == "av1" {
-            return "AV1"
-        }
-
-        if normalizedCodec.hasPrefix("vp9") {
-            return "VP9"
-        }
-
-        if normalizedCodec.hasPrefix("vp8") {
-            return "VP8"
-        }
-
-        if normalizedCodec.hasPrefix("mp4a") || normalizedCodec == "aac" {
-            return "AAC"
-        }
-
-        if normalizedCodec.hasPrefix("opus") {
-            return "Opus"
-        }
-
-        if normalizedCodec.hasPrefix("vorbis") {
-            return "Vorbis"
-        }
-
-        return codec.uppercased()
-    }
-
     private func mediaTypeTitle(for metadata: MediaDownloadMetadata) -> String {
         if metadata.isCollection {
             let template = String(
@@ -1099,6 +1015,12 @@ struct AddDownloadSheet: View {
                 localized: "media.preview.video",
                 defaultValue: "Video",
                 comment: "Media preview type for video content."
+            )
+        case .audio:
+            return String(
+                localized: "media.preview.audio",
+                defaultValue: "Audio",
+                comment: "Media preview type for audio content."
             )
         case .image:
             return String(
@@ -1118,6 +1040,17 @@ struct AddDownloadSheet: View {
                 defaultValue: "Media",
                 comment: "Media preview type fallback."
             )
+        }
+    }
+
+    private func mediaIconName(for metadata: MediaDownloadMetadata) -> String {
+        switch metadata.mediaType {
+        case .image:
+            return "photo"
+        case .audio:
+            return "waveform"
+        case .video, .collection, .unknown:
+            return "play.rectangle"
         }
     }
 

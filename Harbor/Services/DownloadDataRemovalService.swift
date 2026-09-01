@@ -22,6 +22,12 @@ struct DownloadDataRemovalResult: Equatable, Sendable {
     }
 }
 
+struct DownloadPayloadInspection: Equatable, Sendable {
+    let existingPaths: [String]
+    let missingPaths: [String]
+    let failures: [DownloadDataRemovalFailure]
+}
+
 struct DownloadDataRemovalService {
     nonisolated(unsafe) private let fileManager: FileManager
 
@@ -107,8 +113,18 @@ struct DownloadDataRemovalService {
         }
 
         for url in resolution.safeURLs {
-            guard fileManager.fileExists(atPath: url.path) else {
-                missingPaths.append(url.path)
+            do {
+                guard try DurableFileSystem.pathEntryExists(at: url) else {
+                    missingPaths.append(url.path)
+                    continue
+                }
+            } catch {
+                failures.append(
+                    DownloadDataRemovalFailure(
+                        path: url.path,
+                        message: error.localizedDescription
+                    )
+                )
                 continue
             }
 
@@ -132,7 +148,54 @@ struct DownloadDataRemovalService {
         )
     }
 
+    /// Inspects a previously-started deletion without mutating the filesystem.
+    /// Any pathname that exists is treated as ambiguous: after a crash Harbor
+    /// cannot prove it is still the payload named by the old journal.
+    nonisolated func inspectPayloadData(
+        destinationFolderPath: String,
+        payloadPaths: [String]
+    ) -> DownloadPayloadInspection {
+        let resolution = resolvePayloadURLs(
+            destinationFolderPath: destinationFolderPath,
+            payloadPaths: payloadPaths
+        )
+        var existingPaths: [String] = []
+        var missingPaths: [String] = []
+        var failures = resolution.rejectedPaths.map {
+            DownloadDataRemovalFailure(
+                path: $0,
+                message: String(
+                    localized: "download.removeData.unsafePath",
+                    defaultValue: "The path is not safely contained within the download destination.",
+                    comment: "Error shown when Harbor refuses to inspect a path outside the download destination."
+                )
+            )
+        }
+        for url in resolution.safeURLs {
+            do {
+                if try DurableFileSystem.pathEntryExists(at: url) {
+                    existingPaths.append(url.path)
+                } else {
+                    missingPaths.append(url.path)
+                }
+            } catch {
+                failures.append(
+                    DownloadDataRemovalFailure(
+                        path: url.path,
+                        message: error.localizedDescription
+                    )
+                )
+            }
+        }
+        return DownloadPayloadInspection(
+            existingPaths: existingPaths,
+            missingPaths: missingPaths,
+            failures: failures
+        )
+    }
+
     private nonisolated func canonicalFileURL(_ url: URL) -> URL {
         url.standardizedFileURL.resolvingSymlinksInPath()
     }
+
 }

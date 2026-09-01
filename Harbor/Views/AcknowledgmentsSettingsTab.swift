@@ -63,6 +63,11 @@ private struct OpenSourceAcknowledgment: Identifiable {
             purpose: "Media extraction and downloads."
         ),
         OpenSourceAcknowledgment(
+            name: "Deno",
+            license: "MIT License",
+            purpose: "JavaScript execution for media extraction."
+        ),
+        OpenSourceAcknowledgment(
             name: "FFmpeg",
             license: "GNU GPL (bundled build)",
             purpose: "Media probing, conversion, and merging."

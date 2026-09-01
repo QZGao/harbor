@@ -13,12 +13,14 @@ struct BrowserDownloadSheet: View {
 
             BrowserSessionWebView(webView: session.webView)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityIdentifier(HarborAccessibility.browserWebView)
 
             Divider()
 
             footer
         }
         .frame(minWidth: 760, idealWidth: 960, minHeight: 560, idealHeight: 680)
+        .accessibilityIdentifier(HarborAccessibility.browserSheet)
     }
 
     private var header: some View {
@@ -67,6 +69,7 @@ struct BrowserDownloadSheet: View {
             Button("Cancel") {
                 center.dismissBrowserSession()
             }
+            .accessibilityIdentifier(HarborAccessibility.browserCancel)
             .keyboardShortcut(.cancelAction)
         }
         .padding(.horizontal, 20)

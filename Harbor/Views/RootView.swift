@@ -51,6 +51,7 @@ struct RootView: View {
                 }
         }
         .navigationSplitViewStyle(.balanced)
+        .accessibilityIdentifier(HarborAccessibility.root)
         .searchable(text: $center.searchText, placement: .toolbar, prompt: "Search downloads")
         .searchFocused($isSearchFocused)
         .focusedSceneValue(\.focusDownloadSearch, focusSearch)
@@ -62,6 +63,13 @@ struct RootView: View {
                 draft: draft,
                 mediaPreviewProvider: { url in
                     try await center.previewMediaDownload(for: url)
+                },
+                torrentPreviewProvider: { sourceKind, url, requestHeaders in
+                    try await center.previewTorrentContents(
+                        sourceKind: sourceKind,
+                        sourceURL: url,
+                        requestHeaders: requestHeaders
+                    )
                 }
             ) { requests in
                 center.queueDownloads(requests)
@@ -92,8 +100,17 @@ struct RootView: View {
                 }
             )
         ) {
-            Button("OK", role: .cancel) {
-                center.activeAlert = nil
+            if center.canRetryInitialization {
+                Button("Retry") {
+                    center.activeAlert = nil
+                    Task {
+                        await center.initializeIfNeeded()
+                    }
+                }
+            } else {
+                Button("OK", role: .cancel) {
+                    center.activeAlert = nil
+                }
             }
         } message: {
             Text(center.activeAlert?.message ?? "")
@@ -198,6 +215,8 @@ private struct DownloadToolbarContent: ToolbarContent {
             Button("New Download", systemImage: "plus") {
                 center.presentAddSheet()
             }
+            .accessibilityIdentifier(HarborAccessibility.newDownload)
+            .disabled(center.canAddDownloads == false)
         }
 
         ToolbarItem(placement: .primaryAction) {
@@ -211,6 +230,7 @@ private struct DownloadToolbarContent: ToolbarContent {
                     center.resumeAll()
                 }
             }
+            .accessibilityIdentifier(HarborAccessibility.pauseResumeAll)
             .disabled(
                 center.hasActiveDownloads
                     ? center.hasPausableDownloads == false

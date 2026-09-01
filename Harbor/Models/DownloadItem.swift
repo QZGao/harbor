@@ -11,6 +11,7 @@ enum DownloadStatus: String, Codable, CaseIterable, Sendable {
     case completed
     case failed
     case cancelled
+    case waitingToRetry
 
     var title: LocalizedStringResource {
         switch self {
@@ -18,6 +19,8 @@ enum DownloadStatus: String, Codable, CaseIterable, Sendable {
             LocalizedStringResource("status.queued", defaultValue: "Queued")
         case .preparing:
             LocalizedStringResource("status.preparing", defaultValue: "Preparing")
+        case .waitingToRetry:
+            LocalizedStringResource("status.waitingToRetry", defaultValue: "Waiting to Retry")
         case .downloading:
             LocalizedStringResource("status.downloading", defaultValue: "Downloading")
         case .seeding:
@@ -41,6 +44,8 @@ enum DownloadStatus: String, Codable, CaseIterable, Sendable {
             "clock.arrow.circlepath"
         case .preparing:
             "ellipsis.circle"
+        case .waitingToRetry:
+            "clock.arrow.circlepath"
         case .downloading:
             "arrow.down.circle.fill"
         case .seeding:
@@ -62,12 +67,16 @@ enum DownloadStatus: String, Codable, CaseIterable, Sendable {
         switch self {
         case .completed, .failed, .cancelled:
             true
-        case .queued, .preparing, .downloading, .seeding, .browserSessionRequired, .paused:
+        case .queued, .preparing, .waitingToRetry, .downloading, .seeding, .browserSessionRequired, .paused:
             false
         }
     }
 
     var isRunning: Bool {
+        self == .preparing || self == .waitingToRetry || self == .downloading
+    }
+
+    var consumesDownloadSlot: Bool {
         self == .preparing || self == .downloading
     }
 }
@@ -120,17 +129,25 @@ struct DownloadRecord: Codable, Sendable {
     let finishedAt: Date?
     let updatedAt: Date
     let lastError: String?
+    /// Opaque resume data produced by URLSession for direct downloads created
+    /// before Harbor owned its partial files. The field remains in the persisted
+    /// model only so startup can perform a one-time import. New direct downloads
+    /// never populate it; WebKit continuation data uses `browserResumeData`.
     let resumeData: Data?
+    let browserResumeData: Data?
     let requestHeaders: [RequestHeader]
     let backendIdentifier: String?
     let metadataName: String?
     let mediaMetadata: MediaDownloadMetadata?
     let mediaFormatPreference: MediaDownloadFormatPreference?
+    let requiresMediaRecoveryReset: Bool
+    let mediaOutputConflictIdentifier: UUID?
     let downloadLimitOverride: TransferLimitOverride
     let uploadLimitOverride: TransferLimitOverride
     let torrentFingerprint: String?
     let torrentSourceFingerprint: String?
     let managedTorrentSourcePath: String?
+    let torrentFileSelection: TorrentFileSelection?
     let torrentPayloadPaths: [String]
     let shouldSeedAfterDownload: Bool
     let removeOriginalTorrentAfterImport: Bool
@@ -156,16 +173,20 @@ struct DownloadRecord: Codable, Sendable {
         case updatedAt
         case lastError
         case resumeData
+        case browserResumeData
         case requestHeaders
         case backendIdentifier
         case metadataName
         case mediaMetadata
         case mediaFormatPreference
+        case requiresMediaRecoveryReset
+        case mediaOutputConflictIdentifier
         case downloadLimitOverride
         case uploadLimitOverride
         case torrentFingerprint
         case torrentSourceFingerprint
         case managedTorrentSourcePath
+        case torrentFileSelection
         case torrentPayloadPaths
         case shouldSeedAfterDownload
         case removeOriginalTorrentAfterImport
@@ -192,16 +213,20 @@ struct DownloadRecord: Codable, Sendable {
         updatedAt: Date,
         lastError: String?,
         resumeData: Data?,
+        browserResumeData: Data? = nil,
         requestHeaders: [RequestHeader] = [],
         backendIdentifier: String?,
         metadataName: String?,
         mediaMetadata: MediaDownloadMetadata? = nil,
         mediaFormatPreference: MediaDownloadFormatPreference? = nil,
+        requiresMediaRecoveryReset: Bool = false,
+        mediaOutputConflictIdentifier: UUID? = nil,
         downloadLimitOverride: TransferLimitOverride = .inherit,
         uploadLimitOverride: TransferLimitOverride = .inherit,
         torrentFingerprint: String? = nil,
         torrentSourceFingerprint: String? = nil,
         managedTorrentSourcePath: String? = nil,
+        torrentFileSelection: TorrentFileSelection? = nil,
         torrentPayloadPaths: [String] = [],
         shouldSeedAfterDownload: Bool? = nil,
         removeOriginalTorrentAfterImport: Bool = false,
@@ -226,16 +251,20 @@ struct DownloadRecord: Codable, Sendable {
         self.updatedAt = updatedAt
         self.lastError = lastError
         self.resumeData = resumeData
+        self.browserResumeData = browserResumeData
         self.requestHeaders = requestHeaders
         self.backendIdentifier = backendIdentifier
         self.metadataName = metadataName
         self.mediaMetadata = mediaMetadata
         self.mediaFormatPreference = mediaFormatPreference
+        self.requiresMediaRecoveryReset = requiresMediaRecoveryReset
+        self.mediaOutputConflictIdentifier = mediaOutputConflictIdentifier
         self.downloadLimitOverride = downloadLimitOverride
         self.uploadLimitOverride = uploadLimitOverride
         self.torrentFingerprint = torrentFingerprint
         self.torrentSourceFingerprint = torrentSourceFingerprint
         self.managedTorrentSourcePath = managedTorrentSourcePath
+        self.torrentFileSelection = torrentFileSelection
         self.torrentPayloadPaths = torrentPayloadPaths
         self.shouldSeedAfterDownload = shouldSeedAfterDownload
             ?? (backend == .aria2 || sourceKind == .magnetLink || sourceKind == .torrentFile)
@@ -264,11 +293,20 @@ struct DownloadRecord: Codable, Sendable {
         self.updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? .now
         self.lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
         self.resumeData = try container.decodeIfPresent(Data.self, forKey: .resumeData)
+        self.browserResumeData = try container.decodeIfPresent(Data.self, forKey: .browserResumeData)
         self.requestHeaders = try container.decodeIfPresent([RequestHeader].self, forKey: .requestHeaders) ?? []
         self.backendIdentifier = try container.decodeIfPresent(String.self, forKey: .backendIdentifier)
         self.metadataName = try container.decodeIfPresent(String.self, forKey: .metadataName)
         self.mediaMetadata = try container.decodeIfPresent(MediaDownloadMetadata.self, forKey: .mediaMetadata)
         self.mediaFormatPreference = try container.decodeIfPresent(MediaDownloadFormatPreference.self, forKey: .mediaFormatPreference)
+        self.requiresMediaRecoveryReset = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .requiresMediaRecoveryReset
+        ) ?? false
+        self.mediaOutputConflictIdentifier = try container.decodeIfPresent(
+            UUID.self,
+            forKey: .mediaOutputConflictIdentifier
+        )
         self.downloadLimitOverride = try container.decodeIfPresent(
             TransferLimitOverride.self,
             forKey: .downloadLimitOverride
@@ -280,6 +318,7 @@ struct DownloadRecord: Codable, Sendable {
         self.torrentFingerprint = try container.decodeIfPresent(String.self, forKey: .torrentFingerprint)
         self.torrentSourceFingerprint = try container.decodeIfPresent(String.self, forKey: .torrentSourceFingerprint)
         self.managedTorrentSourcePath = try container.decodeIfPresent(String.self, forKey: .managedTorrentSourcePath)
+        self.torrentFileSelection = try container.decodeIfPresent(TorrentFileSelection.self, forKey: .torrentFileSelection)
         self.torrentPayloadPaths = try container.decodeIfPresent([String].self, forKey: .torrentPayloadPaths) ?? []
         self.shouldSeedAfterDownload = try container.decodeIfPresent(
             Bool.self,
@@ -298,43 +337,6 @@ struct DownloadRecord: Codable, Sendable {
             forKey: .completionNotificationDelivered
         ) ?? (status == .completed)
         self.activityEvents = try container.decodeIfPresent([DownloadActivityEvent].self, forKey: .activityEvents) ?? []
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(id, forKey: .id)
-        try container.encode(sourceURL, forKey: .sourceURL)
-        try container.encode(sourceKind, forKey: .sourceKind)
-        try container.encode(backend, forKey: .backend)
-        try container.encode(preferredFilename, forKey: .preferredFilename)
-        try container.encode(destinationFolderPath, forKey: .destinationFolderPath)
-        try container.encode(fileLocationPath, forKey: .fileLocationPath)
-        try container.encode(status, forKey: .status)
-        try container.encode(progress, forKey: .progress)
-        try container.encode(bytesWritten, forKey: .bytesWritten)
-        try container.encode(expectedBytes, forKey: .expectedBytes)
-        try container.encode(uploadedBytes, forKey: .uploadedBytes)
-        try container.encode(createdAt, forKey: .createdAt)
-        try container.encode(startedAt, forKey: .startedAt)
-        try container.encode(finishedAt, forKey: .finishedAt)
-        try container.encode(updatedAt, forKey: .updatedAt)
-        try container.encode(lastError, forKey: .lastError)
-        try container.encode(resumeData, forKey: .resumeData)
-        try container.encode(requestHeaders, forKey: .requestHeaders)
-        try container.encode(backendIdentifier, forKey: .backendIdentifier)
-        try container.encode(metadataName, forKey: .metadataName)
-        try container.encode(mediaMetadata, forKey: .mediaMetadata)
-        try container.encode(mediaFormatPreference, forKey: .mediaFormatPreference)
-        try container.encode(downloadLimitOverride, forKey: .downloadLimitOverride)
-        try container.encode(uploadLimitOverride, forKey: .uploadLimitOverride)
-        try container.encode(torrentFingerprint, forKey: .torrentFingerprint)
-        try container.encode(torrentSourceFingerprint, forKey: .torrentSourceFingerprint)
-        try container.encode(managedTorrentSourcePath, forKey: .managedTorrentSourcePath)
-        try container.encode(torrentPayloadPaths, forKey: .torrentPayloadPaths)
-        try container.encode(shouldSeedAfterDownload, forKey: .shouldSeedAfterDownload)
-        try container.encode(removeOriginalTorrentAfterImport, forKey: .removeOriginalTorrentAfterImport)
-        try container.encode(completionNotificationDelivered, forKey: .completionNotificationDelivered)
-        try container.encode(activityEvents, forKey: .activityEvents)
     }
 
     private static func shouldSeedLegacyTorrent(
@@ -369,18 +371,24 @@ final class DownloadItem: Identifiable {
     var finishedAt: Date?
     var updatedAt: Date
     var lastError: String?
+    /// In-memory copy of the persisted compatibility token. Initialization
+    /// clears it after attempting the one-time import, before records are saved.
     var resumeData: Data?
+    var browserResumeData: Data?
     var taskIdentifier: Int?
     var backendIdentifier: String?
     var metadataName: String?
     var mediaMetadata: MediaDownloadMetadata?
     var mediaFormatPreference: MediaDownloadFormatPreference?
     var requestHeaders: [RequestHeader]
+    var requiresMediaRecoveryReset: Bool
+    var mediaOutputConflictIdentifier: UUID?
     var downloadLimitOverride: TransferLimitOverride
     var uploadLimitOverride: TransferLimitOverride
     var torrentFingerprint: String?
     var torrentSourceFingerprint: String?
     var managedTorrentSourcePath: String?
+    var torrentFileSelection: TorrentFileSelection?
     var torrentPayloadPaths: [String]
     var shouldSeedAfterDownload: Bool
     var removeOriginalTorrentAfterImport: Bool
@@ -408,17 +416,21 @@ final class DownloadItem: Identifiable {
         updatedAt: Date = .now,
         lastError: String? = nil,
         resumeData: Data? = nil,
+        browserResumeData: Data? = nil,
         taskIdentifier: Int? = nil,
         backendIdentifier: String? = nil,
         metadataName: String? = nil,
         mediaMetadata: MediaDownloadMetadata? = nil,
         mediaFormatPreference: MediaDownloadFormatPreference? = nil,
         requestHeaders: [RequestHeader] = [],
+        requiresMediaRecoveryReset: Bool = false,
+        mediaOutputConflictIdentifier: UUID? = nil,
         downloadLimitOverride: TransferLimitOverride = .inherit,
         uploadLimitOverride: TransferLimitOverride = .inherit,
         torrentFingerprint: String? = nil,
         torrentSourceFingerprint: String? = nil,
         managedTorrentSourcePath: String? = nil,
+        torrentFileSelection: TorrentFileSelection? = nil,
         torrentPayloadPaths: [String] = [],
         shouldSeedAfterDownload: Bool? = nil,
         removeOriginalTorrentAfterImport: Bool = false,
@@ -445,17 +457,21 @@ final class DownloadItem: Identifiable {
         self.updatedAt = updatedAt
         self.lastError = lastError
         self.resumeData = resumeData
+        self.browserResumeData = browserResumeData
         self.taskIdentifier = taskIdentifier
         self.backendIdentifier = backendIdentifier
         self.metadataName = metadataName
         self.mediaMetadata = mediaMetadata
         self.mediaFormatPreference = mediaFormatPreference
         self.requestHeaders = requestHeaders
+        self.requiresMediaRecoveryReset = requiresMediaRecoveryReset
+        self.mediaOutputConflictIdentifier = mediaOutputConflictIdentifier
         self.downloadLimitOverride = downloadLimitOverride
         self.uploadLimitOverride = uploadLimitOverride
         self.torrentFingerprint = torrentFingerprint
         self.torrentSourceFingerprint = torrentSourceFingerprint
         self.managedTorrentSourcePath = managedTorrentSourcePath
+        self.torrentFileSelection = torrentFileSelection
         self.torrentPayloadPaths = torrentPayloadPaths
         self.shouldSeedAfterDownload = shouldSeedAfterDownload
             ?? (backend == .aria2 || sourceKind == .magnetLink || sourceKind == .torrentFile)
@@ -493,23 +509,67 @@ final class DownloadItem: Identifiable {
             updatedAt: record.updatedAt,
             lastError: record.lastError,
             resumeData: record.resumeData,
+            browserResumeData: record.browserResumeData,
             taskIdentifier: nil,
             backendIdentifier: record.backendIdentifier,
             metadataName: record.metadataName,
             mediaMetadata: record.mediaMetadata,
             mediaFormatPreference: record.mediaFormatPreference,
             requestHeaders: record.requestHeaders,
+            requiresMediaRecoveryReset: record.requiresMediaRecoveryReset,
+            mediaOutputConflictIdentifier: record.mediaOutputConflictIdentifier,
             downloadLimitOverride: record.downloadLimitOverride,
             uploadLimitOverride: record.uploadLimitOverride,
             torrentFingerprint: record.torrentFingerprint,
             torrentSourceFingerprint: record.torrentSourceFingerprint,
             managedTorrentSourcePath: record.managedTorrentSourcePath,
+            torrentFileSelection: record.torrentFileSelection,
             torrentPayloadPaths: record.torrentPayloadPaths,
             shouldSeedAfterDownload: record.shouldSeedAfterDownload,
             removeOriginalTorrentAfterImport: record.removeOriginalTorrentAfterImport,
             completionNotificationDelivered: record.completionNotificationDelivered,
             activityEvents: record.activityEvents
         )
+    }
+
+    func restorePersistedState(from record: DownloadRecord) {
+        precondition(record.id == id && record.createdAt == createdAt)
+        sourceURL = record.sourceURL
+        sourceKind = record.sourceKind
+        backend = record.backend
+        preferredFilename = record.preferredFilename
+        destinationFolderPath = record.destinationFolderPath
+        fileLocationPath = record.fileLocationPath
+        status = record.status
+        progress = record.progress
+        bytesWritten = record.bytesWritten
+        expectedBytes = record.expectedBytes
+        speedBytesPerSecond = 0
+        uploadBytesPerSecond = 0
+        startedAt = record.startedAt
+        finishedAt = record.finishedAt
+        updatedAt = record.updatedAt
+        lastError = record.lastError
+        resumeData = record.resumeData
+        browserResumeData = record.browserResumeData
+        taskIdentifier = nil
+        backendIdentifier = record.backendIdentifier
+        metadataName = record.metadataName
+        mediaMetadata = record.mediaMetadata
+        mediaFormatPreference = record.mediaFormatPreference
+        requestHeaders = record.requestHeaders
+        requiresMediaRecoveryReset = record.requiresMediaRecoveryReset
+        mediaOutputConflictIdentifier = record.mediaOutputConflictIdentifier
+        downloadLimitOverride = record.downloadLimitOverride
+        uploadLimitOverride = record.uploadLimitOverride
+        torrentFingerprint = record.torrentFingerprint
+        managedTorrentSourcePath = record.managedTorrentSourcePath
+        torrentFileSelection = record.torrentFileSelection
+        torrentPayloadPaths = record.torrentPayloadPaths
+        shouldSeedAfterDownload = record.shouldSeedAfterDownload
+        removeOriginalTorrentAfterImport = record.removeOriginalTorrentAfterImport
+        completionNotificationDelivered = record.completionNotificationDelivered
+        activityEvents = record.activityEvents
     }
 
     var displayName: String {
@@ -612,6 +672,23 @@ final class DownloadItem: Identifiable {
         sourceURL.isFileURL ? sourceURL.path : sourceURL.absoluteString
     }
 
+    var partialTorrentSelectionText: String? {
+        guard let torrentFileSelection,
+              torrentFileSelection.isPartial else {
+            return nil
+        }
+        let template = String(
+            localized: "torrent.selection.summary",
+            defaultValue: "%d of %d files selected",
+            comment: "Summary for a torrent download that includes only some files. Parameters are selected count and total count."
+        )
+        return String(
+            format: template,
+            torrentFileSelection.selectedFileCount,
+            torrentFileSelection.totalFileCount
+        )
+    }
+
     var sourceBadgeTitle: LocalizedStringResource {
         sourceKind.title
     }
@@ -662,7 +739,7 @@ final class DownloadItem: Identifiable {
         }
 
         switch status {
-        case .queued, .preparing, .downloading:
+        case .queued, .preparing, .waitingToRetry, .downloading:
             return String(localized: "Waiting", comment: "Speed status fallback")
         case .seeding, .browserSessionRequired, .paused, .completed, .failed, .cancelled:
             return "-"
@@ -696,7 +773,7 @@ final class DownloadItem: Identifiable {
     }
 
     var canPause: Bool {
-        status == .preparing || status == .downloading || status == .seeding
+        status == .preparing || status == .waitingToRetry || status == .downloading || status == .seeding
     }
 
     var canResume: Bool {
@@ -723,16 +800,20 @@ final class DownloadItem: Identifiable {
             updatedAt: updatedAt,
             lastError: lastError,
             resumeData: resumeData,
+            browserResumeData: browserResumeData,
             requestHeaders: requestHeaders,
             backendIdentifier: backendIdentifier,
             metadataName: metadataName,
             mediaMetadata: mediaMetadata?.persistenceSnapshot,
             mediaFormatPreference: mediaFormatPreference,
+            requiresMediaRecoveryReset: requiresMediaRecoveryReset,
+            mediaOutputConflictIdentifier: mediaOutputConflictIdentifier,
             downloadLimitOverride: downloadLimitOverride,
             uploadLimitOverride: uploadLimitOverride,
             torrentFingerprint: torrentFingerprint,
             torrentSourceFingerprint: torrentSourceFingerprint,
             managedTorrentSourcePath: managedTorrentSourcePath,
+            torrentFileSelection: torrentFileSelection,
             torrentPayloadPaths: torrentPayloadPaths,
             shouldSeedAfterDownload: shouldSeedAfterDownload,
             removeOriginalTorrentAfterImport: removeOriginalTorrentAfterImport,

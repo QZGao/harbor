@@ -6,7 +6,7 @@ nonisolated enum TorrentSourceLoader {
         requestHeaders: [RequestHeader]
     ) async throws -> Data {
         if sourceURL.isFileURL {
-            return try Data(contentsOf: sourceURL)
+            return try ManagedTorrentSourceStore.loadTorrentData(at: sourceURL)
         }
 
         var request = URLRequest(url: sourceURL)
@@ -30,11 +30,13 @@ nonisolated enum TorrentSourceLoader {
             session.finishTasksAndInvalidate()
         }
 
-        let (data, response) = try await session.data(for: request)
+        let (temporaryURL, response) = try await session.download(for: request)
         if let response = response as? HTTPURLResponse,
            (200 ... 299).contains(response.statusCode) == false {
             throw TorrentSourceLoadingError.httpStatus(response.statusCode)
         }
+
+        let data = try ManagedTorrentSourceStore.loadTorrentData(at: temporaryURL)
 
         guard data.isEmpty == false else {
             throw TorrentSourceLoadingError.emptyResponse

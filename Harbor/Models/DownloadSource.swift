@@ -103,7 +103,7 @@ struct MagnetLinkMetadata: Sendable {
     let displayName: String?
     let infoHash: String?
 
-    init(url: URL) {
+    nonisolated init(url: URL) {
         let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         let queryItems = components?.queryItems ?? []
 
@@ -122,7 +122,7 @@ struct MagnetLinkMetadata: Sendable {
 }
 
 private extension String {
-    var nilIfBlank: String? {
+    nonisolated var nilIfBlank: String? {
         trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : self
     }
 }

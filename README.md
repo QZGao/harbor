@@ -18,6 +18,9 @@
     <a href="https://github.com/thsnkhn/harbor/blob/main/LICENSE">
       <img src="https://img.shields.io/github/license/thsnkhn/harbor" alt="License" />
     </a>
+    <a href="https://github.com/thsnkhn/harbor/stargazers">
+      <img src="https://img.shields.io/github/stars/thsnkhn/harbor?style=flat&label=stars" alt="GitHub stars" />
+    </a>
     <a href="https://github.com/thsnkhn/harbor/releases/latest">
       <img src="https://img.shields.io/badge/platform-macOS%2015.6%2B-111111" alt="Platform macOS 15.6+" />
     </a>
@@ -36,7 +39,7 @@
 
 ## Why Harbor
 
-Harbor exists to give macOS users a serious download manager without the usual tradeoffs. It combines a polished native SwiftUI interface with pragmatic download-engine separation, so the app feels clean and Mac-native while still handling direct downloads, magnet links, and `.torrent` files reliably.
+Harbor exists to give macOS users a serious download manager without the usual tradeoffs. It combines a polished native SwiftUI interface with pragmatic download-engine separation, so the app feels clean and Mac-native while handling direct downloads, public media links, magnet links, and `.torrent` files.
 
 If you want a downloader that respects the platform, respects your machine, and stays out of your way, Harbor is that app.
 
@@ -46,8 +49,14 @@ If you want a downloader that respects the platform, respects your machine, and 
 - Free and open source under GPL-3.0
 - Local-first and privacy-friendly by design
 - Direct HTTP and HTTPS downloads
-- Magnet link and local `.torrent` support
-- Batch add: paste many links, pick one folder, queue them all at once
+- Public media downloads with previews and video or audio format selection
+- Magnet link and local `.torrent` file support
+- Torrent preview: inspect the file list and choose what to download before you start
+- Batch add: paste many links, choose one folder, and queue them together
+- Traffic profiles for Unlimited, Balanced, Quiet, and Custom download behavior
+- Global and per-download speed controls
+- Quick Look previews for completed downloads
+- Torrent watch folders, seeding controls, and share-ratio limits
 - Queue persistence across launches
 - Pause, resume, retry, cancel, and history flows
 - Finder reveal and open-file actions

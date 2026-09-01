@@ -1,0 +1,110 @@
+{
+  "fill" : "system-light",
+  "groups" : [
+    {
+      "blend-mode" : "normal",
+      "blur-material" : null,
+      "layers" : [
+        {
+          "hidden" : false,
+          "image-name" : "BT31.svg",
+          "name" : "Ship - Right"
+        },
+        {
+          "hidden" : false,
+          "image-name" : "BT32.svg",
+          "name" : "Ship - Left"
+        }
+      ],
+      "lighting" : "combined",
+      "name" : "Top Layer",
+      "opacity" : 0.8,
+      "shadow" : {
+        "kind" : "layer-color",
+        "opacity" : 0.5
+      },
+      "specular" : true,
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.3
+      }
+    },
+    {
+      "blur-material" : null,
+      "layers" : [
+        {
+          "hidden" : false,
+          "image-name" : "BT2b.svg",
+          "name" : "Ship - Middle",
+          "opacity" : 0.8
+        }
+      ],
+      "lighting" : "individual",
+      "name" : "Middle Layer",
+      "shadow" : {
+        "kind" : "layer-color",
+        "opacity" : 0.5
+      },
+      "specular" : true,
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.3
+      }
+    },
+    {
+      "layers" : [
+        {
+          "hidden" : false,
+          "image-name" : "BT1.svg",
+          "name" : "Ship - Top",
+          "opacity" : 0.8
+        }
+      ],
+      "name" : "Bottom Layer",
+      "shadow" : {
+        "kind" : "layer-color",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.3
+      }
+    },
+    {
+      "blur-material" : null,
+      "layers" : [
+        {
+          "glass" : false,
+          "hidden-specializations" : [
+            {
+              "value" : true
+            },
+            {
+              "appearance" : "light",
+              "value" : false
+            }
+          ],
+          "image-name" : "BG 2.svg",
+          "name" : "Background"
+        }
+      ],
+      "lighting" : "individual",
+      "name" : "Background Layer",
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0
+      },
+      "specular" : false,
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

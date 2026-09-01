@@ -2,26 +2,8 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-build_dir="${TMPDIR:-/tmp}/harbor-media-tests"
-module_cache="${build_dir}/ModuleCache"
-binary="${build_dir}/MediaRuntimeSmokeTests"
 media_runtime_root="${project_dir}/Vendor/MediaRuntime"
 torrent_runtime_root="${project_dir}/Vendor/TorrentRuntime"
-
-rm -rf "$build_dir"
-mkdir -p "$build_dir" "$module_cache"
-
-swiftc \
-  -module-cache-path "$module_cache" \
-  "${project_dir}/Harbor/Models/MediaDownloadMetadata.swift" \
-  "${project_dir}/Harbor/Services/HarborApplicationSupport.swift" \
-  "${project_dir}/Harbor/Services/ManagedChildProcess.swift" \
-  "${project_dir}/Harbor/Services/MediaRuntimeResolver.swift" \
-  "${project_dir}/Harbor/Services/MediaDownloadService.swift" \
-  "${project_dir}/Tests/MediaRuntimeSmokeTests.swift" \
-  -o "$binary"
-
-"$binary"
 
 run_for_arch() {
   local architecture="$1"
@@ -48,11 +30,19 @@ for architecture in arm64 x86_64; do
   torrent_bin="${torrent_runtime_root}/${architecture}/bin"
 
   check_executable "${media_bin}/yt-dlp"
+  check_executable "${media_bin}/deno"
   check_executable "${media_bin}/ffmpeg"
   check_executable "${media_bin}/ffprobe"
   check_executable "${torrent_bin}/aria2c"
 
   run_for_arch "$architecture" "${media_bin}/yt-dlp" --version >/dev/null
+  run_for_arch "$architecture" "${media_bin}/deno" --version >/dev/null
+  runtime_report="$(run_for_arch "$architecture" "${media_bin}/yt-dlp" --ignore-config --verbose --js-runtimes "deno:${media_bin}/deno" --simulate about:blank 2>&1 || true)"
+  if [[ "$runtime_report" != *"JS runtimes: deno-"* ]]; then
+    echo "yt-dlp did not detect bundled Deno for ${architecture}." >&2
+    echo "$runtime_report" >&2
+    exit 1
+  fi
   run_for_arch "$architecture" "${media_bin}/ffmpeg" -version >/dev/null
   run_for_arch "$architecture" "${media_bin}/ffprobe" -version >/dev/null
   run_for_arch "$architecture" "${torrent_bin}/aria2c" --version >/dev/null

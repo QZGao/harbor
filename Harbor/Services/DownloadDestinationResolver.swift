@@ -1,6 +1,7 @@
+import Darwin
 import Foundation
 
-struct DownloadDestinationResolver {
+struct DownloadDestinationResolver: @unchecked Sendable {
     nonisolated(unsafe) private let fileManager: FileManager
 
     nonisolated init(fileManager: FileManager = .default) {
@@ -38,11 +39,11 @@ struct DownloadDestinationResolver {
         return sanitize(candidate)
     }
 
-    nonisolated func uniqueDestinationURL(for filename: String, in directory: URL) -> URL {
+    nonisolated func uniqueDestinationURL(for filename: String, in directory: URL) throws -> URL {
         let cleanName = sanitize(filename)
         let baseURL = directory.appendingPathComponent(cleanName)
 
-        guard fileManager.fileExists(atPath: baseURL.path) else {
+        guard try DurableFileSystem.pathEntryExists(at: baseURL) else {
             return baseURL
         }
 
@@ -61,7 +62,7 @@ struct DownloadDestinationResolver {
             }
 
             let candidateURL = directory.appendingPathComponent(candidateName)
-            if fileManager.fileExists(atPath: candidateURL.path) == false {
+            if try DurableFileSystem.pathEntryExists(at: candidateURL) == false {
                 return candidateURL
             }
 
@@ -76,21 +77,91 @@ struct DownloadDestinationResolver {
         sourceURL: URL,
         into directory: URL
     ) throws -> URL {
-        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        try createDirectoryIfNeeded(directory)
 
         let targetName = resolvedFilename(
             custom: customFilename,
             responseSuggestedFilename: responseSuggestedFilename,
             sourceURL: sourceURL
         )
-        let destinationURL = uniqueDestinationURL(for: targetName, in: directory)
-
-        if fileManager.fileExists(atPath: destinationURL.path) {
-            try fileManager.removeItem(at: destinationURL)
+        while true {
+            let destinationURL = try uniqueDestinationURL(for: targetName, in: directory)
+            do {
+                try moveDownloadedFile(from: temporaryURL, to: destinationURL)
+                return destinationURL
+            } catch let error as CocoaError where error.code == .fileWriteFileExists {
+                // Another writer won the name after it was selected. Resolve a
+                // new name; never remove a file Harbor does not own.
+                continue
+            }
         }
+    }
 
-        try fileManager.moveItem(at: temporaryURL, to: destinationURL)
-        return destinationURL
+    nonisolated func destinationURL(
+        customFilename: String?,
+        responseSuggestedFilename: String?,
+        sourceURL: URL,
+        in directory: URL
+    ) throws -> URL {
+        try createDirectoryIfNeeded(directory)
+        let targetName = resolvedFilename(
+            custom: customFilename,
+            responseSuggestedFilename: responseSuggestedFilename,
+            sourceURL: sourceURL
+        )
+        return try uniqueDestinationURL(for: targetName, in: directory)
+    }
+
+    nonisolated func moveDownloadedFile(from sourceURL: URL, to destinationURL: URL) throws {
+        try createDirectoryIfNeeded(destinationURL.deletingLastPathComponent())
+        let result = sourceURL.path.withCString { sourcePath in
+            destinationURL.path.withCString { destinationPath in
+                Darwin.renameatx_np(
+                    AT_FDCWD,
+                    sourcePath,
+                    AT_FDCWD,
+                    destinationPath,
+                    UInt32(RENAME_EXCL)
+                )
+            }
+        }
+        guard result == 0 else {
+            let code = errno
+            if code == EEXIST || code == ENOTEMPTY {
+                throw CocoaError(.fileWriteFileExists)
+            }
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        try DurableFileSystem.synchronizeParentDirectory(of: destinationURL)
+    }
+
+    nonisolated func synchronizePlacedFile(at destinationURL: URL) throws {
+        guard try DurableFileSystem.pathEntryExists(at: destinationURL) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        try DurableFileSystem.synchronizeFile(at: destinationURL)
+        try DurableFileSystem.synchronizeParentDirectory(of: destinationURL)
+    }
+
+    nonisolated func copyDownloadedFile(from sourceURL: URL, to stagingURL: URL) throws {
+        try createDirectoryIfNeeded(stagingURL.deletingLastPathComponent())
+        guard try DurableFileSystem.pathEntryExists(at: stagingURL) == false else {
+            throw CocoaError(.fileWriteFileExists)
+        }
+        try fileManager.copyItem(at: sourceURL, to: stagingURL)
+        try DurableFileSystem.synchronizeFile(at: stagingURL)
+        try DurableFileSystem.synchronizeParentDirectory(of: stagingURL)
+    }
+
+    private nonisolated func createDirectoryIfNeeded(_ directoryURL: URL) throws {
+        let alreadyExists = try DurableFileSystem.pathEntryExists(at: directoryURL)
+        try fileManager.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+        if alreadyExists == false {
+            try DurableFileSystem.synchronizeParentDirectory(of: directoryURL)
+        }
     }
 
     private nonisolated func sanitize(_ filename: String) -> String {

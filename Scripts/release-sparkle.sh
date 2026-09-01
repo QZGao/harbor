@@ -188,6 +188,10 @@ resign_exported_app() {
   done
 
   for architecture in arm64 x86_64; do
+    if [ -f "$APP_PATH/Contents/Resources/MediaRuntime/$architecture/bin/deno" ]; then
+      codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp "$APP_PATH/Contents/Resources/MediaRuntime/$architecture/bin/deno"
+    fi
+
     if [ -f "$APP_PATH/Contents/Resources/MediaRuntime/$architecture/bin/yt-dlp" ]; then
       codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp --entitlements "$YT_DLP_ENTITLEMENTS" "$APP_PATH/Contents/Resources/MediaRuntime/$architecture/bin/yt-dlp"
     fi
