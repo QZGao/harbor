@@ -1,15 +1,11 @@
 import Foundation
 
 nonisolated enum TorrentSourceLoader {
-    static func load(
-        from sourceURL: URL,
+    static func fetch(
+        from remoteURL: URL,
         requestHeaders: [RequestHeader]
     ) async throws -> Data {
-        if sourceURL.isFileURL {
-            return try ManagedTorrentSourceStore.loadTorrentData(at: sourceURL)
-        }
-
-        var request = URLRequest(url: sourceURL)
+        var request = URLRequest(url: remoteURL)
         requestHeaders.apply(to: &request)
 
         let configuration = URLSessionConfiguration.ephemeral
@@ -18,7 +14,7 @@ nonisolated enum TorrentSourceLoader {
         configuration.timeoutIntervalForResource = 120
 
         let redirectDelegate = TorrentSourceRedirectDelegate(
-            sourceURL: sourceURL,
+            sourceURL: remoteURL,
             requestHeaders: requestHeaders
         )
         let session = URLSession(

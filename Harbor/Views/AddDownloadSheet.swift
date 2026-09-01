@@ -36,8 +36,7 @@ struct AddDownloadSheet: View {
     @State private var destinationPath: String
     @State private var hasCustomizedDestination = false
     @State private var shouldStartImmediately: Bool
-    @State private var requestHeaders: [RequestHeader]
-    @State private var isAdvancedSettingsExpanded = false
+    @State private var requestHeaders: [RequestHeader] = []
     @State private var isRequestHeadersEditorPresented = false
     @State private var validationMessage: String?
     @State private var mediaPreview: MediaDownloadMetadata?
@@ -49,7 +48,7 @@ struct AddDownloadSheet: View {
     @State private var mediaPreviewTask: Task<Void, Never>?
     @State private var mediaPreviewGeneration = 0
     @State private var torrentPreviewSource: TorrentPreviewSource?
-    @State private var approvedSensitiveTorrentHeaders: [RequestHeader]?
+    @State private var hasApprovedSensitiveTorrentHeaders = false
     @State private var pendingSensitiveTorrentAction: PendingSensitiveTorrentAction?
 
     init(
@@ -70,7 +69,6 @@ struct AddDownloadSheet: View {
         _torrentFileURL = State(initialValue: draft.torrentFileURL)
         _destinationPath = State(initialValue: draft.destinationFolderURL.path)
         _shouldStartImmediately = State(initialValue: draft.shouldStartImmediately)
-        _requestHeaders = State(initialValue: draft.requestHeaders)
     }
 
     var body: some View {
@@ -224,17 +222,13 @@ struct AddDownloadSheet: View {
         }
         .sheet(isPresented: $isRequestHeadersEditorPresented) {
             RequestHeadersEditor(
-                requestHeaders: requestHeaders,
-                sourceUsesAria2: currentSourceUsesAria2
-            ) { updatedHeaders, confirmedSensitiveTorrentWarning in
+                requestHeaders: requestHeaders
+            ) { updatedHeaders in
                 requestHeaders = updatedHeaders
-                approvedSensitiveTorrentHeaders = confirmedSensitiveTorrentWarning
-                    ? updatedHeaders
-                    : nil
+                hasApprovedSensitiveTorrentHeaders = false
                 validationMessage = nil
             }
         }
-        // Fallback if the source becomes an aria2 job after sensitive headers were saved.
         .alert(
             "Sensitive headers may be shared",
             isPresented: Binding(
@@ -281,7 +275,7 @@ struct AddDownloadSheet: View {
 
     private func presentTorrentPreview(_ source: TorrentPreviewSource) {
         if requestHeaders.triggersSensitiveTorrentWarning,
-           approvedSensitiveTorrentHeaders != requestHeaders {
+           hasApprovedSensitiveTorrentHeaders == false {
             pendingSensitiveTorrentAction = .preview(source)
             return
         }
@@ -516,7 +510,7 @@ struct AddDownloadSheet: View {
     }
 
     private var advancedSettingsSection: some View {
-        DisclosureGroup(isExpanded: $isAdvancedSettingsExpanded) {
+        DisclosureGroup("Advanced Settings") {
             LabeledContent("Request Headers") {
                 Button("Configure…") {
                     isRequestHeadersEditorPresented = true
@@ -524,17 +518,6 @@ struct AddDownloadSheet: View {
             }
             .padding(.top, 10)
             .padding(.leading, 24)
-        } label: {
-            HStack {
-                Text("Advanced Settings")
-                Spacer()
-            }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                withAnimation {
-                    isAdvancedSettingsExpanded.toggle()
-                }
-            }
         }
     }
 
@@ -606,20 +589,6 @@ struct AddDownloadSheet: View {
     private var parsedLinkURL: URL? {
         let trimmedURL = sourceURLText.trimmingCharacters(in: .whitespacesAndNewlines)
         return URL(string: trimmedURL)
-    }
-
-    private var currentSourceUsesAria2: Bool {
-        switch entryMode {
-        case .torrentFile:
-            return true
-        case .linkOrMagnet:
-            let sourceURLs = isBatchEntry
-                ? parsedBatchURLs
-                : [parsedLinkURL].compactMap { $0 }
-            return sourceURLs.contains {
-                DownloadSourceKind.detect(from: $0)?.usesAria2 == true
-            }
-        }
     }
 
     private var batchEntries: [DownloadSourceImportService.TextEntry] {
@@ -910,7 +879,7 @@ struct AddDownloadSheet: View {
         if requests.contains(where: {
             $0.sourceKind.usesAria2 && $0.requestHeaders.triggersSensitiveTorrentWarning
         }),
-           approvedSensitiveTorrentHeaders != requestHeaders {
+           hasApprovedSensitiveTorrentHeaders == false {
             pendingSensitiveTorrentAction = .submit(requests)
             return
         }
@@ -930,7 +899,7 @@ struct AddDownloadSheet: View {
         }
 
         pendingSensitiveTorrentAction = nil
-        approvedSensitiveTorrentHeaders = requestHeaders
+        hasApprovedSensitiveTorrentHeaders = true
 
         switch action {
         case let .preview(source):

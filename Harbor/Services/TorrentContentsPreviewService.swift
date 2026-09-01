@@ -18,7 +18,7 @@ struct TorrentContentsPreviewService: Sendable {
             if sourceURL.isFileURL {
                 data = try readLocalTorrent(at: sourceURL)
             } else {
-                data = try await TorrentSourceLoader.load(
+                data = try await TorrentSourceLoader.fetch(
                     from: sourceURL,
                     requestHeaders: requestHeaders
                 )

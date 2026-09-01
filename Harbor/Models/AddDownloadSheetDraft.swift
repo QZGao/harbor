@@ -23,7 +23,6 @@ struct AddDownloadSheetDraft: Identifiable, Sendable {
     let torrentFileURL: URL?
     let destinationFolderURL: URL
     let shouldStartImmediately: Bool
-    let requestHeaders: [RequestHeader]
 
     init(
         id: UUID = UUID(),
@@ -31,8 +30,7 @@ struct AddDownloadSheetDraft: Identifiable, Sendable {
         sourceURLText: String = "",
         torrentFileURL: URL? = nil,
         destinationFolderURL: URL,
-        shouldStartImmediately: Bool,
-        requestHeaders: [RequestHeader] = []
+        shouldStartImmediately: Bool
     ) {
         self.id = id
         self.entryMode = entryMode
@@ -40,7 +38,6 @@ struct AddDownloadSheetDraft: Identifiable, Sendable {
         self.torrentFileURL = torrentFileURL
         self.destinationFolderURL = destinationFolderURL
         self.shouldStartImmediately = shouldStartImmediately
-        self.requestHeaders = requestHeaders
     }
 
     static func blank(

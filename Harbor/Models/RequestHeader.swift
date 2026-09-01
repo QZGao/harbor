@@ -1,19 +1,8 @@
 import Foundation
 
-nonisolated struct RequestHeader: Codable, Hashable, Identifiable, Sendable {
-    let id: UUID
+nonisolated struct RequestHeader: Codable, Hashable, Sendable {
     var name: String
     var value: String
-
-    init(
-        id: UUID = UUID(),
-        name: String = "",
-        value: String = ""
-    ) {
-        self.id = id
-        self.name = name
-        self.value = value
-    }
 
     var validationIssue: RequestHeaderValidationIssue? {
         guard name.isEmpty == false else {
@@ -31,7 +20,7 @@ nonisolated struct RequestHeader: Codable, Hashable, Identifiable, Sendable {
         return nil
     }
 
-    /// Identifies Cookie and Authorization headers for warnings in RequestHeadersEditor and AddDownloadSheet.
+    /// Identifies Cookie and Authorization headers that require torrent disclosure.
     var triggersSensitiveTorrentWarning: Bool {
         let fieldName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         return fieldName.caseInsensitiveCompare("Cookie") == .orderedSame

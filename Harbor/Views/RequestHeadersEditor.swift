@@ -7,23 +7,18 @@ struct RequestHeadersEditor: View {
     Referer: https://example.com/
     """
 
-    let sourceUsesAria2: Bool
-    let onSave: ([RequestHeader], _ confirmedSensitiveTorrentWarning: Bool) -> Void
+    let onSave: ([RequestHeader]) -> Void
 
     @Environment(\.dismiss) private var dismiss
 
     @State private var requestHeadersText: String
     @State private var isRequestHeadersEditorFocused = false
     @State private var validationMessage: String?
-    @State private var pendingSensitiveHeaders: [RequestHeader]?
-    @State private var isSensitiveHeaderWarningPresented = false
 
     init(
         requestHeaders: [RequestHeader],
-        sourceUsesAria2: Bool,
-        onSave: @escaping ([RequestHeader], _ confirmedSensitiveTorrentWarning: Bool) -> Void
+        onSave: @escaping ([RequestHeader]) -> Void
     ) {
-        self.sourceUsesAria2 = sourceUsesAria2
         self.onSave = onSave
         _requestHeadersText = State(
             initialValue: requestHeaders
@@ -96,24 +91,6 @@ struct RequestHeadersEditor: View {
         .onChange(of: requestHeadersText) {
             validationMessage = nil
         }
-        // See RequestHeader.triggersSensitiveTorrentWarning; warn before saving headers aria2 may forward.
-        .alert(
-            "Sensitive headers may be shared",
-            isPresented: $isSensitiveHeaderWarningPresented
-        ) {
-            Button("Cancel", role: .cancel) {
-                pendingSensitiveHeaders = nil
-                isRequestHeadersEditorFocused = true
-            }
-
-            Button("Save Headers") {
-                savePendingSensitiveHeaders()
-            }
-        } message: {
-            Text(
-                "The supplied headers contain Cookie or Authorization information. aria2 may send these headers to every HTTP/HTTPS tracker and web seed used by this torrent. Save these headers?"
-            )
-        }
     }
 
     private func save() {
@@ -122,30 +99,7 @@ struct RequestHeadersEditor: View {
             return
         }
 
-        if sourceUsesAria2,
-           requestHeaders.triggersSensitiveTorrentWarning {
-            pendingSensitiveHeaders = requestHeaders
-            isSensitiveHeaderWarningPresented = true
-            return
-        }
-
-        commit(requestHeaders, confirmedSensitiveTorrentWarning: false)
-    }
-
-    private func savePendingSensitiveHeaders() {
-        guard let requestHeaders = pendingSensitiveHeaders else {
-            return
-        }
-
-        pendingSensitiveHeaders = nil
-        commit(requestHeaders, confirmedSensitiveTorrentWarning: true)
-    }
-
-    private func commit(
-        _ requestHeaders: [RequestHeader],
-        confirmedSensitiveTorrentWarning: Bool
-    ) {
-        onSave(requestHeaders, confirmedSensitiveTorrentWarning)
+        onSave(requestHeaders)
         dismiss()
     }
 
