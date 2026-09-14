@@ -37,6 +37,8 @@ struct DownloadsSettingsTab: View {
     let settings: AppSettingsStore
 
     var body: some View {
+        @Bindable var settings = settings
+
         Form {
             Section("Save Locations") {
                 DestinationFolderRow(
@@ -53,8 +55,52 @@ struct DownloadsSettingsTab: View {
                     reveal: settings.revealTorrentDestination
                 )
             }
+
+            Section("Proxy") {
+                Picker("Mode", selection: $settings.proxyMode) {
+                    ForEach(NetworkProxyMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+
+                if settings.proxyMode == .manual {
+                    Picker("Protocol", selection: $settings.proxyScheme) {
+                        ForEach(NetworkProxyScheme.allCases) { scheme in
+                            Text(scheme.title).tag(scheme)
+                        }
+                    }
+
+                    TextField("Host", text: $settings.proxyHost)
+                        .textFieldStyle(.roundedBorder)
+
+                    TextField("Port", value: $settings.proxyPort, format: .number)
+                        .textFieldStyle(.roundedBorder)
+                        .monospacedDigit()
+
+                    if let error = settings.proxySettings.validationError {
+                        Text(error.localizedDescription)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                }
+
+                Text(proxyExplanation)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
+    }
+
+    private var proxyExplanation: LocalizedStringResource {
+        switch settings.proxyMode {
+        case .none:
+            "Harbor connects directly for regular and torrent downloads."
+        case .system:
+            "Regular downloads use the macOS proxy configuration. Torrents use its static HTTP or SOCKS proxy when one is configured."
+        case .manual:
+            "The manual proxy applies to new regular and torrent connections. Proxy authentication is not supported yet."
+        }
     }
 }
 

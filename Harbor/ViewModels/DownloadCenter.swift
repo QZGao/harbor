@@ -268,7 +268,10 @@ final class DownloadCenter {
         self.networkBindingMonitor = networkBindingMonitor ?? NetworkBindingMonitor()
         self.sleepPreventionService = sleepPreventionService ?? DownloadSleepPreventionService()
         self.quickLookPreviewService = quickLookPreviewService ?? QuickLookPreviewService()
-        self.torrentService = torrentService ?? Aria2TorrentService(transferSettings: settings.transferSettings)
+        self.torrentService = torrentService ?? Aria2TorrentService(
+            transferSettings: settings.transferSettings,
+            proxySettings: settings.proxySettings
+        )
         self.directPauseOperation = directPauseOperation
         self.mediaCleanupOperation = mediaCleanupOperation
         self.mediaPauseOperation = mediaPauseOperation
@@ -292,7 +295,8 @@ final class DownloadCenter {
                 }
             },
             recoveryDirectoryURL: directRecoveryDirectoryURL,
-            completedHandoffStore: completedHandoffStore
+            completedHandoffStore: completedHandoffStore,
+            proxySettings: settings.proxySettings
         )
         self.browserCoordinator = BrowserDownloadCoordinator(
             temporaryDirectory: browserRecoveryDirectoryURL,
@@ -311,6 +315,9 @@ final class DownloadCenter {
         }
         settings.networkBindingDidChange = { [weak self] _ in
             self?.configureNetworkBinding()
+        }
+        settings.proxySettingsDidChange = { [weak self] proxySettings in
+            self?.applyProxySettings(proxySettings)
         }
         self.networkBindingMonitor.statusDidChange = { [weak self] status in
             self?.handleNetworkBindingStatus(status)
@@ -2541,6 +2548,7 @@ final class DownloadCenter {
             sourceKind: sourceKind,
             sourceURL: sourceURL,
             requestHeaders: requestHeaders,
+            proxySettings: settings.proxySettings,
             torrentService: torrentService
         )
     }
@@ -2679,7 +2687,8 @@ final class DownloadCenter {
             } else {
                 managedSource = try await managedTorrentSourceStore.fetchRemoteTorrent(
                     from: request.sourceURL,
-                    requestHeaders: request.requestHeaders
+                    requestHeaders: request.requestHeaders,
+                    proxySettings: settings.proxySettings
                 )
             }
 
@@ -4313,7 +4322,8 @@ final class DownloadCenter {
             } else {
                 managedSource = try await managedTorrentSourceStore.fetchRemoteTorrent(
                     from: sourceURL,
-                    requestHeaders: item.requestHeaders
+                    requestHeaders: item.requestHeaders,
+                    proxySettings: settings.proxySettings
                 )
             }
 
@@ -6002,6 +6012,13 @@ final class DownloadCenter {
         }
 
         startNextQueuedDownloadsIfNeeded()
+    }
+
+    private func applyProxySettings(_ proxySettings: NetworkProxySettings) {
+        coordinator.updateProxySettings(proxySettings)
+        Task { [torrentService] in
+            await torrentService.updateProxySettings(proxySettings)
+        }
     }
 
     private func torrentTransferOptions(for item: DownloadItem) -> TorrentTransferOptions {

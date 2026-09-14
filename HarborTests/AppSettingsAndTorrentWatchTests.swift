@@ -4,6 +4,32 @@ import XCTest
 
 @MainActor
 final class AppSettingsAndTorrentWatchTests: XCTestCase {
+    func testProxySettingsDefaultToSystemAndPersistManualConfiguration() {
+        let suiteName = "HarborTests.Proxy.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        XCTAssertEqual(settings.proxySettings, .system)
+
+        var observedSettings: NetworkProxySettings?
+        settings.proxySettingsDidChange = { observedSettings = $0 }
+        settings.proxyMode = .manual
+        settings.proxyScheme = .socks5
+        settings.proxyHost = "proxy.example"
+        settings.proxyPort = 1_080
+
+        let expected = NetworkProxySettings(
+            mode: .manual,
+            scheme: .socks5,
+            host: "proxy.example",
+            port: 1_080
+        )
+        XCTAssertEqual(observedSettings, expected)
+        XCTAssertEqual(AppSettingsStore(userDefaults: userDefaults).proxySettings, expected)
+    }
+
     func testPreventSleepDefaultsOffAndPersists() {
         let suiteName = "HarborTests.PreventSleep.\(UUID().uuidString)"
         let userDefaults = UserDefaults(suiteName: suiteName)!

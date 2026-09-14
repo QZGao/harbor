@@ -292,14 +292,17 @@ actor Aria2TorrentService {
     private let daemonStartupOperation: DaemonStartupOperation
     private let startupLogBuffer = TorrentEngineLogBuffer()
     private var transferSettings: DownloadTransferSettings
+    private var proxySettings: NetworkProxySettings
     private var networkBinding: NetworkBindingStatus = .unrestricted
     private var isRetryingAfterSessionRecovery = false
 
     init(
         transferSettings: DownloadTransferSettings = .default,
+        proxySettings: NetworkProxySettings = .system,
         daemonStartupOperation: DaemonStartupOperation? = nil
     ) {
         self.transferSettings = transferSettings
+        self.proxySettings = proxySettings
         self.daemonStartupOperation = daemonStartupOperation ?? { service in
             try await service.startDaemonUntilReady()
         }
@@ -369,6 +372,37 @@ actor Aria2TorrentService {
             await persistSessionAfterMutation("transfer settings update")
         } catch {
             logger.warning("Failed to update aria2 transfer settings: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    func updateProxySettings(_ proxySettings: NetworkProxySettings) async {
+        guard self.proxySettings != proxySettings else {
+            return
+        }
+        self.proxySettings = proxySettings
+
+        let proxyURI: String
+        do {
+            proxyURI = try proxySettings.aria2ProxyURI() ?? ""
+        } catch {
+            logger.warning("Could not apply torrent proxy settings: \(error.localizedDescription, privacy: .public)")
+            return
+        }
+
+        guard isDaemonReady,
+              process?.isRunning == true,
+              rpcPort != nil,
+              rpcSecret != nil else {
+            return
+        }
+
+        do {
+            _ = try await rpcCall(method: "aria2.changeGlobalOption", params: [
+                authorizedToken(),
+                ["bt-proxy": proxyURI]
+            ], as: String.self)
+        } catch {
+            logger.warning("Failed to update torrent proxy settings: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -952,6 +986,7 @@ actor Aria2TorrentService {
         try terminatePersistedOwnedDaemonIfNeeded()
         let sessionFileURL = try prepareSessionFile()
         let stateDirectoryURL = try prepareStateDirectory()
+        let proxyURI = try proxySettings.aria2ProxyURI()
         try terminateOrphanedDaemons(
             matching: binaryURL,
             sessionFileURL: sessionFileURL
@@ -967,7 +1002,8 @@ actor Aria2TorrentService {
             rpcSecret: secret,
             hostProcessIdentifier: ProcessInfo.processInfo.processIdentifier,
             transferSettings: transferSettings,
-            networkBinding: networkBinding
+            networkBinding: networkBinding,
+            proxyURI: proxyURI
         )
 
         let process = Process()
@@ -1055,7 +1091,8 @@ actor Aria2TorrentService {
         rpcSecret: String,
         hostProcessIdentifier: pid_t,
         transferSettings: DownloadTransferSettings,
-        networkBinding: NetworkBindingStatus
+        networkBinding: NetworkBindingStatus,
+        proxyURI: String? = nil
     ) -> [String] {
         var arguments = [
             "--enable-rpc=true",
@@ -1093,6 +1130,9 @@ actor Aria2TorrentService {
         // covers every BitTorrent socket without affecting direct downloads.
         if case let .bound(_, binding) = networkBinding {
             arguments.append("--bt-interface=\(binding.interfaceName)")
+        }
+        if let proxyURI {
+            arguments.append("--bt-proxy=\(proxyURI)")
         }
 
         return arguments

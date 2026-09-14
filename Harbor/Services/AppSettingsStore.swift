@@ -104,6 +104,10 @@ final class AppSettingsStore {
         static let perDownloadConnectionCount = "perDownloadConnectionCount"
         static let networkBindingSelection = "torrentNetworkBindingSelection"
         static let networkBindingDisplayName = "torrentNetworkBindingDisplayName"
+        static let proxyMode = "networkProxyMode"
+        static let proxyScheme = "networkProxyScheme"
+        static let proxyHost = "networkProxyHost"
+        static let proxyPort = "networkProxyPort"
     }
 
     static let maxConcurrentDownloadsRange = 1 ... 16
@@ -117,6 +121,7 @@ final class AppSettingsStore {
     @ObservationIgnored var transferSettingsDidChange: ((DownloadTransferSettings) -> Void)?
     @ObservationIgnored var torrentAutomationSettingsDidChange: (() -> Void)?
     @ObservationIgnored var networkBindingDidChange: ((NetworkBindingSelection) -> Void)?
+    @ObservationIgnored var proxySettingsDidChange: ((NetworkProxySettings) -> Void)?
 
     var defaultDestinationPath: String {
         didSet {
@@ -188,6 +193,34 @@ final class AppSettingsStore {
                 storedNetworkBindingDisplayName,
                 forKey: Keys.networkBindingDisplayName
             )
+        }
+    }
+
+    var proxyMode: NetworkProxyMode {
+        didSet {
+            userDefaults.set(proxyMode.rawValue, forKey: Keys.proxyMode)
+            notifyProxySettingsChanged()
+        }
+    }
+
+    var proxyScheme: NetworkProxyScheme {
+        didSet {
+            userDefaults.set(proxyScheme.rawValue, forKey: Keys.proxyScheme)
+            notifyProxySettingsChanged()
+        }
+    }
+
+    var proxyHost: String {
+        didSet {
+            userDefaults.set(proxyHost, forKey: Keys.proxyHost)
+            notifyProxySettingsChanged()
+        }
+    }
+
+    var proxyPort: Int {
+        didSet {
+            userDefaults.set(proxyPort, forKey: Keys.proxyPort)
+            notifyProxySettingsChanged()
         }
     }
 
@@ -423,6 +456,16 @@ final class AppSettingsStore {
             .string(forKey: Keys.networkBindingDisplayName)
             ?? Self.fallbackDisplayName(for: storedSelection)
 
+        self.proxyMode = userDefaults.string(forKey: Keys.proxyMode)
+            .flatMap(NetworkProxyMode.init(rawValue:))
+            ?? .system
+        self.proxyScheme = userDefaults.string(forKey: Keys.proxyScheme)
+            .flatMap(NetworkProxyScheme.init(rawValue:))
+            ?? .http
+        self.proxyHost = userDefaults.string(forKey: Keys.proxyHost) ?? ""
+        let storedProxyPort = userDefaults.integer(forKey: Keys.proxyPort)
+        self.proxyPort = storedProxyPort == 0 ? 8_080 : storedProxyPort
+
         refreshNetworkBindingTargets()
     }
 
@@ -485,6 +528,15 @@ final class AppSettingsStore {
         )
 
         return trafficMode.applying(to: customSettings)
+    }
+
+    var proxySettings: NetworkProxySettings {
+        NetworkProxySettings(
+            mode: proxyMode,
+            scheme: proxyScheme,
+            host: proxyHost,
+            port: proxyPort
+        )
     }
 
     static func clampedSpeedLimitKilobytes(_ value: Int) -> Int {
@@ -640,6 +692,10 @@ final class AppSettingsStore {
 
     private func notifyTorrentAutomationSettingsChanged() {
         torrentAutomationSettingsDidChange?()
+    }
+
+    private func notifyProxySettingsChanged() {
+        proxySettingsDidChange?(proxySettings)
     }
 
     private func speedLimitBytesPerSecond(

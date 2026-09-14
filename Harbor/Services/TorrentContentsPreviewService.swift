@@ -5,6 +5,7 @@ struct TorrentContentsPreviewService: Sendable {
         sourceKind: DownloadSourceKind,
         sourceURL: URL,
         requestHeaders: [RequestHeader],
+        proxySettings: NetworkProxySettings,
         torrentService: Aria2TorrentService
     ) async throws -> TorrentContentsPreview {
         switch sourceKind {
@@ -17,7 +18,8 @@ struct TorrentContentsPreviewService: Sendable {
             } else {
                 data = try await TorrentSourceLoader.fetch(
                     from: sourceURL,
-                    requestHeaders: requestHeaders
+                    requestHeaders: requestHeaders,
+                    proxySettings: proxySettings
                 )
             }
             return try TorrentMetainfoParser.preview(from: data)
