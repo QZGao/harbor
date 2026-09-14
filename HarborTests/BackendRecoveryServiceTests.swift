@@ -4,6 +4,46 @@ import XCTest
 @testable import Harbor
 
 extension HarborModelAndSafetyTests {
+    func testPeerBlocklistSurvivesTorrentDaemonRestart() async throws {
+        guard Aria2BinaryResolver.resolveBinaryURL() != nil else {
+            throw XCTSkip("The bundled Aria2 Next runtime is not available in this test build.")
+        }
+
+        let fileManager = FileManager.default
+        let applicationSupportURL = fileManager.temporaryDirectory
+            .appendingPathComponent("HarborBlocklistRestartTests-\(UUID().uuidString)", isDirectory: true)
+        let environmentKey = "HARBOR_APPLICATION_SUPPORT_DIR"
+        let previousValue = getenv(environmentKey).map { String(cString: $0) }
+        defer {
+            if let previousValue {
+                setenv(environmentKey, previousValue, 1)
+            } else {
+                unsetenv(environmentKey)
+            }
+            try? fileManager.removeItem(at: applicationSupportURL)
+        }
+        setenv(environmentKey, applicationSupportURL.path, 1)
+
+        let service = Aria2TorrentService()
+        let applied = try await service.setPeerBlocklist(["192.0.2.1"])
+        XCTAssertEqual(applied.ruleCount, 1)
+
+        await service.setNetworkBinding(
+            .bound(
+                displayName: "Loopback",
+                binding: ResolvedNetworkBinding(
+                    interfaceName: "lo0",
+                    ipv4Address: "127.0.0.1"
+                )
+            )
+        )
+        let cleared = try await service.setPeerBlocklist([])
+        try await service.shutdown()
+
+        XCTAssertEqual(cleared.ruleCount, 0)
+        XCTAssertEqual(cleared.revision, 2)
+    }
+
     func testBundledAriaNextDaemonMigratesLegacySessionAndPersistsOwnership() async throws {
         guard Aria2BinaryResolver.resolveBinaryURL() != nil else {
             throw XCTSkip("The bundled Aria2 Next runtime is not available in this test build.")

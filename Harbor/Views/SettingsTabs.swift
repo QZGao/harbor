@@ -191,6 +191,53 @@ struct TorrentsSettingsTab: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Section("Peer Blocklist") {
+                Toggle("Enable IP blocklist", isOn: $settings.torrentBlocklistEnabled)
+
+                if settings.torrentBlocklistEnabled {
+                    TextField("Blocklist URL", text: $settings.torrentBlocklistURL)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit {
+                            settings.requestTorrentBlocklistRefresh()
+                        }
+
+                    LabeledContent("Status") {
+                        if settings.isRefreshingTorrentBlocklist {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else if let lastUpdated = settings.torrentBlocklistLastUpdated {
+                            Text(
+                                "\(settings.torrentBlocklistRuleCount) rules • \(lastUpdated.formatted(date: .abbreviated, time: .shortened))"
+                            )
+                            .foregroundStyle(.secondary)
+                        } else {
+                            Text("No valid blocklist cached")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Button("Refresh Blocklist", systemImage: "arrow.clockwise") {
+                        settings.requestTorrentBlocklistRefresh()
+                    }
+                    .disabled(
+                        settings.torrentBlocklistURL
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .isEmpty
+                            || settings.isRefreshingTorrentBlocklist
+                    )
+
+                    if let errorMessage = settings.torrentBlocklistErrorMessage {
+                        Text(errorMessage)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                }
+
+                Text("Aria2 Next accepts one IPv4 address, IPv6 address, or CIDR range per line. The last valid cached list remains active when a refresh fails.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
         .onAppear {

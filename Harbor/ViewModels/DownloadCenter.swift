@@ -115,6 +115,7 @@ final class DownloadCenter {
     @ObservationIgnored private var coordinator: DownloadCoordinator! = nil
     @ObservationIgnored private var browserCoordinator: BrowserDownloadCoordinator! = nil
     @ObservationIgnored private let torrentService: Aria2TorrentService
+    @ObservationIgnored private let torrentBlocklistController: TorrentBlocklistController
     @ObservationIgnored private var mediaService: MediaDownloadService! = nil
     private var initializationState: InitializationState = .notLoaded
     @ObservationIgnored private var initializationTask: Task<Void, Never>?
@@ -211,6 +212,7 @@ final class DownloadCenter {
         sleepPreventionService: (any DownloadSleepPreventing)? = nil,
         quickLookPreviewService: (any QuickLookPreviewing)? = nil,
         torrentService: Aria2TorrentService? = nil,
+        torrentBlocklistService: TorrentBlocklistService? = nil,
         mediaService: MediaDownloadService? = nil,
         directPauseOperation: @escaping DirectPauseOperation = { coordinator, id in
             await coordinator.pauseDownloadAndWait(id: id)
@@ -268,9 +270,19 @@ final class DownloadCenter {
         self.networkBindingMonitor = networkBindingMonitor ?? NetworkBindingMonitor()
         self.sleepPreventionService = sleepPreventionService ?? DownloadSleepPreventionService()
         self.quickLookPreviewService = quickLookPreviewService ?? QuickLookPreviewService()
-        self.torrentService = torrentService ?? Aria2TorrentService(
+        let resolvedTorrentService = torrentService ?? Aria2TorrentService(
             transferSettings: settings.transferSettings,
             proxySettings: settings.proxySettings
+        )
+        self.torrentService = resolvedTorrentService
+        let resolvedBlocklistService = torrentBlocklistService ?? TorrentBlocklistService(
+            apply: { rules in
+                try await resolvedTorrentService.setPeerBlocklist(rules)
+            }
+        )
+        self.torrentBlocklistController = TorrentBlocklistController(
+            settings: settings,
+            service: resolvedBlocklistService
         )
         self.directPauseOperation = directPauseOperation
         self.mediaCleanupOperation = mediaCleanupOperation
@@ -612,6 +624,7 @@ final class DownloadCenter {
             selectDownload(downloads.first?.id)
             await backfillLegacyTorrentFingerprints()
             await reconcileRestoredTorrentSession()
+            await torrentBlocklistController.activate()
             initializationState = .loaded
             initializationFailureMessage = nil
             if settings.networkBindingStatus.isAvailable {

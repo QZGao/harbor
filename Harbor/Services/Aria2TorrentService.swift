@@ -294,6 +294,7 @@ actor Aria2TorrentService {
     private let startupLogBuffer = TorrentEngineLogBuffer()
     private var transferSettings: DownloadTransferSettings
     private var proxySettings: NetworkProxySettings
+    private var peerBlocklistRules: [String] = []
     private var networkBinding: NetworkBindingStatus = .unrestricted
     private var isRetryingAfterSessionRecovery = false
 
@@ -462,6 +463,18 @@ actor Aria2TorrentService {
             },
             as: String.self
         )
+    }
+
+    func setPeerBlocklist(_ rules: [String]) async throws -> TorrentBlocklistApplication {
+        let application = try await rpcCallWithDaemonRestart(
+            method: "aria2.setBtPeerBlocklist",
+            params: {
+                [try authorizedToken(), rules]
+            },
+            as: TorrentBlocklistApplication.self
+        )
+        peerBlocklistRules = rules
+        return application
     }
 
     private func addedTrackerURLs(gid: String) async throws -> [String] {
@@ -1146,6 +1159,12 @@ actor Aria2TorrentService {
                     authorizedToken()
                 ], as: VersionPayload.self)
                 try await applyGlobalOptions(transferSettings)
+                if peerBlocklistRules.isEmpty == false {
+                    _ = try await rpcCall(method: "aria2.setBtPeerBlocklist", params: [
+                        authorizedToken(),
+                        peerBlocklistRules
+                    ], as: TorrentBlocklistApplication.self)
+                }
                 isRetryingAfterSessionRecovery = false
                 isDaemonReady = true
                 startupLogBuffer.stopCapturing()
