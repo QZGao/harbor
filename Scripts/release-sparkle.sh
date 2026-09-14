@@ -183,8 +183,8 @@ resign_exported_app() {
         codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp {} \;
     fi
 
-    if [ -f "$APP_PATH/Contents/Resources/TorrentRuntime/$architecture/bin/aria2c" ]; then
-      codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp "$APP_PATH/Contents/Resources/TorrentRuntime/$architecture/bin/aria2c"
+    if [ -f "$APP_PATH/Contents/Resources/TorrentRuntime/$architecture/bin/aria2-next" ]; then
+      codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp "$APP_PATH/Contents/Resources/TorrentRuntime/$architecture/bin/aria2-next"
     fi
   done
 

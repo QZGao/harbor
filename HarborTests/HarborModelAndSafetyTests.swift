@@ -314,7 +314,7 @@ final class HarborModelAndSafetyTests: XCTestCase {
 
         XCTAssertEqual(options["max-download-limit"], "0")
         XCTAssertEqual(options["max-upload-limit"], "75000")
-        XCTAssertEqual(options["max-connection-per-server"], "6")
+        XCTAssertEqual(options["stream-max-connections"], "6")
         XCTAssertEqual(options["seed-ratio"], "0.0")
         XCTAssertNil(options["seed-time"])
 

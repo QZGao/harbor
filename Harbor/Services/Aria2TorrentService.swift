@@ -13,7 +13,7 @@ enum TorrentEngineError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .binaryNotFound:
-            "Torrent support requires aria2c. \(Aria2BinaryResolver.installHint)"
+            "Torrent support requires Aria2 Next. \(Aria2BinaryResolver.installHint)"
         case let .startupFailed(message):
             "Couldn’t start the torrent engine. \(message)"
         case .invalidSource:
@@ -542,10 +542,7 @@ actor Aria2TorrentService {
         return returnedGID
     }
 
-    func previewMagnetMetainfo(
-        at sourceURL: URL,
-        requestHeaders: [RequestHeader]
-    ) async throws -> Data {
+    func previewMagnetContents(at sourceURL: URL) async throws -> TorrentContentsPreview {
         guard let expectedInfoHash = ManagedTorrentSourceStore.normalizedInfoHash(
             MagnetLinkMetadata(url: sourceURL).infoHash
         ) else {
@@ -563,18 +560,13 @@ actor Aria2TorrentService {
         let gid = Self.makeSubmissionGID()
         do {
             try await ensureDaemonRunning()
-            var options: [String: Any] = [
+            let options: [String: Any] = [
                 "gid": gid,
                 "dir": previewDirectory.path,
                 "pause": "false",
                 "pause-metadata": "true",
-                "bt-metadata-only": "true",
-                "bt-save-metadata": "true",
                 "seed-time": "0"
             ]
-            if requestHeaders.isEmpty == false {
-                options["header"] = requestHeaders.map(\.aria2HeaderValue)
-            }
             let returnedGID = try await submitDownload(
                 method: "aria2.addUri",
                 params: [
@@ -588,36 +580,28 @@ actor Aria2TorrentService {
                 throw TorrentEngineError.invalidResponse
             }
 
-            let expectedMetadataURL = previewDirectory
-                .appendingPathComponent("\(expectedInfoHash).torrent", isDirectory: false)
-
             while true {
                 try Task.checkCancellation()
 
-                let metadataURL: URL? = if FileManager.default.fileExists(
-                    atPath: expectedMetadataURL.path
-                ) {
-                    expectedMetadataURL
-                } else {
-                    try FileManager.default.contentsOfDirectory(
-                        at: previewDirectory,
-                        includingPropertiesForKeys: nil
-                    ).first { $0.pathExtension.lowercased() == "torrent" }
-                }
-
-                if let metadataURL {
-                    let data = try ManagedTorrentSourceStore.loadTorrentData(at: metadataURL)
-                    let preview = try TorrentMetainfoParser.preview(from: data)
-                    guard preview.infoHash == expectedInfoHash else {
+                let payload = try await rpcCall(
+                    method: "aria2.tellStatus",
+                    params: [
+                        authorizedToken(),
+                        gid,
+                        ["status", "errorMessage", "infoHash", "files", "bittorrent"]
+                    ],
+                    as: Aria2NextMagnetStatus.self
+                )
+                if let preview = try payload.preview(relativeTo: previewDirectory) {
+                    guard ManagedTorrentSourceStore.normalizedInfoHash(preview.infoHash)
+                        == expectedInfoHash else {
                         throw TorrentPreviewError.fingerprintMismatch
                     }
                     await cleanupTorrentPreview(gid: gid, directoryURL: previewDirectory)
-                    return data
+                    return preview
                 }
-
-                let snapshot = try await status(for: gid)
-                if snapshot.status == "error" || snapshot.status == "removed" {
-                    throw TorrentPreviewError.metadataUnavailable(snapshot.errorMessage)
+                if payload.status == "error" || payload.status == "removed" {
+                    throw TorrentPreviewError.metadataUnavailable(payload.errorMessage)
                 }
 
                 try await Task.sleep(for: .milliseconds(250))
@@ -951,7 +935,7 @@ actor Aria2TorrentService {
     }
 
     private func startDaemonUntilReady() async throws {
-        // aria2 exits immediately when --interface names a missing interface.
+        // Aria2 Next exits immediately when --bt-interface names a missing interface.
         // Refusing here turns that into an explanation the user can act on.
         if case let .unavailable(displayName) = networkBinding {
             throw TorrentEngineError.networkInterfaceUnavailable(displayName)
@@ -965,17 +949,20 @@ actor Aria2TorrentService {
             throw TorrentEngineError.binaryNotFound
         }
 
+        try terminatePersistedOwnedDaemonIfNeeded()
         let sessionFileURL = try prepareSessionFile()
+        let stateDirectoryURL = try prepareStateDirectory()
         try terminateOrphanedDaemons(
             matching: binaryURL,
             sessionFileURL: sessionFileURL
         )
-        logger.info("Launching aria2 from \(binaryURL.path, privacy: .public)")
+        logger.info("Launching Aria2 Next from \(binaryURL.path, privacy: .public)")
 
         let port = Int.random(in: 18_000 ... 28_000)
         let secret = UUID().uuidString.replacingOccurrences(of: "-", with: "")
         let arguments = Self.daemonArguments(
             sessionFilePath: sessionFileURL.path,
+            stateDirectoryPath: stateDirectoryURL.path,
             rpcPort: port,
             rpcSecret: secret,
             hostProcessIdentifier: ProcessInfo.processInfo.processIdentifier,
@@ -995,7 +982,7 @@ actor Aria2TorrentService {
         do {
             try process.run()
         } catch {
-            logger.error("Failed to launch aria2: \(error.localizedDescription, privacy: .public)")
+            logger.error("Failed to launch Aria2 Next: \(error.localizedDescription, privacy: .public)")
             throw TorrentEngineError.startupFailed(error.localizedDescription)
         }
 
@@ -1017,11 +1004,11 @@ actor Aria2TorrentService {
                 "Harbor could not durably record ownership of the torrent engine: \(error.localizedDescription)"
             )
         }
-        logger.info("aria2 process started on RPC port \(port, privacy: .public)")
+        logger.info("Aria2 Next process started on RPC port \(port, privacy: .public)")
 
         for _ in 0 ..< 20 {
             if process.isRunning == false {
-                logger.error("aria2 exited before RPC became available")
+                logger.error("Aria2 Next exited before RPC became available")
                 resetDaemon(terminateIfRunning: false)
                 if try recoverCorruptSessionIfPossible(
                     at: sessionFileURL,
@@ -1030,7 +1017,7 @@ actor Aria2TorrentService {
                     try await startDaemonUntilReady()
                     return
                 }
-                throw TorrentEngineError.startupFailed("aria2c exited before opening RPC.")
+                throw TorrentEngineError.startupFailed("Aria2 Next exited before opening RPC.")
             }
 
             do {
@@ -1041,15 +1028,15 @@ actor Aria2TorrentService {
                 isRetryingAfterSessionRecovery = false
                 isDaemonReady = true
                 startupLogBuffer.stopCapturing()
-                logger.info("aria2 RPC is ready")
+                logger.info("Aria2 Next RPC is ready")
                 return
             } catch {
-                logger.debug("aria2 RPC not ready yet: \(error.localizedDescription, privacy: .public)")
+                logger.debug("Aria2 Next RPC not ready yet: \(error.localizedDescription, privacy: .public)")
                 try? await Task.sleep(for: .milliseconds(250))
             }
         }
 
-        logger.error("Timed out waiting for aria2 RPC readiness")
+        logger.error("Timed out waiting for Aria2 Next RPC readiness")
         resetDaemon(terminateIfRunning: true)
         if try recoverCorruptSessionIfPossible(
             at: sessionFileURL,
@@ -1063,6 +1050,7 @@ actor Aria2TorrentService {
 
     nonisolated static func daemonArguments(
         sessionFilePath: String,
+        stateDirectoryPath: String,
         rpcPort: Int,
         rpcSecret: String,
         hostProcessIdentifier: pid_t,
@@ -1077,14 +1065,13 @@ actor Aria2TorrentService {
             "--input-file=\(sessionFilePath)",
             "--save-session=\(sessionFilePath)",
             "--save-session-interval=5",
+            "--state-dir=\(stateDirectoryPath)",
             "--force-save=true",
             "--stop-with-process=\(hostProcessIdentifier)",
-            "--bt-detach-seed-only=true",
+            "--detach-share-only=true",
             // Per-download options override this unlimited daemon default.
             // TODO: Add per-torrent ratio overrides if one global preference becomes too limiting.
             "--seed-ratio=0.0",
-            "--bt-save-metadata=true",
-            "--bt-load-saved-metadata=true",
             "--follow-torrent=true",
             "--pause=true",
             "--allow-overwrite=false",
@@ -1097,16 +1084,15 @@ actor Aria2TorrentService {
             "--max-overall-upload-limit=\(aria2LimitString(transferSettings.globalUploadSpeedLimitBytesPerSecond))",
             "--max-download-limit=\(aria2LimitString(transferSettings.perDownloadSpeedLimitBytesPerSecond))",
             "--max-upload-limit=\(aria2LimitString(transferSettings.perDownloadUploadSpeedLimitBytesPerSecond))",
-            "--max-connection-per-server=\(transferSettings.perDownloadConnectionCount)",
-            "--split=\(transferSettings.perDownloadConnectionCount)",
+            "--stream-max-connections=\(transferSettings.perDownloadConnectionCount)",
             "--check-certificate=true",
-            "--console-log-level=notice"
+            "--console-log-level=info"
         ])
 
-        // Local Peer Discovery stays off by default in aria2, so --interface is
-        // the only socket binding the daemon needs.
+        // Local Peer Discovery stays off by default, so this native binding
+        // covers every BitTorrent socket without affecting direct downloads.
         if case let .bound(_, binding) = networkBinding {
-            arguments.append("--interface=\(binding.interfaceName)")
+            arguments.append("--bt-interface=\(binding.interfaceName)")
         }
 
         return arguments
@@ -1127,7 +1113,7 @@ actor Aria2TorrentService {
         isRetryingAfterSessionRecovery = true
         let quarantineURL = sessionFileURL
             .deletingLastPathComponent()
-            .appendingPathComponent("aria2.session.corrupt-\(UUID().uuidString)")
+            .appendingPathComponent("aria2-next.session.corrupt-\(UUID().uuidString)")
         try FileManager.default.moveItem(at: sessionFileURL, to: quarantineURL)
         guard FileManager.default.createFile(atPath: sessionFileURL.path, contents: Data()) else {
             throw TorrentEngineError.startupFailed(
@@ -1138,7 +1124,7 @@ actor Aria2TorrentService {
                 )
             )
         }
-        logger.warning("Recovered from an unreadable aria2 session file")
+        logger.warning("Recovered from an unreadable Aria2 Next session file")
         return true
     }
 
@@ -1171,7 +1157,7 @@ actor Aria2TorrentService {
         let fileManager = FileManager.default
         let harborDirectoryURL = HarborApplicationSupport.directoryURL(fileManager: fileManager)
         let sessionFileURL = harborDirectoryURL.appendingPathComponent(
-            "aria2.session",
+            "aria2-next.session",
             isDirectory: false
         )
 
@@ -1204,17 +1190,42 @@ actor Aria2TorrentService {
                     )
                 )
             }
-        } else if fileManager.createFile(atPath: sessionFileURL.path, contents: Data()) == false {
-            throw TorrentEngineError.startupFailed(
-                String(
-                    localized: "torrent.session.fileCreationFailed",
-                    defaultValue: "Couldn’t create the torrent session file.",
-                    comment: "Torrent engine startup detail shown when its session file cannot be created."
+        } else {
+            let legacySessionURL = harborDirectoryURL.appendingPathComponent("aria2.session")
+            if fileManager.fileExists(atPath: legacySessionURL.path) {
+                try Data(contentsOf: legacySessionURL).write(to: sessionFileURL, options: .atomic)
+            } else if fileManager.createFile(atPath: sessionFileURL.path, contents: Data()) == false {
+                throw TorrentEngineError.startupFailed(
+                    String(
+                        localized: "torrent.session.fileCreationFailed",
+                        defaultValue: "Couldn’t create the torrent session file.",
+                        comment: "Torrent engine startup detail shown when the session file cannot be created."
+                    )
                 )
-            )
+            }
+            try DurableFileSystem.synchronizeFile(at: sessionFileURL)
+            try DurableFileSystem.synchronizeDirectory(at: harborDirectoryURL)
         }
 
         return sessionFileURL
+    }
+
+    private func prepareStateDirectory() throws -> URL {
+        let fileManager = FileManager.default
+        let stateDirectoryURL = HarborApplicationSupport.directoryURL(fileManager: fileManager)
+            .appendingPathComponent("aria2-next-state", isDirectory: true)
+        var isDirectory: ObjCBool = false
+        if fileManager.fileExists(atPath: stateDirectoryURL.path, isDirectory: &isDirectory) {
+            guard isDirectory.boolValue else {
+                throw TorrentEngineError.startupFailed(
+                    "The Aria2 Next state path is not a directory."
+                )
+            }
+        } else {
+            try fileManager.createDirectory(at: stateDirectoryURL, withIntermediateDirectories: true)
+            try DurableFileSystem.synchronizeParentDirectory(of: stateDirectoryURL)
+        }
+        return stateDirectoryURL
     }
 
     private func downloadOptions(
@@ -1258,7 +1269,6 @@ actor Aria2TorrentService {
 
         if transferOptions?.verifyExistingData == true {
             options["check-integrity"] = "true"
-            options["bt-hash-check-seed"] = "true"
             options["allow-overwrite"] = "false"
             options["auto-file-renaming"] = "false"
         }
@@ -1320,8 +1330,7 @@ actor Aria2TorrentService {
         var options = [
             "max-download-limit": aria2LimitString(downloadLimit),
             "max-upload-limit": aria2LimitString(uploadLimit),
-            "max-connection-per-server": "\(transferSettings.perDownloadConnectionCount)",
-            "split": "\(transferSettings.perDownloadConnectionCount)"
+            "stream-max-connections": "\(transferSettings.perDownloadConnectionCount)"
         ]
 
         if let transferOptions {

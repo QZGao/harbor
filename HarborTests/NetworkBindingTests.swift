@@ -246,6 +246,7 @@ final class NetworkBindingTests: XCTestCase {
         func arguments(for networkBinding: NetworkBindingStatus) -> [String] {
             Aria2TorrentService.daemonArguments(
                 sessionFilePath: "/tmp/aria2.session",
+                stateDirectoryPath: "/tmp/aria2-next-state",
                 rpcPort: 18_000,
                 rpcSecret: "secret",
                 hostProcessIdentifier: 42,
@@ -264,9 +265,10 @@ final class NetworkBindingTests: XCTestCase {
             )
         )
         XCTAssertEqual(
-            bound.filter { $0.hasPrefix("--interface=") },
-            ["--interface=utun6"]
+            bound.filter { $0.hasPrefix("--bt-interface=") },
+            ["--bt-interface=utun6"]
         )
+        XCTAssertTrue(bound.contains("--state-dir=/tmp/aria2-next-state"))
         XCTAssertTrue(bound.contains("--rpc-listen-all=false"))
 
         for networkBinding in [
@@ -274,7 +276,7 @@ final class NetworkBindingTests: XCTestCase {
             .unavailable(displayName: "ProtonVPN")
         ] {
             XCTAssertFalse(
-                arguments(for: networkBinding).contains { $0.hasPrefix("--interface=") }
+                arguments(for: networkBinding).contains { $0.hasPrefix("--bt-interface=") }
             )
         }
     }
