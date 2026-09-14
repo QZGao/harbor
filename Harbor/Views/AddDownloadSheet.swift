@@ -241,7 +241,7 @@ struct AddDownloadSheet: View {
             }
         } message: {
             Text(
-                "The supplied headers contain Cookie or Authorization information. aria2 may send these headers to every HTTP/HTTPS tracker and web seed used by this torrent. Proceed?"
+                "The supplied headers contain Cookie or Authorization information. Aria2 Next sends them to each configured HTTP/HTTPS web seed and preserves them on same-origin redirects. It removes them when a redirect changes origin. Proceed?"
             )
         }
     }
