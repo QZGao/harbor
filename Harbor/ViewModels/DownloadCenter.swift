@@ -2553,6 +2553,31 @@ final class DownloadCenter {
         )
     }
 
+    func torrentTrackers(for id: UUID) async throws -> [TorrentTracker] {
+        try await torrentService.trackers(gid: try torrentGID(for: id))
+    }
+
+    func addTorrentTracker(_ url: String, for id: UUID) async throws {
+        try await torrentService.addTracker(url, gid: try torrentGID(for: id))
+    }
+
+    func removeTorrentTracker(_ tracker: TorrentTracker, for id: UUID) async throws {
+        try await torrentService.removeTracker(tracker, gid: try torrentGID(for: id))
+    }
+
+    func reannounceTorrentTrackers(for id: UUID) async throws {
+        try await torrentService.forceTrackerAnnounce(gid: try torrentGID(for: id))
+    }
+
+    private func torrentGID(for id: UUID) throws -> String {
+        guard let item = item(for: id),
+              item.backend == .aria2,
+              let gid = item.backendIdentifier else {
+            throw TorrentTrackerError.unavailable
+        }
+        return gid
+    }
+
     func refreshMediaFormats(for id: UUID) async {
         guard let currentItem = item(for: id),
               currentItem.backend == .ytDlp,

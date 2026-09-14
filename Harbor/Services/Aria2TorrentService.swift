@@ -231,6 +231,7 @@ actor Aria2TorrentService {
 
     private struct BittorrentPayload: Decodable {
         let info: InfoPayload?
+        let announceList: [[String]]?
     }
 
     private struct InfoPayload: Decodable {
@@ -404,6 +405,90 @@ actor Aria2TorrentService {
         } catch {
             logger.warning("Failed to update torrent proxy settings: \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    func trackers(gid: String) async throws -> [TorrentTracker] {
+        let currentGID = try await followedStatus(for: gid).currentSnapshot.gid
+        let trackers = try await rpcCallWithDaemonRestart(
+            method: "aria2.getBtTrackers",
+            params: {
+                [try authorizedToken(), currentGID]
+            },
+            as: [TorrentTracker].self
+        )
+        guard trackers.isEmpty else {
+            return trackers
+        }
+
+        let status = try await rpcCallWithDaemonRestart(
+            method: "aria2.tellStatus",
+            params: {
+                [try authorizedToken(), currentGID, ["gid", "status", "bittorrent"]]
+            },
+            as: StatusPayload.self
+        )
+        return (status.bittorrent?.announceList ?? []).enumerated().flatMap { tier, urls in
+            urls.map { TorrentTracker.pending(url: $0, tier: tier) }
+        }
+    }
+
+    func addTracker(_ value: String, gid: String) async throws {
+        let url = try TorrentTrackerError.normalizedURL(value)
+        let currentGID = try await followedStatus(for: gid).currentSnapshot.gid
+        var addedTrackers = try await addedTrackerURLs(gid: currentGID)
+        guard addedTrackers.contains(url) == false else {
+            return
+        }
+        addedTrackers.append(url)
+        try await updateAddedTrackers(addedTrackers, gid: currentGID)
+    }
+
+    func removeTracker(_ tracker: TorrentTracker, gid: String) async throws {
+        guard tracker.isRemovable else {
+            return
+        }
+        let currentGID = try await followedStatus(for: gid).currentSnapshot.gid
+        let addedTrackers = try await addedTrackerURLs(gid: currentGID)
+            .filter { $0 != tracker.url }
+        try await updateAddedTrackers(addedTrackers, gid: currentGID)
+    }
+
+    func forceTrackerAnnounce(gid: String) async throws {
+        let currentGID = try await followedStatus(for: gid).currentSnapshot.gid
+        _ = try await rpcCallWithDaemonRestart(
+            method: "aria2.forceBtAnnounce",
+            params: {
+                [try authorizedToken(), currentGID]
+            },
+            as: String.self
+        )
+    }
+
+    private func addedTrackerURLs(gid: String) async throws -> [String] {
+        let options = try await rpcCallWithDaemonRestart(
+            method: "aria2.getOption",
+            params: {
+                [try authorizedToken(), gid]
+            },
+            as: [String: String].self
+        )
+        return options["bt-tracker", default: ""]
+            .split(separator: ",")
+            .map(String.init)
+    }
+
+    private func updateAddedTrackers(
+        _ urls: [String],
+        gid: String
+    ) async throws {
+        _ = try await rpcCallWithDaemonRestart(
+            method: "aria2.changeOption",
+            params: {
+                [try authorizedToken(), gid, ["bt-tracker": urls.joined(separator: ",")]]
+            },
+            as: String.self
+        )
+        try await saveSession()
     }
 
     func saveSession() async throws {
