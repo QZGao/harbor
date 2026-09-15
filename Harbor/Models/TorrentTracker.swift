@@ -5,8 +5,10 @@ nonisolated struct TorrentTracker: Decodable, Equatable, Identifiable, Sendable 
     let source: String
     let tier: String
     let status: String
+    let failures: String?
     let seeders: String
     let leechers: String
+    let nextAnnounce: String?
     let updating: String
     let message: String?
 
@@ -18,6 +20,10 @@ nonisolated struct TorrentTracker: Decodable, Equatable, Identifiable, Sendable 
 
     var tierNumber: Int {
         Int(tier) ?? 0
+    }
+
+    var tierText: String {
+        String(format: String(localized: "Tier %d"), tierNumber)
     }
 
     var statusText: String {
@@ -42,14 +48,43 @@ nonisolated struct TorrentTracker: Decodable, Equatable, Identifiable, Sendable 
         )
     }
 
-    static func pending(url: String, tier: Int) -> TorrentTracker {
+    var failureCountText: String? {
+        guard let failures = Int(failures ?? ""), failures >= 0 else {
+            return nil
+        }
+        if failures == 1 {
+            return String(localized: "1 failure")
+        }
+        return String(format: String(localized: "%d failures"), failures)
+    }
+
+    var nextAnnounceText: String? {
+        guard let seconds = Int64(nextAnnounce ?? ""), seconds >= 0 else {
+            return nil
+        }
+        if seconds == 0 {
+            return String(localized: "Next announce now")
+        }
+        return String(
+            format: String(localized: "Next announce in %lld seconds"),
+            seconds
+        )
+    }
+
+    static func pending(
+        url: String,
+        source: String = "metainfo",
+        tier: Int
+    ) -> TorrentTracker {
         TorrentTracker(
             url: url,
-            source: "metainfo",
+            source: source,
             tier: "\(tier)",
             status: "",
+            failures: nil,
             seeders: "-1",
             leechers: "-1",
+            nextAnnounce: nil,
             updating: "false",
             message: nil
         )

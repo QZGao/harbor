@@ -126,14 +126,21 @@ private struct TrackerRow: View {
                     .lineLimit(2)
                     .textSelection(.enabled)
 
-                HStack(spacing: 8) {
-                    Text(tracker.statusText)
-                    if let peerCountText = tracker.peerCountText {
-                        Text(peerCountText)
-                    }
-                }
+                Text(
+                    [tracker.tierText, tracker.statusText, tracker.peerCountText]
+                        .compactMap { $0 }
+                        .joined(separator: " • ")
+                )
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+                let activity = [tracker.failureCountText, tracker.nextAnnounceText]
+                    .compactMap { $0 }
+                if activity.isEmpty == false {
+                    Text(activity.joined(separator: " • "))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
 
                 if let message = tracker.message, message.isEmpty == false {
                     Text(message)

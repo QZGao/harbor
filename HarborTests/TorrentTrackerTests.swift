@@ -15,9 +15,12 @@ final class TorrentTrackerTests: XCTestCase {
 
         XCTAssertEqual(tracker.url, "https://tracker.example/announce")
         XCTAssertEqual(tracker.tierNumber, 2)
+        XCTAssertEqual(tracker.tierText, "Tier 2")
         XCTAssertFalse(tracker.isRemovable)
         XCTAssertEqual(tracker.statusText, "Working")
         XCTAssertEqual(tracker.peerCountText, "12 seeders, 3 leechers")
+        XCTAssertEqual(tracker.failureCountText, "0 failures")
+        XCTAssertEqual(tracker.nextAnnounceText, "Next announce in 45 seconds")
         XCTAssertNil(tracker.message)
 
         let addedTracker = try JSONDecoder().decode(

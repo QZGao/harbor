@@ -2,13 +2,23 @@ import Foundation
 
 @MainActor
 final class TorrentBlocklistController {
+    nonisolated private static let automaticRefreshInterval: TimeInterval = 24 * 60 * 60
+
     private let settings: AppSettingsStore
     private let service: TorrentBlocklistService
+    private let refreshInterval: TimeInterval
     private var updateTask: Task<Void, Never>?
+    private var automaticRefreshTask: Task<Void, Never>?
+    private var lastFailedRefresh: Date?
 
-    init(settings: AppSettingsStore, service: TorrentBlocklistService) {
+    init(
+        settings: AppSettingsStore,
+        service: TorrentBlocklistService,
+        refreshInterval: TimeInterval = automaticRefreshInterval
+    ) {
         self.settings = settings
         self.service = service
+        self.refreshInterval = refreshInterval
 
         settings.torrentBlocklistSettingsDidChange = { [weak self] in
             self?.scheduleUpdate(forceRefresh: false)
@@ -23,13 +33,16 @@ final class TorrentBlocklistController {
 
     deinit {
         updateTask?.cancel()
+        automaticRefreshTask?.cancel()
     }
 
     func activate() async {
         await update(forceRefresh: false)
+        scheduleAutomaticRefresh()
     }
 
     private func scheduleUpdate(forceRefresh: Bool) {
+        automaticRefreshTask?.cancel()
         let previousTask = updateTask
         previousTask?.cancel()
         updateTask = Task { @MainActor [weak self] in
@@ -43,7 +56,33 @@ final class TorrentBlocklistController {
             await self.update(forceRefresh: forceRefresh)
             if Task.isCancelled == false {
                 self.updateTask = nil
+                self.scheduleAutomaticRefresh()
             }
+        }
+    }
+
+    private func scheduleAutomaticRefresh() {
+        automaticRefreshTask?.cancel()
+        guard settings.torrentBlocklistEnabled else {
+            automaticRefreshTask = nil
+            return
+        }
+
+        let referenceDate = [settings.torrentBlocklistLastUpdated, lastFailedRefresh]
+            .compactMap { $0 }
+            .max()
+        let elapsed = referenceDate.map { Date.now.timeIntervalSince($0) } ?? 0
+        let delay = max(0, refreshInterval - elapsed)
+        automaticRefreshTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(delay))
+            } catch {
+                return
+            }
+            guard Task.isCancelled == false else {
+                return
+            }
+            self?.scheduleUpdate(forceRefresh: true)
         }
     }
 
@@ -72,11 +111,13 @@ final class TorrentBlocklistController {
             guard Task.isCancelled == false else {
                 return
             }
+            lastFailedRefresh = nil
             settings.updateTorrentBlocklistStatus(status)
         } catch {
             guard Task.isCancelled == false else {
                 return
             }
+            lastFailedRefresh = .now
             settings.updateTorrentBlocklistError(error)
         }
     }

@@ -4,6 +4,44 @@ import XCTest
 
 final class TorrentBlocklistTests: XCTestCase {
     @MainActor
+    func testEnabledBlocklistRefreshesOnSchedule() async throws {
+        let suiteName = "HarborTests.BlocklistSchedule.\(UUID().uuidString)"
+        let userDefaults = UserDefaults(suiteName: suiteName)!
+        userDefaults.removePersistentDomain(forName: suiteName)
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HarborBlocklistSchedule-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+
+        let settings = AppSettingsStore(userDefaults: userDefaults)
+        settings.torrentBlocklistURL = "https://example.com/blocklist.txt"
+        settings.torrentBlocklistEnabled = true
+        let secondDownload = expectation(description: "Scheduled blocklist refresh")
+        let downloadRecorder = BlocklistDownloadRecorder()
+        let service = TorrentBlocklistService(
+            directoryURL: directoryURL,
+            downloader: { _, _ in
+                if await downloadRecorder.recordDownload() == 2 {
+                    secondDownload.fulfill()
+                }
+                return Data("192.0.2.1\n".utf8)
+            },
+            apply: { rules in
+                TorrentBlocklistApplication(ruleCount: rules.count, revision: 1)
+            }
+        )
+        let controller = TorrentBlocklistController(
+            settings: settings,
+            service: service,
+            refreshInterval: 0.02
+        )
+
+        await controller.activate()
+        await fulfillment(of: [secondDownload], timeout: 1)
+        _ = controller
+    }
+
+    @MainActor
     func testDisablingWaitsForCancelledRefreshBeforeClearingFilter() async throws {
         let suiteName = "HarborTests.BlocklistCancellation.\(UUID().uuidString)"
         let userDefaults = UserDefaults(suiteName: suiteName)!
@@ -124,6 +162,15 @@ final class TorrentBlocklistTests: XCTestCase {
 
 private enum BlocklistProbeError: Error, Equatable {
     case downloadFailed
+}
+
+private actor BlocklistDownloadRecorder {
+    private var count = 0
+
+    func recordDownload() -> Int {
+        count += 1
+        return count
+    }
 }
 
 private actor BlocklistApplicationRecorder {

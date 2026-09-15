@@ -413,14 +413,16 @@ actor Aria2TorrentService {
 
     func trackers(gid: String) async throws -> [TorrentTracker] {
         let currentGID = try await followedStatus(for: gid).currentSnapshot.gid
-        let trackers = try await rpcCallWithDaemonRestart(
+        var trackers = try await rpcCallWithDaemonRestart(
             method: "aria2.getBtTrackers",
             params: {
                 [try authorizedToken(), currentGID]
             },
             as: [TorrentTracker].self
         )
-        guard trackers.isEmpty else {
+        let addedTrackers = Set(try await addedTrackerURLs(gid: currentGID))
+        var reportedURLs = Set(trackers.map(\.url))
+        guard trackers.isEmpty || addedTrackers.isSubset(of: reportedURLs) == false else {
             return trackers
         }
 
@@ -431,9 +433,21 @@ actor Aria2TorrentService {
             },
             as: StatusPayload.self
         )
-        return (status.bittorrent?.announceList ?? []).enumerated().flatMap { tier, urls in
-            urls.map { TorrentTracker.pending(url: $0, tier: tier) }
+        for (tier, urls) in (status.bittorrent?.announceList ?? []).enumerated() {
+            for url in urls {
+                guard reportedURLs.insert(url).inserted else {
+                    continue
+                }
+                trackers.append(
+                    TorrentTracker.pending(
+                        url: url,
+                        source: addedTrackers.contains(url) ? "global" : "metainfo",
+                        tier: tier
+                    )
+                )
+            }
         }
+        return trackers
     }
 
     func addTracker(_ value: String, gid: String) async throws {
