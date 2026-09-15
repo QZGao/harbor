@@ -2035,14 +2035,18 @@ final class DownloadCenter {
                 return
             }
 
+            var didClearSuspension = false
             for item in downloads where item.wasSuspendedForNetworkBinding {
                 item.wasSuspendedForNetworkBinding = false
+                didClearSuspension = true
                 guard item.status == .paused else {
                     continue
                 }
                 resumeDownload(item)
             }
-            schedulePersist()
+            if didClearSuspension {
+                schedulePersist()
+            }
         }
     }
 
