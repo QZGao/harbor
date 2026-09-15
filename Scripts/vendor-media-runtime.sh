@@ -7,7 +7,7 @@ host_arch="$(uname -m)"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-yt_dlp_version="${YT_DLP_VERSION:-2026.06.09}"
+yt_dlp_version="${YT_DLP_VERSION:-2026.08.19}"
 yt_dlp_url="${YT_DLP_URL:-https://github.com/yt-dlp/yt-dlp/releases/download/${yt_dlp_version}/yt-dlp_macos}"
 deno_version="${DENO_VERSION:-2.9.6}"
 arm64_ffmpeg_path="${ARM64_FFMPEG_PATH:-${FFMPEG_PATH:-$(command -v ffmpeg || true)}}"
