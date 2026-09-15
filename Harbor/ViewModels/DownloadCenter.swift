@@ -2673,6 +2673,7 @@ final class DownloadCenter {
             torrentSourceFingerprint: managedTorrentSource?.sourceFingerprint,
             managedTorrentSourcePath: managedTorrentSource?.managedURL.path,
             torrentFileSelection: request.torrentFileSelection,
+            downloadsTorrentPiecesSequentially: request.downloadsTorrentPiecesSequentially,
             shouldSeedAfterDownload: backend == .aria2 ? settings.seedNewTorrents : false
         )
 
@@ -6070,7 +6071,8 @@ final class DownloadCenter {
             shouldSeed: item.shouldSeedAfterDownload,
             seedRatioLimit: settings.seedingRatioLimit,
             verifyExistingData: item.finishedAt != nil,
-            selectedFileIndexes: item.torrentFileSelection?.selectedIndexes
+            selectedFileIndexes: item.torrentFileSelection?.selectedIndexes,
+            downloadsTorrentPiecesSequentially: item.downloadsTorrentPiecesSequentially
         )
     }
 

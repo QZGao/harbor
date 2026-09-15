@@ -101,6 +101,7 @@ struct TorrentTransferOptions: Equatable, Sendable {
     let seedRatioLimit: Double?
     let verifyExistingData: Bool
     let selectedFileIndexes: [Int]?
+    let downloadsTorrentPiecesSequentially: Bool
 
     init(
         downloadLimitBytesPerSecond: Int64?,
@@ -108,7 +109,8 @@ struct TorrentTransferOptions: Equatable, Sendable {
         shouldSeed: Bool,
         seedRatioLimit: Double? = nil,
         verifyExistingData: Bool = false,
-        selectedFileIndexes: [Int]? = nil
+        selectedFileIndexes: [Int]? = nil,
+        downloadsTorrentPiecesSequentially: Bool = false
     ) {
         self.downloadLimitBytesPerSecond = downloadLimitBytesPerSecond
         self.uploadLimitBytesPerSecond = uploadLimitBytesPerSecond
@@ -116,6 +118,7 @@ struct TorrentTransferOptions: Equatable, Sendable {
         self.seedRatioLimit = seedRatioLimit
         self.verifyExistingData = verifyExistingData
         self.selectedFileIndexes = selectedFileIndexes
+        self.downloadsTorrentPiecesSequentially = downloadsTorrentPiecesSequentially
     }
 }
 
@@ -1478,6 +1481,10 @@ actor Aria2TorrentService {
         ]
 
         if let transferOptions {
+            if transferOptions.downloadsTorrentPiecesSequentially {
+                options["force-sequential"] = "true"
+            }
+
             if transferOptions.shouldSeed {
                 options["seed-ratio"] = aria2RatioString(transferOptions.seedRatioLimit)
             } else {
